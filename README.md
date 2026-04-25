@@ -67,6 +67,50 @@ curl -X POST localhost:4001/collections/media/search \
   -d '{"query": "sunset over ocean", "mode": "semantic", "vector_space": "qwen3-vl"}'
 ```
 
+### Multi-space retrieval + reranking
+
+Embed every document into multiple vector spaces at ingest time. At query time, search one space, multiple spaces, or all of them. A cross-encoder reranker re-scores the merged candidates for maximum accuracy.
+
+```
+Query
+  |
+  +-- Tantivy BM25 -----------> FTS candidates
+  +-- Harrier HNSW -----------> text semantic candidates
+  +-- Qwen3-VL HNSW ----------> multimodal candidates
+  |
+  v
+  RRF merge (all three)
+  |
+  v
+  Reranker (cross-encoder re-scores top candidates)
+  |
+  v
+  Filter -> Score (recency, boost, relationships)
+  |
+  v
+  Return top_k
+```
+
+Pick the right retrieval path for the query:
+
+- **Text query, text docs:** search `harrier` space only
+- **Text query, find images/video:** search `qwen3-vl` space (cross-modal)
+- **Mixed collection, best accuracy:** search both spaces, RRF merge, rerank
+
+```bash
+# Search multiple vector spaces at once (merged via RRF, then reranked)
+curl -X POST localhost:4001/collections/media/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "goal celebration slow motion",
+    "mode": "hybrid",
+    "vector_space": ["harrier", "qwen3-vl"],
+    "top_k": 10
+  }'
+```
+
+Three retrievers, one reranker, one scoring pipeline. The reranker doesn't care which retriever found the candidate. It just scores (query, text) relevance from scratch.
+
 ### Recency bias + metadata boosting
 
 ```bash
