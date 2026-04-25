@@ -184,19 +184,48 @@ docker run -p 4001:4001 -v ./data:/app/data compass
 
 ## Embedding models
 
-Compass ships with a built-in BGE-small embedder (CPU, ~2-3ms/query). For production, use a GPU embedding server:
+Compass supports any embedding model via named vector spaces. Pick the right model for your use case:
+
+### Recommended models (April 2026)
+
+**For text search** (documents, code, multilingual), use Harrier or Qwen3:
+
+| Model | Score | Benchmark | Dims | License | GPU | When to use |
+|-------|-------|-----------|------|---------|-----|-------------|
+| Harrier-OSS-v1-0.6B | ~68 | MTEB v2 | 768 | MIT | 8GB | Default for most deployments. Best quality-per-VRAM. |
+| Qwen3-Embedding-8B | 70.58 | MTEB v2 | 32-7168 | Apache 2.0 | 16GB+ | When you need top-2 accuracy and have an A100/H100. |
+| Harrier-OSS-v1-27B | 74.3 | MTEB v2 | 1024 | MIT | 48GB+ | Maximum accuracy. Requires H100. |
+
+**For multimodal** (text queries finding images, video frames, PDFs):
+
+| Model | Score | Benchmark | Dims | License | GPU | When to use |
+|-------|-------|-----------|------|---------|-----|-------------|
+| Qwen3-VL-Embedding-2B | 0.945 | MMEB (cross-modal) | 896+ | Apache 2.0 | 8GB+ | Best cross-modal accuracy. Handles text + image + video in one space. |
+
+**For reranking** (re-scoring top results after retrieval):
+
+| Model | Score | Benchmark | License | GPU | When to use |
+|-------|-------|-----------|---------|-----|-------------|
+| Qwen3-Reranker-8B | 69.76 | MTEB-R | Apache 2.0 | 16GB+ | Best open-source reranker for multilingual + code. |
+| Contextual AI Reranker v2 | SOTA on QA | Various | Open source | 8GB+ | Best for Q&A-style retrieval. |
+
+**CPU-only fallback** (no GPU available, degraded mode):
+
+| Model | Score | Benchmark | Dims | License | When to use |
+|-------|-------|-----------|------|---------|-------------|
+| BGE-small-en-v1.5 | ~63 | MTEB | 384 | MIT | Local dev, CI/CD tests, or hardware with no GPU. Not recommended for production. |
+
+### Typical setup
+
+Most deployments need two vector spaces: one for text, one for multimodal (if applicable).
 
 ```bash
-# Run HuggingFace TEI with the flagship model
+# Run HuggingFace TEI with the recommended text model
 docker run -p 8080:80 --gpus all ghcr.io/huggingface/text-embeddings-inference \
-  --model-id Qwen/Qwen3-Embedding-8B
+  --model-id microsoft/harrier-oss-v1-0.6b
 ```
 
-| Model | MTEB | Dims | Modality | License | GPU |
-|-------|------|------|----------|---------|-----|
-| Qwen3-Embedding-8B | 70.58 | 32-7168 | Text + code | Apache 2.0 | 16GB+ |
-| Qwen3-VL-Embedding-2B | 0.945 cross-modal | 896+ | Text + image + video | Apache 2.0 | 8GB+ |
-| BGE-small-en-v1.5 | ~63 | 384 | Text | MIT | CPU only |
+MTEB and MMEB are different benchmarks on different scales. MTEB scores are 0-100 (text tasks). MMEB scores are 0-1 (cross-modal retrieval). They cannot be compared directly.
 
 ## API
 
