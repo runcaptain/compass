@@ -37,6 +37,23 @@ curl -X POST localhost:4001/collections/docs/ingest \
 curl -X POST localhost:4001/collections/docs/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "search engine", "mode": "hybrid"}'
+
+# Search with recency bias (newer docs score higher)
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "quarterly report",
+    "mode": "hybrid",
+    "recency": {
+      "field": "created_at",
+      "half_life_days": 30,
+      "min_score": 0.1
+    },
+    "boosts": [
+      {"field": "department", "value": "Legal", "weight": 2.0},
+      {"field": "priority", "gte": 3, "weight": 1.5}
+    ]
+  }'
 ```
 
 ## Docker
