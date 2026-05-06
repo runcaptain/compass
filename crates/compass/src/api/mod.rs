@@ -48,6 +48,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ── Health ───────────────────────────────────────────────────────
         .route("/health", get(health_check))
 
+        // 64 MB body limit. Default 2 MB is too small for batched ingest with embeddings.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+
         .with_state(state)
 }
 

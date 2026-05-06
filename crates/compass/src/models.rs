@@ -212,12 +212,29 @@ pub struct SearchRequest {
     /// Number of results to return (default: 10)
     #[serde(default = "default_top_k")]
     pub top_k: usize,
-    /// Metadata filters
+    /// Pre-computed query vector. When set, semantic search uses this directly
+    /// and skips in-process embedding. Useful for benchmarks and cases where
+    /// the caller has already embedded the query.
+    #[serde(default, alias = "vector")]
+    pub query_vector: Option<Vec<f32>>,
+    /// Metadata filters (exact match, range, contains, set membership).
+    /// Backward compatible: plain values are exact match.
     #[serde(default)]
-    pub filters: HashMap<String, MetadataValue>,
-    /// Recency decay configuration
+    pub filters: HashMap<String, FilterValue>,
+    /// Weights for blending FTS vs semantic scores in hybrid mode.
+    #[serde(default)]
+    pub score_weights: Option<ScoreWeights>,
+    /// Recency decay configuration (full control)
     #[serde(default)]
     pub recency: Option<RecencyConfig>,
+    /// Recency preset: "recent", "mild", "aggressive", or "archive".
+    /// Shorthand that expands to a RecencyConfig. Requires `recency_field`.
+    /// Ignored if `recency` is also set (explicit config wins).
+    #[serde(default)]
+    pub recency_preset: Option<String>,
+    /// Which metadata timestamp field to use with recency_preset (e.g. "created_at")
+    #[serde(default)]
+    pub recency_field: Option<String>,
     /// Metadata field boost factors
     #[serde(default)]
     pub boosts: Vec<BoostConfig>,
@@ -245,6 +262,24 @@ pub struct RecencyConfig {
     /// Floor value so old docs never go to zero (default: 0.1)
     #[serde(default = "default_min_score")]
     pub min_score: f64,
+}
+
+impl RecencyConfig {
+    /// Expand a preset name into a full RecencyConfig.
+    ///   "recent"     — 7-day half-life, floor 0.2 (news, feeds, tickets)
+    ///   "mild"       — 30-day half-life, floor 0.3 (docs, reports)
+    ///   "aggressive" — 3-day half-life, floor 0.05 (real-time, alerts)
+    ///   "archive"    — 90-day half-life, floor 0.5 (long-lived content)
+    pub fn from_preset(name: &str, field: String) -> Option<Self> {
+        let (half_life_days, min_score) = match name {
+            "recent" => (7.0, 0.2),
+            "mild" => (30.0, 0.3),
+            "aggressive" => (3.0, 0.05),
+            "archive" => (90.0, 0.5),
+            _ => return None,
+        };
+        Some(Self { field, half_life_days, min_score })
+    }
 }
 
 fn default_min_score() -> f64 {
@@ -299,6 +334,49 @@ fn default_sibling_weight() -> f64 {
 
 fn default_agg_mode() -> String {
     "max".to_string()
+}
+
+// ── Filter Types ─────────────────────────────────────────────────────────
+// Rich metadata filters: range (gte/lte), array contains, set membership.
+// Backward compatible: a plain MetadataValue in JSON still works as exact match.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilterCondition {
+    #[serde(default)]
+    pub gte: Option<f64>,
+    #[serde(default)]
+    pub lte: Option<f64>,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default, rename = "in")]
+    pub in_values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum FilterValue {
+    Condition(FilterCondition),
+    Exact(MetadataValue),
+}
+
+// ── Score Weights ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoreWeights {
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f64,
+    #[serde(default = "default_score_weight")]
+    pub fts_weight: f64,
+    #[serde(default = "default_score_weight")]
+    pub semantic_weight: f64,
+}
+
+fn default_rrf_k() -> f64 {
+    60.0
+}
+
+fn default_score_weight() -> f64 {
+    1.0
 }
 
 /// GET /collections/:name/facets

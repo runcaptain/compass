@@ -1,0 +1,47 @@
+[package]
+name = "compass"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Embedded vector + full-text search engine. Single binary, zero external dependencies."
+
+[[bin]]
+name = "compass"
+path = "src/main.rs"
+
+[features]
+default = []
+# Opt-in GPU vector backend via the compass-vector-gpu crate.
+# Requires CUDA 12+ and a Linux host. See ARCHITECTURE.md for build details.
+gpu = ["dep:compass-vector-gpu"]
+
+[dependencies]
+# Internal trait crate — defines VectorIndex, IndexParams, IndexError.
+# Stable surface that pluggable backends bind to.
+compass-index-api = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rayon = { workspace = true }
+half = { workspace = true }
+tantivy = { workspace = true }
+usearch = { workspace = true }
+tokenizers = { workspace = true }
+safetensors = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+hf-hub = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Optional GPU backend, enabled with --features gpu
+compass-vector-gpu = { path = "../compass-vector-gpu", optional = true }

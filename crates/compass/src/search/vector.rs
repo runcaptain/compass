@@ -61,7 +61,11 @@ fn create_index(dims: usize, capacity: usize) -> Result<Index, Box<dyn std::erro
     let index = Index::new(&opts)
         .map_err(|e| format!("Failed to create USearch index: {}", e))?;
     if capacity > 0 {
-        let threads = rayon::current_num_threads();
+        // Reserve enough concurrent search slots for the spawn_blocking pool.
+        // Default rayon threads (=CPU count) is too low when search runs on
+        // tokio's blocking pool. 128 slots costs ~256KB and avoids the
+        // "No available threads to lock" fallback to brute-force.
+        let threads = 128.max(rayon::current_num_threads());
         index.reserve_capacity_and_threads(capacity, threads)
             .map_err(|e| format!("Failed to reserve USearch capacity: {}", e))?;
     }

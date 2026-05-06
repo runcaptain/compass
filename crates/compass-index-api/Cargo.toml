@@ -1,0 +1,13 @@
+[package]
+name = "compass-index-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Stable trait API for Compass vector index backends. Implementors include the bundled USearch CPU backend and the optional cuVS GPU backend."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

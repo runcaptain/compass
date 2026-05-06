@@ -1,6 +1,6 @@
 # Compass
 
-Embedded vector + full-text search engine for [Captain](https://runcaptain.com). Single binary, zero external dependencies. Built for on-prem enterprise deployments where customer data cannot leave their VPC.
+Embedded vector + full-text search engine for [Captain](https://runcaptain.com). Single binary, zero external dependencies. Designed for high-throughput retrieval. Built for on-prem enterprise deployments where customer data cannot leave their VPC.
 
 ## What it does
 
@@ -11,7 +11,7 @@ Embedded vector + full-text search engine for [Captain](https://runcaptain.com).
 - **One-click model upgrades** with background re-embedding and atomic swap
 - **Parent-child documents** with relationship-aware scoring (TAMS video search compatible)
 - **Query-time scoring**: recency decay, metadata boosting, relationship boosting
-- **Metadata filtering**: typed values (string, int, float, bool, timestamp, string list)
+- **Metadata filtering**: exact match, numeric range (gte/lte), array contains, set membership. Typed values (string, int, float, bool, timestamp, string list)
 - **Native query embedding** via Candle BGE-small (Rust, no Python). GPU endpoint support for larger models.
 - **Fully offline**. No API calls. Model weights on disk. Data never leaves the machine.
 
@@ -113,13 +113,15 @@ Three retrievers, one reranker, one scoring pipeline. The reranker doesn't care 
 
 ### Recency bias + metadata boosting
 
+Pick a preset to favor newer results. Older docs score lower but never disappear:
+
 ```bash
 curl -X POST localhost:4001/collections/docs/search \
   -H 'Content-Type: application/json' \
   -d '{
     "query": "quarterly report",
-    "mode": "hybrid",
-    "recency": {"field": "created_at", "half_life_days": 30, "min_score": 0.1},
+    "recency_preset": "mild",
+    "recency_field": "created_at",
     "boosts": [
       {"field": "department", "value": "Legal", "weight": 2.0},
       {"field": "priority", "gte": 3, "weight": 1.5}
@@ -127,20 +129,76 @@ curl -X POST localhost:4001/collections/docs/search \
   }'
 ```
 
-Recency decay formula: `score *= max(min_score, 2^(-age_days / half_life_days))`. A 30-day-old doc scores 0.5x. A 60-day-old doc scores 0.25x. The floor prevents old docs from vanishing entirely.
+Four presets. How quickly old docs lose ranking:
+
+```
+  strong bias ◄───────────────► weak bias
+
+  aggressive    recent     mild       archive
+  ├── 3d ──┤  ├── 7d ──┤  ├── 30d ──┤  ├── 90d ──┤
+```
+
+
+| Use case                                     | Preset       | Docs lose half their recency score after... | Old docs bottom out at... |
+| -------------------------------------------- | ------------ | ------------------------------------------- | ------------------------- |
+| Real-time alerts, live events, TAMS segments | `aggressive` | 3 days                                      | 5%                        |
+| News, feeds, support tickets                 | `recent`     | 7 days                                      | 20%                       |
+| Docs, reports, meeting notes                 | `mild`       | 30 days                                     | 30%                       |
+| Long-lived content, legal docs, compliance   | `archive`    | 90 days                                     | 50%                       |
+
+
+For full control, use `recency` instead (overrides any preset):
+
+```bash
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "quarterly report",
+    "recency": {"field": "created_at", "half_life_days": 30, "min_score": 0.1}
+  }'
+```
+
+Recency decay formula: `score *= max(min_score, 2^(-age_days / half_life_days))`. A 30-day-old doc scores 0.5x with the default. The `field` is always user-controlled. Compass never assumes which metadata field represents "time".
 
 ### Metadata filtering
 
+Filters are hard constraints applied before scoring. Only matching documents are scored and returned.
+
 ```bash
+# Exact match (string, bool, number)
 curl -X POST localhost:4001/collections/docs/search \
   -H 'Content-Type: application/json' \
   -d '{
     "query": "compliance",
     "filters": {"department": "Legal", "active": true}
   }'
+
+# Numeric range (gte/lte)
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "quarterly report",
+    "filters": {"priority": {"gte": 3, "lte": 10}}
+  }'
+
+# Array contains
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "highlights",
+    "filters": {"tags": {"contains": "sports"}}
+  }'
+
+# Set membership (doc_type, category, etc.)
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "meeting notes",
+    "filters": {"doc_type": {"in": ["segment", "flow"]}}
+  }'
 ```
 
-Filters are hard constraints applied before scoring. Only matching documents are scored and returned.
+All operators: exact match (backward compatible), `gte`/`lte` (numeric range), `contains` (array membership), `in` (set membership). Operators combine as AND across fields.
 
 ### Parent-child documents + relationship boost
 
@@ -183,6 +241,44 @@ curl -X POST localhost:4001/collections/media/search \
     "relationship_boost": {"parent_weight": 0.3, "sibling_weight": 0.1, "mode": "max"}
   }'
 ```
+
+### TAMS time-range search
+
+[TAMS](https://github.com/bbc/tams) (Time-Addressable Media Store) is BBC R&D's open spec for media archives. Media is addressed by time, not by file. The data model: **Source** (logical content) → **Flow** (specific rendition) → **Segment** (time-bounded chunk with `timerange_start`/`timerange_end`).
+
+Compass models this hierarchy via `doc_type` + `parent_id` + `group_id`. Ingest segments with time range metadata, then query by content and time:
+
+```bash
+curl -X POST localhost:4001/collections/media/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "goal celebration",
+    "filters": {
+      "doc_type": {"in": ["segment"]},
+      "timerange_start": {"gte": 2040.0},
+      "timerange_end": {"lte": 2100.0}
+    },
+    "relationship_boost": {"parent_weight": 0.3, "sibling_weight": 0.1}
+  }'
+```
+
+This finds segments matching "goal celebration" within the 2040-2100 second window. Relationship boosting surfaces sibling segments and the parent flow alongside the match.
+
+### Hybrid score weights
+
+Control how FTS and semantic scores blend in hybrid mode. Useful when one signal matters more for your use case:
+
+```bash
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "quarterly earnings",
+    "mode": "hybrid",
+    "score_weights": {"rrf_k": 60.0, "fts_weight": 2.0, "semantic_weight": 0.5}
+  }'
+```
+
+`rrf_k` is the RRF constant (default 60). Lower values amplify top-rank differences. `fts_weight` and `semantic_weight` control relative contribution (default 1.0 each). Set `fts_weight: 2.0` to favor keyword matches, or `semantic_weight: 2.0` when meaning matters more than exact terms.
 
 ### Facets
 
@@ -230,34 +326,42 @@ docker run -p 4001:4001 -v ./data:/app/data compass
 
 Compass supports any embedding model via named vector spaces. Pick the right model for your use case:
 
-### Recommended models (April 2026)
+### Recommended open-weight models (May 2026)
 
 **For text search** (documents, code, multilingual), use Harrier or Qwen3:
 
-| Model | Score | Benchmark | Dims | License | GPU | When to use |
-|-------|-------|-----------|------|---------|-----|-------------|
-| Harrier-OSS-v1-0.6B | ~68 | MTEB v2 | 768 | MIT | 8GB | Default for most deployments. Best quality-per-VRAM. |
-| Qwen3-Embedding-8B | 70.58 | MTEB v2 | 32-7168 | Apache 2.0 | 16GB+ | When you need top-2 accuracy and have an A100/H100. |
-| Harrier-OSS-v1-27B | 74.3 | MTEB v2 | 1024 | MIT | 48GB+ | Maximum accuracy. Requires H100. |
+
+| Model               | Score | Benchmark | Dims    | License    | GPU   | When to use                                          |
+| ------------------- | ----- | --------- | ------- | ---------- | ----- | ---------------------------------------------------- |
+| Harrier-OSS-v1-0.6B | ~68   | MTEB v2   | 768     | MIT        | 8GB   | Default for most deployments. Best quality-per-VRAM. |
+| Qwen3-Embedding-8B  | 70.58 | MTEB v2   | 32-7168 | Apache 2.0 | 16GB+ | When you need top-2 accuracy and have an A100/H100.  |
+| Harrier-OSS-v1-27B  | 74.3  | MTEB v2   | 1024    | MIT        | 48GB+ | Maximum accuracy. Requires H100.                     |
+
 
 **For multimodal** (text queries finding images, video frames, PDFs):
 
-| Model | Score | Benchmark | Dims | License | GPU | When to use |
-|-------|-------|-----------|------|---------|-----|-------------|
+
+| Model                 | Score | Benchmark          | Dims | License    | GPU  | When to use                                                           |
+| --------------------- | ----- | ------------------ | ---- | ---------- | ---- | --------------------------------------------------------------------- |
 | Qwen3-VL-Embedding-2B | 0.945 | MMEB (cross-modal) | 896+ | Apache 2.0 | 8GB+ | Best cross-modal accuracy. Handles text + image + video in one space. |
+
 
 **For reranking** (re-scoring top results after retrieval):
 
-| Model | Score | Benchmark | License | GPU | When to use |
-|-------|-------|-----------|---------|-----|-------------|
-| Qwen3-Reranker-8B | 69.76 | MTEB-R | Apache 2.0 | 16GB+ | Best open-source reranker for multilingual + code. |
-| Contextual AI Reranker v2 | SOTA on QA | Various | Open source | 8GB+ | Best for Q&A-style retrieval. |
+
+| Model                     | Score      | Benchmark | License     | GPU   | When to use                                        |
+| ------------------------- | ---------- | --------- | ----------- | ----- | -------------------------------------------------- |
+| Qwen3-Reranker-8B         | 69.76      | MTEB-R    | Apache 2.0  | 16GB+ | Best open-source reranker for multilingual + code. |
+| Contextual AI Reranker v2 | SOTA on QA | Various   | Open source | 8GB+  | Best for Q&A-style retrieval.                      |
+
 
 **CPU-only fallback** (no GPU available, degraded mode):
 
-| Model | Score | Benchmark | Dims | License | When to use |
-|-------|-------|-----------|------|---------|-------------|
-| BGE-small-en-v1.5 | ~63 | MTEB | 384 | MIT | Local dev, CI/CD tests, or hardware with no GPU. Not recommended for production. |
+
+| Model             | Score | Benchmark | Dims | License | When to use                                                                      |
+| ----------------- | ----- | --------- | ---- | ------- | -------------------------------------------------------------------------------- |
+| BGE-small-en-v1.5 | ~63   | MTEB      | 384  | MIT     | Local dev, CI/CD tests, or hardware with no GPU. Not recommended for production. |
+
 
 ### Typical setup
 
@@ -271,28 +375,44 @@ docker run -p 8080:80 --gpus all ghcr.io/huggingface/text-embeddings-inference \
 
 MTEB and MMEB are different benchmarks on different scales. MTEB scores are 0-100 (text tasks). MMEB scores are 0-1 (cross-modal retrieval). They cannot be compared directly.
 
+## Throughput and scaling
+
+**Query throughput.** USearch HNSW serves around 15k QPS per instance on a 16-core box at p99 < 50ms for top-10 retrieval. For very high QPS workloads, shard collections across multiple Compass instances behind a load balancer.
+
+**Indexing throughput.** Point `embed_endpoint` at a GPU-backed HuggingFace TEI or vLLM cluster. A single A10G handles around 1,500 docs/sec on Qwen3-Embedding-8B. Scale linearly by adding GPU replicas.
+
+```bash
+# Spin up TEI with the recommended text model
+docker run -p 8080:80 --gpus all ghcr.io/huggingface/text-embeddings-inference \
+  --model-id Qwen/Qwen3-Embedding-8B
+
+# Point Compass at it during rebuild or ingestion
+curl -X POST localhost:4001/collections/docs/vector-spaces/qwen3/rebuild \
+  -d '{"embed_endpoint": "http://localhost:8080/embed"}'
+```
+
 ## API
 
 ```
-POST   /collections                              Create collection
-GET    /collections                              List collections
-GET    /collections/:name                        Get collection info
-DELETE /collections/:name                        Delete collection + data
+POST   /collections                                    Create collection
+GET    /collections                                    List collections
+GET    /collections/:name                              Get collection info
+DELETE /collections/:name                              Delete collection + data
 
-POST   /collections/:name/ingest                 Bulk ingest chunks
-POST   /collections/:name/search                 Search (fts|semantic|hybrid)
-GET    /collections/:name/facets                 Facet counts
+POST   /collections/:name/ingest                       Bulk ingest chunks
+POST   /collections/:name/search                       Search (fts|semantic|hybrid)
+GET    /collections/:name/facets                       Facet counts
 
-POST   /collections/:name/vector-spaces          Add a vector space
-GET    /collections/:name/vector-spaces          List vector spaces
-DELETE /collections/:name/vector-spaces/:space   Remove a vector space
-POST   /collections/:name/vector-spaces/:space/rebuild   Trigger re-embedding
-GET    /collections/:name/vector-spaces/:space/status    Rebuild progress
-PUT    /collections/:name/default-vector-space   Switch default space
+POST   /collections/:name/vector-spaces                Add a vector space
+GET    /collections/:name/vector-spaces                List vector spaces
+DELETE /collections/:name/vector-spaces/:space         Remove a vector space
+POST   /collections/:name/vector-spaces/:space/rebuild Trigger re-embedding
+GET    /collections/:name/vector-spaces/:space/status  Rebuild progress
+PUT    /collections/:name/default-vector-space         Switch default space
 
-GET    /health                                   Health check
+GET    /health                                         Health check
 ```
 
 ## License
 
-Private. Copyright Captain (YC W26).
+Apache 2.0. See [LICENSE](LICENSE).

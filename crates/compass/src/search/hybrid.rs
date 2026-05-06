@@ -13,9 +13,6 @@
 
 use std::collections::HashMap;
 
-/// RRF constant. k=60 is the standard value from the original paper by Cormack et al.
-const K: f32 = 60.0;
-
 /// A merged search result with source tracking.
 #[derive(Debug, Clone)]
 pub struct HybridResult {
@@ -49,25 +46,28 @@ impl ResultSource {
 ///
 /// Both input lists should be ordered by relevance (position 0 = best match).
 /// Returns merged results sorted by combined RRF score, truncated to `limit`.
+///
+/// `rrf_k`: RRF constant (default 60.0). Lower values amplify top-rank differences.
+/// `fts_weight` / `semantic_weight`: relative contribution weights (default 1.0 each).
 pub fn merge_rrf(
-    fts_results: &[(u64, f32)],      // (chunk_id, bm25_score), ranked by relevance
-    semantic_results: &[(u64, f32)],  // (chunk_id, cosine_score), ranked by relevance
+    fts_results: &[(u64, f32)],
+    semantic_results: &[(u64, f32)],
     limit: usize,
+    rrf_k: f32,
+    fts_weight: f32,
+    semantic_weight: f32,
 ) -> Vec<HybridResult> {
-    // Accumulator: chunk_id -> (rrf_score, found_in_fts, found_in_semantic)
     let mut scores: HashMap<u64, (f32, bool, bool)> = HashMap::new();
 
-    // Add FTS contributions: each result gets 1/(k + its rank position)
     for (rank, &(chunk_id, _bm25)) in fts_results.iter().enumerate() {
         let entry = scores.entry(chunk_id).or_insert((0.0, false, false));
-        entry.0 += 1.0 / (K + rank as f32);
+        entry.0 += fts_weight * (1.0 / (rrf_k + rank as f32));
         entry.1 = true;
     }
 
-    // Add semantic contributions: same formula
     for (rank, &(chunk_id, _cosine)) in semantic_results.iter().enumerate() {
         let entry = scores.entry(chunk_id).or_insert((0.0, false, false));
-        entry.0 += 1.0 / (K + rank as f32);
+        entry.0 += semantic_weight * (1.0 / (rrf_k + rank as f32));
         entry.2 = true;
     }
 

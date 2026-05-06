@@ -14,6 +14,7 @@ pub mod relationships;
 pub mod store;
 
 use crate::embed::EmbedState;
+use crate::filter;
 use crate::models::*;
 use crate::scoring::{self, ScoredCandidate};
 use crate::search::hybrid;
@@ -32,8 +33,9 @@ use tokio::sync::RwLock;
 struct LoadedCollection {
     metadata: Collection,
     fts: FtsState,
-    /// Named vector spaces, each with its own USearch HNSW index
-    vector_spaces: HashMap<String, VectorState>,
+    /// Named vector spaces, each with its own USearch HNSW index.
+    /// Arc-wrapped so search can clone cheaply and run in spawn_blocking.
+    vector_spaces: HashMap<String, Arc<VectorState>>,
     /// Document relationships (parent-child + sibling groups)
     relationships: RelationshipStore,
     /// All chunks in memory, keyed by chunk ID for O(1) retrieval
@@ -99,7 +101,7 @@ impl CollectionManager {
             if vecs_path.exists() {
                 match vector::load_vector_index(&index_path, &vecs_path, space_config.dims) {
                     Ok(vs) => {
-                        vector_spaces.insert(space_name.clone(), vs);
+                        vector_spaces.insert(space_name.clone(), Arc::new(vs));
                     }
                     Err(e) => {
                         tracing::warn!("Failed to load vector space '{}' for '{}': {}", space_name, name, e);
@@ -107,12 +109,12 @@ impl CollectionManager {
                 }
             } else {
                 // Empty vector space (no vectors yet)
-                vector_spaces.insert(space_name.clone(), VectorState {
+                vector_spaces.insert(space_name.clone(), Arc::new(VectorState {
                     index: None,
                     key_to_chunk_id: Vec::new(),
                     vectors: Vec::new(),
                     dims: space_config.dims,
-                });
+                }));
             }
         }
 
@@ -189,12 +191,12 @@ impl CollectionManager {
         // Create empty vector spaces
         let mut vs_map = HashMap::new();
         for (sname, sconfig) in &collection.vector_spaces {
-            vs_map.insert(sname.clone(), VectorState {
+            vs_map.insert(sname.clone(), Arc::new(VectorState {
                 index: None,
                 key_to_chunk_id: Vec::new(),
                 vectors: Vec::new(),
                 dims: sconfig.dims,
-            });
+            }));
         }
 
         let loaded = LoadedCollection {
@@ -256,12 +258,12 @@ impl CollectionManager {
             status: "building".to_string(),
         });
 
-        loaded.vector_spaces.insert(space_name.to_string(), VectorState {
+        loaded.vector_spaces.insert(space_name.to_string(), Arc::new(VectorState {
             index: None,
             key_to_chunk_id: Vec::new(),
             vectors: Vec::new(),
             dims,
-        });
+        }));
 
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
         Ok(())
@@ -340,7 +342,7 @@ impl CollectionManager {
 
         if vecs_path.exists() {
             let vs = vector::load_vector_index(&index_path, &vecs_path, dims)?;
-            loaded.vector_spaces.insert(space_name.to_string(), vs);
+            loaded.vector_spaces.insert(space_name.to_string(), Arc::new(vs));
         }
 
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
@@ -469,7 +471,7 @@ impl CollectionManager {
             }
 
             let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
-            loaded.vector_spaces.insert(space_name, vs);
+            loaded.vector_spaces.insert(space_name, Arc::new(vs));
         }
 
         // Phase 6: Save metadata + relationships
@@ -517,8 +519,16 @@ impl CollectionManager {
 
         let semantic_results = if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
             if let Some(vs) = loaded.vector_spaces.get(space_name) {
-                if let Ok(query_vec) = embed_state.embed_query(&req.query) {
-                    let vr = vector::search_vectors(&query_vec, vs, rerank_k);
+                let query_vec_opt: Option<Vec<f32>> = req.query_vector.clone()
+                    .or_else(|| embed_state.embed_query(&req.query).ok());
+                if let Some(query_vec) = query_vec_opt {
+                    // Clone the Arc<VectorState> cheaply and run the blocking
+                    // USearch FFI call on a dedicated thread pool. This prevents
+                    // the search from starving the tokio async runtime.
+                    let vs_clone = vs.clone();
+                    let vr = tokio::task::spawn_blocking(move || {
+                        vector::search_vectors(&query_vec, &vs_clone, rerank_k)
+                    }).await.unwrap_or_default();
                     vr.iter().map(|r| (r.chunk_id, r.score)).collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -533,7 +543,11 @@ impl CollectionManager {
         // ── Step 2: Merge via RRF (for hybrid) or use single-mode results ──
         let mut candidates: Vec<ScoredCandidate> = match mode {
             SearchMode::Hybrid if !fts_results.is_empty() || !semantic_results.is_empty() => {
-                let merged = hybrid::merge_rrf(&fts_results, &semantic_results, rerank_k);
+                let (rrf_k, fts_w, sem_w) = match &req.score_weights {
+                    Some(sw) => (sw.rrf_k as f32, sw.fts_weight as f32, sw.semantic_weight as f32),
+                    None => (60.0, 1.0, 1.0),
+                };
+                let merged = hybrid::merge_rrf(&fts_results, &semantic_results, rerank_k, rrf_k, fts_w, sem_w);
                 merged.iter().map(|r| ScoredCandidate {
                     chunk_id: r.chunk_id,
                     base_score: r.rrf_score,
@@ -560,20 +574,26 @@ impl CollectionManager {
         if !req.filters.is_empty() {
             candidates.retain(|c| {
                 if let Some(chunk) = loaded.chunks.get(&c.chunk_id) {
-                    req.filters.iter().all(|(key, filter_val)| {
-                        chunk.metadata.get(key).map_or(false, |v| v == filter_val)
-                    })
+                    filter::matches_filters(chunk, &req.filters)
                 } else {
-                    true // chunk not in memory (loaded from disk), keep it
+                    true
                 }
             });
         }
 
         // ── Step 4: Apply scoring pipeline ──────────────────────────────
-        let has_scoring = req.recency.is_some() || !req.boosts.is_empty() || req.relationship_boost.is_some();
+        // Resolve recency preset into a full config (explicit `recency` wins)
+        let recency_config = req.recency.clone().or_else(|| {
+            req.recency_preset.as_deref().and_then(|preset| {
+                req.recency_field.as_deref().map(|field| {
+                    RecencyConfig::from_preset(preset, field.to_string())
+                }).flatten()
+            })
+        });
+
+        let has_scoring = recency_config.is_some() || !req.boosts.is_empty() || req.relationship_boost.is_some();
 
         if has_scoring && !candidates.is_empty() {
-            // Build metadata map for candidates
             let chunk_metadata: HashMap<u64, HashMap<String, MetadataValue>> = candidates
                 .iter()
                 .filter_map(|c| {
@@ -583,7 +603,6 @@ impl CollectionManager {
                 })
                 .collect();
 
-            // Build relationship maps for candidates
             let candidate_ids: Vec<u64> = candidates.iter().map(|c| c.chunk_id).collect();
             let (parent_ids, sibling_map) = loaded.relationships.build_scoring_maps(&candidate_ids);
 
@@ -592,7 +611,7 @@ impl CollectionManager {
                 &chunk_metadata,
                 &parent_ids,
                 &sibling_map,
-                &req.recency,
+                &recency_config,
                 &req.boosts,
                 &req.relationship_boost,
             );

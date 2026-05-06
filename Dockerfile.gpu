@@ -1,0 +1,56 @@
+# GPU-enabled Compass build (cuVS / CAGRA → HNSW).
+#
+# Requires a Linux x86_64 host with CUDA 12+ runtime at deploy time.
+# The first build pulls and compiles cuVS from source; expect 30-60 minutes
+# on a fresh box. Cache the builder layer aggressively in CI.
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    build-essential \
+    gcc-11 \
+    g++-11 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin gcc-11 (cuVS requires gcc 11+).
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100
+
+# Install Rust 1.82.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.82.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock* ./
+COPY crates/ crates/
+
+# Build with the gpu feature. cuVS will be cloned and cmake-built on first run.
+RUN cargo build --release -p compass --features gpu
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/compass /app/compass
+RUN mkdir -p /app/data
+
+ENV PORT=4001
+ENV DATA_DIR=/app/data
+ENV COMPASS_BACKEND=auto
+EXPOSE 4001
+
+CMD ["/app/compass"]

@@ -14,6 +14,7 @@
 mod api;
 mod collections;
 mod embed;
+mod filter;
 mod models;
 mod scoring;
 mod search;

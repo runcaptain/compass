@@ -1,0 +1,31 @@
+[package]
+name = "compass-vector-gpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "GPU-accelerated vector index backend for Compass via NVIDIA cuVS. Linux + CUDA only."
+
+[dependencies]
+compass-index-api = { workspace = true }
+
+# cuVS Rust bindings. crates.io publishes lag the source tree by months,
+# so we pin to a specific RAPIDS release tag from git.
+# Build prerequisites: CUDA 12+, CMake 3.26+, gcc 11+ (~30-60min first build).
+# See ARCHITECTURE.md for full setup.
+cuvs = { git = "https://github.com/rapidsai/cuvs", tag = "v25.10.00" }
+
+half = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "compass_vector_gpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compass-gpu-smoke"
+path = "src/bin/smoke.rs"
