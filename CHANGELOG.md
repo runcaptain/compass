@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`ARCHITECTURE.md`.** Contributor's map: crate layout, module map, storage format, rebuild flow.
 - **`CONTRIBUTING.md`.** PR checklist, commit format, scope guidelines.
 - **Throughput and scaling section** in README documenting QPS expectations and horizontal scaling pattern.
+- **Rich metadata filters.** Filters now support numeric range (`gte`/`lte`), array `contains`, and set membership (`in`) in addition to exact match. Backward compatible: plain values still work as exact match.
+- **TAMS time-range queries.** Filter segments by `timerange_start`/`timerange_end` using range operators. Combined with `doc_type` filtering and relationship boost for hierarchy-aware video search.
+- **Configurable hybrid score weights.** New `score_weights` field on search requests controls RRF blending: `rrf_k`, `fts_weight`, `semantic_weight`. Previously hardcoded at k=60 with equal weights.
+- **Recency presets.** `recency_preset` field accepts `aggressive` (3d), `recent` (7d), `mild` (30d), or `archive` (90d) instead of manually configuring the decay formula. Pair with `recency_field` to specify which timestamp metadata field to use.
+- **Apache 2.0 license.**
 
 ### Changed
 
