@@ -30,7 +30,10 @@ pub struct VectorState {
     /// Maps HNSW key -> chunk ID. HNSW keys are sequential (0, 1, 2, ...),
     /// chunk IDs may not be (especially after deletions or multi-batch ingests).
     pub key_to_chunk_id: Vec<u64>,
-    /// All stored vectors, in key order. Used for brute-force fallback on small datasets.
+    /// Memory-mapped vector storage. Replaces the old Vec<Vec<f32>> to avoid
+    /// loading all vectors into RAM. Zero-copy reads via mmap.
+    pub mmap_vectors: Option<super::mmap_vectors::MmapVectors>,
+    /// Legacy in-memory vectors for datasets without an mmap file (e.g. first build).
     pub vectors: Vec<Vec<f32>>,
     /// Embedding dimensionality (e.g. 384 for BGE-small)
     pub dims: usize,
@@ -48,7 +51,7 @@ pub struct VectorResult {
 }
 
 /// Create a new USearch HNSW index with the given dimensions and capacity.
-fn create_index(dims: usize, capacity: usize) -> Result<Index, Box<dyn std::error::Error + Send + Sync>> {
+pub fn create_index(dims: usize, capacity: usize) -> Result<Index, Box<dyn std::error::Error + Send + Sync>> {
     let opts = IndexOptions {
         dimensions: dims,
         metric: MetricKind::Cos,        // cosine similarity
@@ -86,20 +89,25 @@ pub fn build_vector_index(
         return Ok(VectorState {
             index: None,
             key_to_chunk_id: Vec::new(),
+            mmap_vectors: None,
             vectors: Vec::new(),
             dims,
         });
     }
 
-    // Save raw vectors to disk (for brute-force fallback and future rebuilds)
-    save_vectors(vectors_path, vectors, dims)?;
+    // Save raw vectors to mmap-backed file (replaces in-memory Vec<Vec<f32>>)
+    if let Some(parent) = vectors_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mmap = super::mmap_vectors::MmapVectors::create(vectors_path, dims, vectors)?;
 
     // For small datasets, skip HNSW and use brute-force search
     if vectors.len() < HNSW_THRESHOLD {
         return Ok(VectorState {
             index: None,
             key_to_chunk_id: chunk_ids.to_vec(),
-            vectors: vectors.to_vec(),
+            mmap_vectors: Some(mmap),
+            vectors: Vec::new(),
             dims,
         });
     }
@@ -127,7 +135,8 @@ pub fn build_vector_index(
     Ok(VectorState {
         index: Some(index),
         key_to_chunk_id: chunk_ids.to_vec(),
-        vectors: vectors.to_vec(),
+        mmap_vectors: Some(mmap),
+        vectors: Vec::new(),
         dims,
     })
 }
@@ -138,19 +147,34 @@ pub fn load_vector_index(
     vectors_path: &Path,
     dims: usize,
 ) -> Result<VectorState, Box<dyn std::error::Error + Send + Sync>> {
-    // Load raw vectors
-    let vectors = load_vectors(vectors_path, dims)?;
+    // Load vectors via mmap (zero-copy, no RAM allocation for vector data)
+    let mmap = if vectors_path.exists() {
+        Some(super::mmap_vectors::MmapVectors::open(vectors_path)?)
+    } else {
+        // Fall back to legacy binary format
+        let vecs = load_vectors(vectors_path, dims)?;
+        if !vecs.is_empty() {
+            // Migrate: create mmap file from legacy data
+            let m = super::mmap_vectors::MmapVectors::create(vectors_path, dims, &vecs)?;
+            Some(m)
+        } else {
+            None
+        }
+    };
+
+    let count = mmap.as_ref().map(|m| m.len()).unwrap_or(0);
 
     // Load the key-to-chunk-id mapping
     let map_path = index_path.with_extension("keymap");
     let key_to_chunk_id = load_key_map(&map_path)?;
 
     // For small datasets, skip HNSW
-    if vectors.len() < HNSW_THRESHOLD {
+    if count < HNSW_THRESHOLD {
         return Ok(VectorState {
             index: None,
             key_to_chunk_id,
-            vectors,
+            mmap_vectors: mmap,
+            vectors: Vec::new(),
             dims,
         });
     }
@@ -164,15 +188,16 @@ pub fn load_vector_index(
         Ok(VectorState {
             index: Some(index),
             key_to_chunk_id,
-            vectors,
+            mmap_vectors: mmap,
+            vectors: Vec::new(),
             dims,
         })
     } else {
-        // No HNSW file — fall back to brute-force
         Ok(VectorState {
             index: None,
             key_to_chunk_id,
-            vectors,
+            mmap_vectors: mmap,
+            vectors: Vec::new(),
             dims,
         })
     }
@@ -210,14 +235,23 @@ pub fn search_vectors(
     }
 
     // Brute-force fallback: compute cosine similarity against all vectors
-    let mut scores: Vec<(usize, f32)> = state.vectors.iter()
-        .enumerate()
-        .map(|(i, v)| {
-            // Dot product of normalized vectors = cosine similarity
-            let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-            (i, score)
-        })
-        .collect();
+    let mut scores: Vec<(usize, f32)> = if let Some(ref mmap) = state.mmap_vectors {
+        mmap.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (i, score)
+            })
+            .collect()
+    } else {
+        state.vectors.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (i, score)
+            })
+            .collect()
+    };
 
     // Sort by score descending (highest similarity first)
     scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -293,7 +327,7 @@ fn load_vectors(
 }
 
 /// Save key-to-chunk-id mapping. Format: [u32 count] [count * u64 chunk_ids]
-fn save_key_map(path: &Path, chunk_ids: &[u64]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_key_map(path: &Path, chunk_ids: &[u64]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf: Vec<u8> = Vec::with_capacity(4 + chunk_ids.len() * 8);
     buf.extend_from_slice(&(chunk_ids.len() as u32).to_le_bytes());
     for &id in chunk_ids {

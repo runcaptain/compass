@@ -6,7 +6,9 @@
 //   Hybrid:   Both combined via Reciprocal Rank Fusion (RRF, k=60)
 
 pub mod backend;
+pub mod chunk_store;
 pub mod hybrid;
+pub mod mmap_vectors;
 pub mod tantivy_fts;
 pub mod vector;
 
