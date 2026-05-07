@@ -277,8 +277,9 @@ pub fn search_vectors(query_vec: &[f32], state: &VectorState, top_k: usize) -> V
 // ── Persistence helpers ──────────────────────────────────────────────────────
 // Simple binary formats for saving/loading vectors and key maps to disk.
 
-/// Save vectors to a binary file.
+/// Save vectors to a binary file (legacy format, kept for migration).
 /// Format: [u32 count] [u32 dims] [count * dims * f32 values]
+#[allow(dead_code)]
 fn save_vectors(
     path: &Path,
     vectors: &[Vec<f32>],

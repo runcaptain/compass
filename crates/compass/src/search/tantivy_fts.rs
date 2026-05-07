@@ -51,6 +51,7 @@ impl BitSet {
 
     /// Create a bitset with ALL bits set to 1 (everything matches).
     /// Used for unfiltered facet queries where every document counts.
+    #[allow(dead_code)]
     fn all(num_bits: usize) -> Self {
         let num_words = (num_bits + 63) / 64;
         let mut words = vec![u64::MAX; num_words];
