@@ -357,6 +357,7 @@ impl CollectionManager {
     }
 
     /// Mark a vector space as active (called when rebuild completes).
+    #[allow(dead_code)]
     pub async fn mark_vector_space_active(
         &self,
         collection_name: &str,
