@@ -77,7 +77,10 @@ pub struct ThreadSafeDistilledEmbedder {
 impl ThreadSafeDistilledEmbedder {
     /// Encode a query string into a normalized embedding vector (~50-100μs).
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
-        let embedder = self.inner.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+        let embedder = self
+            .inner
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
         Ok(embedder.encode(text))
     }
 }
@@ -98,7 +101,10 @@ pub fn init_distilled(model_dir: &Path) -> Option<ThreadSafeDistilledEmbedder> {
         return None;
     }
 
-    tracing::info!("Loading distilled query embedder from {}...", model_dir.display());
+    tracing::info!(
+        "Loading distilled query embedder from {}...",
+        model_dir.display()
+    );
     let load_start = std::time::Instant::now();
 
     // Load tokenizer
@@ -116,10 +122,7 @@ pub fn init_distilled(model_dir: &Path) -> Option<ThreadSafeDistilledEmbedder> {
     // Convert FP16 bytes to FP32 embedding matrix
     let fp16_data = tensor.data();
     let fp16_slice: &[f16] = unsafe {
-        std::slice::from_raw_parts(
-            fp16_data.as_ptr() as *const f16,
-            fp16_data.len() / 2,
-        )
+        std::slice::from_raw_parts(fp16_data.as_ptr() as *const f16, fp16_data.len() / 2)
     };
 
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(vocab_size);
@@ -140,6 +143,10 @@ pub fn init_distilled(model_dir: &Path) -> Option<ThreadSafeDistilledEmbedder> {
     );
 
     Some(ThreadSafeDistilledEmbedder {
-        inner: Mutex::new(DistilledEmbedder { tokenizer, embeddings, dims }),
+        inner: Mutex::new(DistilledEmbedder {
+            tokenizer,
+            embeddings,
+            dims,
+        }),
     })
 }

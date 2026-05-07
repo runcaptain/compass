@@ -53,7 +53,9 @@ pub struct CollectionManager {
 
 impl CollectionManager {
     /// Create a new manager and load existing collections from disk.
-    pub async fn new(data_dir: &Path) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(
+        data_dir: &Path,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(data_dir)?;
 
         // Clean up any stale rebuild directories from crashes
@@ -81,7 +83,10 @@ impl CollectionManager {
     }
 
     /// Load a single collection from disk into memory.
-    async fn load_collection(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_collection(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let metadata = store::load_metadata(&self.data_dir, name)?;
         let tantivy_dir = store::tantivy_dir(&self.data_dir, name);
         let vectors_dir = store::vectors_dir(&self.data_dir, name);
@@ -104,18 +109,26 @@ impl CollectionManager {
                         vector_spaces.insert(space_name.clone(), Arc::new(vs));
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to load vector space '{}' for '{}': {}", space_name, name, e);
+                        tracing::warn!(
+                            "Failed to load vector space '{}' for '{}': {}",
+                            space_name,
+                            name,
+                            e
+                        );
                     }
                 }
             } else {
                 // Empty vector space (no vectors yet)
-                vector_spaces.insert(space_name.clone(), Arc::new(VectorState {
-                    index: None,
-                    key_to_chunk_id: Vec::new(),
-                    mmap_vectors: None,
-                    vectors: Vec::new(),
-                    dims: space_config.dims,
-                }));
+                vector_spaces.insert(
+                    space_name.clone(),
+                    Arc::new(VectorState {
+                        index: None,
+                        key_to_chunk_id: Vec::new(),
+                        mmap_vectors: None,
+                        vectors: Vec::new(),
+                        dims: space_config.dims,
+                    }),
+                );
             }
         }
 
@@ -135,8 +148,15 @@ impl CollectionManager {
 
         let mut collections = self.collections.write().await;
         collections.insert(name.to_string(), loaded);
-        tracing::info!("Loaded collection '{}' ({} chunks, {} vector spaces)",
-            name, chunk_count, collections.get(name).map(|c| c.vector_spaces.len()).unwrap_or(0));
+        tracing::info!(
+            "Loaded collection '{}' ({} chunks, {} vector spaces)",
+            name,
+            chunk_count,
+            collections
+                .get(name)
+                .map(|c| c.vector_spaces.len())
+                .unwrap_or(0)
+        );
 
         Ok(())
     }
@@ -162,11 +182,14 @@ impl CollectionManager {
         let spaces = vector_spaces.unwrap_or_else(|| {
             let dims = embedding_dims.unwrap_or(384);
             let mut m = HashMap::new();
-            m.insert("default".to_string(), VectorSpaceConfig {
-                dims,
-                model: "bge-small-en-v1.5".to_string(),
-                status: "active".to_string(),
-            });
+            m.insert(
+                "default".to_string(),
+                VectorSpaceConfig {
+                    dims,
+                    model: "bge-small-en-v1.5".to_string(),
+                    status: "active".to_string(),
+                },
+            );
             m
         });
 
@@ -192,13 +215,16 @@ impl CollectionManager {
         // Create empty vector spaces
         let mut vs_map = HashMap::new();
         for (sname, sconfig) in &collection.vector_spaces {
-            vs_map.insert(sname.clone(), Arc::new(VectorState {
-                index: None,
-                key_to_chunk_id: Vec::new(),
-                mmap_vectors: None,
-                vectors: Vec::new(),
-                dims: sconfig.dims,
-            }));
+            vs_map.insert(
+                sname.clone(),
+                Arc::new(VectorState {
+                    index: None,
+                    key_to_chunk_id: Vec::new(),
+                    mmap_vectors: None,
+                    vectors: Vec::new(),
+                    dims: sconfig.dims,
+                }),
+            );
         }
 
         let loaded = LoadedCollection {
@@ -225,7 +251,10 @@ impl CollectionManager {
         collections.get(name).map(|c| c.metadata.clone())
     }
 
-    pub async fn delete_collection(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_collection(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut collections = self.collections.write().await;
         if collections.remove(name).is_none() {
             return Err(format!("Collection '{}' not found", name).into());
@@ -254,19 +283,25 @@ impl CollectionManager {
             return Err(format!("Vector space '{}' already exists", space_name).into());
         }
 
-        loaded.metadata.vector_spaces.insert(space_name.to_string(), VectorSpaceConfig {
-            dims,
-            model: model.to_string(),
-            status: "building".to_string(),
-        });
+        loaded.metadata.vector_spaces.insert(
+            space_name.to_string(),
+            VectorSpaceConfig {
+                dims,
+                model: model.to_string(),
+                status: "building".to_string(),
+            },
+        );
 
-        loaded.vector_spaces.insert(space_name.to_string(), Arc::new(VectorState {
-            index: None,
-            key_to_chunk_id: Vec::new(),
-            mmap_vectors: None,
-            vectors: Vec::new(),
-            dims,
-        }));
+        loaded.vector_spaces.insert(
+            space_name.to_string(),
+            Arc::new(VectorState {
+                index: None,
+                key_to_chunk_id: Vec::new(),
+                mmap_vectors: None,
+                vectors: Vec::new(),
+                dims,
+            }),
+        );
 
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
         Ok(())
@@ -340,12 +375,18 @@ impl CollectionManager {
         let vectors_dir = store::vectors_dir(&self.data_dir, collection_name);
         let index_path = vectors_dir.join(format!("{}.index", space_name));
         let vecs_path = vectors_dir.join(format!("{}.bin", space_name));
-        let dims = loaded.metadata.vector_spaces.get(space_name)
-            .map(|c| c.dims).unwrap_or(384);
+        let dims = loaded
+            .metadata
+            .vector_spaces
+            .get(space_name)
+            .map(|c| c.dims)
+            .unwrap_or(384);
 
         if vecs_path.exists() {
             let vs = vector::load_vector_index(&index_path, &vecs_path, dims)?;
-            loaded.vector_spaces.insert(space_name.to_string(), Arc::new(vs));
+            loaded
+                .vector_spaces
+                .insert(space_name.to_string(), Arc::new(vs));
         }
 
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
@@ -388,14 +429,25 @@ impl CollectionManager {
 
         // Phase 2: Resolve batch parent references
         let parent_ids: Vec<Option<u64>> = ingest_chunks.iter().map(|ic| ic.parent_id).collect();
-        let parent_refs: Vec<Option<String>> = ingest_chunks.iter().map(|ic| ic.parent_ref.clone()).collect();
-        let group_ids: Vec<Option<String>> = ingest_chunks.iter().map(|ic| ic.group_id.clone()).collect();
+        let parent_refs: Vec<Option<String>> = ingest_chunks
+            .iter()
+            .map(|ic| ic.parent_ref.clone())
+            .collect();
+        let group_ids: Vec<Option<String>> =
+            ingest_chunks.iter().map(|ic| ic.group_id.clone()).collect();
         let resolved = RelationshipStore::resolve_batch_refs(
-            &client_id_map, &parent_ids, &parent_refs, &group_ids,
+            &client_id_map,
+            &parent_ids,
+            &parent_refs,
+            &group_ids,
         );
 
         // Phase 3: Build DocumentChunks and collect embeddings per vector space
-        let default_space = loaded.metadata.default_vector_space.clone().unwrap_or_else(|| "default".into());
+        let default_space = loaded
+            .metadata
+            .default_vector_space
+            .clone()
+            .unwrap_or_else(|| "default".into());
         let mut chunks: Vec<DocumentChunk> = Vec::with_capacity(count);
         // space_name -> Vec<(chunk_id, embedding)>
         let mut space_vectors: HashMap<String, Vec<(u64, Vec<f32>)>> = HashMap::new();
@@ -456,7 +508,10 @@ impl CollectionManager {
         // Phase 5: Update each vector space's HNSW index
         let vectors_dir = store::vectors_dir(&self.data_dir, collection_name);
         for (space_name, new_vecs) in space_vectors {
-            let dims = loaded.metadata.vector_spaces.get(&space_name)
+            let dims = loaded
+                .metadata
+                .vector_spaces
+                .get(&space_name)
                 .map(|c| c.dims)
                 .unwrap_or(384);
 
@@ -473,13 +528,24 @@ impl CollectionManager {
                 let Ok(mut vs) = Arc::try_unwrap(arc) else {
                     // Another thread holds a reference — fall back to full rebuild
                     let existing = loaded.vector_spaces.get(&space_name);
-                    let mut all_ids: Vec<u64> = existing.map(|e| e.key_to_chunk_id.clone()).unwrap_or_default();
+                    let mut all_ids: Vec<u64> = existing
+                        .map(|e| e.key_to_chunk_id.clone())
+                        .unwrap_or_default();
                     let mut all_vecs: Vec<Vec<f32>> = existing
                         .and_then(|e| e.mmap_vectors.as_ref())
                         .map(|m| m.to_vecs())
                         .unwrap_or_default();
-                    for (cid, vec) in new_vecs { all_ids.push(cid); all_vecs.push(vec); }
-                    let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
+                    for (cid, vec) in new_vecs {
+                        all_ids.push(cid);
+                        all_vecs.push(vec);
+                    }
+                    let vs = vector::build_vector_index(
+                        &index_path,
+                        &vecs_path,
+                        &all_ids,
+                        &all_vecs,
+                        dims,
+                    )?;
                     loaded.vector_spaces.insert(space_name, Arc::new(vs));
                     continue;
                 };
@@ -501,19 +567,23 @@ impl CollectionManager {
                     if vs.index.is_none() || index_path.exists() {
                         let index = vector::create_index(dims, total)?;
                         if index_path.exists() {
-                            index.load(index_path.to_str().unwrap())
+                            index
+                                .load(index_path.to_str().unwrap())
                                 .map_err(|e| format!("Failed to load USearch index: {}", e))?;
                         }
                         // Reserve for new vectors
                         let threads = 128.max(rayon::current_num_threads());
-                        index.reserve_capacity_and_threads(total, threads)
+                        index
+                            .reserve_capacity_and_threads(total, threads)
                             .map_err(|e| format!("Reserve failed: {}", e))?;
                         // Add new vectors incrementally
                         for (i, (_, vec)) in new_vecs.iter().enumerate() {
-                            index.add((base_key + i) as u64, vec)
+                            index
+                                .add((base_key + i) as u64, vec)
                                 .map_err(|e| format!("Failed to add vector: {}", e))?;
                         }
-                        index.save(index_path.to_str().unwrap())
+                        index
+                            .save(index_path.to_str().unwrap())
                             .map_err(|e| format!("Failed to save index: {}", e))?;
                         vs.index = Some(index);
                     }
@@ -526,15 +596,19 @@ impl CollectionManager {
                 loaded.vector_spaces.insert(space_name, Arc::new(vs));
             } else {
                 // Full rebuild path (first ingest or legacy data)
-                let mut all_ids: Vec<u64> = existing.map(|e| e.key_to_chunk_id.clone()).unwrap_or_default();
-                let mut all_vecs: Vec<Vec<f32>> = existing.map(|e| e.vectors.clone()).unwrap_or_default();
+                let mut all_ids: Vec<u64> = existing
+                    .map(|e| e.key_to_chunk_id.clone())
+                    .unwrap_or_default();
+                let mut all_vecs: Vec<Vec<f32>> =
+                    existing.map(|e| e.vectors.clone()).unwrap_or_default();
 
                 for (cid, vec) in new_vecs {
                     all_ids.push(cid);
                     all_vecs.push(vec);
                 }
 
-                let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
+                let vs =
+                    vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
                 loaded.vector_spaces.insert(space_name, Arc::new(vs));
             }
         }
@@ -542,11 +616,16 @@ impl CollectionManager {
         // Phase 6: Save metadata + relationships
         loaded.metadata.chunk_count += count as u64;
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
-        let rel_path = store::collection_dir(&self.data_dir, collection_name).join("relationships.bin");
+        let rel_path =
+            store::collection_dir(&self.data_dir, collection_name).join("relationships.bin");
         loaded.relationships.save(&rel_path)?;
 
-        tracing::info!("Ingested {} chunks into '{}' ({} relationships tracked)",
-            count, collection_name, loaded.relationships.len());
+        tracing::info!(
+            "Ingested {} chunks into '{}' ({} relationships tracked)",
+            count,
+            collection_name,
+            loaded.relationships.len()
+        );
 
         Ok((count, client_id_map))
     }
@@ -559,7 +638,10 @@ impl CollectionManager {
         collection_name: &str,
         req: &SearchRequest,
         embed_state: &EmbedState,
-    ) -> Result<(Vec<(DocumentChunk, f32, String)>, usize, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (Vec<(DocumentChunk, f32, String)>, usize, u64),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let start = std::time::Instant::now();
         let collections = self.collections.read().await;
         let loaded = collections
@@ -570,13 +652,16 @@ impl CollectionManager {
         let rerank_k = req.top_k * 3; // fetch extra candidates for scoring
 
         // Determine which vector space to use
-        let space_name = req.vector_space.as_deref()
+        let space_name = req
+            .vector_space
+            .as_deref()
             .or(loaded.metadata.default_vector_space.as_deref())
             .unwrap_or("default");
 
         // ── Step 1: Retrieve candidates ──────────────────────────────────
         let fts_results = if matches!(mode, SearchMode::Fts | SearchMode::Hybrid) {
-            let (results, _, _) = tantivy_fts::search(&loaded.fts, &req.query, &HashMap::new(), rerank_k)?;
+            let (results, _, _) =
+                tantivy_fts::search(&loaded.fts, &req.query, &HashMap::new(), rerank_k)?;
             results
         } else {
             Vec::new()
@@ -584,7 +669,9 @@ impl CollectionManager {
 
         let semantic_results = if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
             if let Some(vs) = loaded.vector_spaces.get(space_name) {
-                let query_vec_opt: Option<Vec<f32>> = req.query_vector.clone()
+                let query_vec_opt: Option<Vec<f32>> = req
+                    .query_vector
+                    .clone()
                     .or_else(|| embed_state.embed_query(&req.query).ok());
                 if let Some(query_vec) = query_vec_opt {
                     // Clone the Arc<VectorState> cheaply and run the blocking
@@ -593,7 +680,9 @@ impl CollectionManager {
                     let vs_clone = vs.clone();
                     let vr = tokio::task::spawn_blocking(move || {
                         vector::search_vectors(&query_vec, &vs_clone, rerank_k)
-                    }).await.unwrap_or_default();
+                    })
+                    .await
+                    .unwrap_or_default();
                     vr.iter().map(|r| (r.chunk_id, r.score)).collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -609,29 +698,49 @@ impl CollectionManager {
         let mut candidates: Vec<ScoredCandidate> = match mode {
             SearchMode::Hybrid if !fts_results.is_empty() || !semantic_results.is_empty() => {
                 let (rrf_k, fts_w, sem_w) = match &req.score_weights {
-                    Some(sw) => (sw.rrf_k as f32, sw.fts_weight as f32, sw.semantic_weight as f32),
+                    Some(sw) => (
+                        sw.rrf_k as f32,
+                        sw.fts_weight as f32,
+                        sw.semantic_weight as f32,
+                    ),
                     None => (60.0, 1.0, 1.0),
                 };
-                let merged = hybrid::merge_rrf(&fts_results, &semantic_results, rerank_k, rrf_k, fts_w, sem_w);
-                merged.iter().map(|r| ScoredCandidate {
-                    chunk_id: r.chunk_id,
-                    base_score: r.rrf_score,
-                    final_score: r.rrf_score,
-                    source: r.source.as_str().to_string(),
-                }).collect()
+                let merged = hybrid::merge_rrf(
+                    &fts_results,
+                    &semantic_results,
+                    rerank_k,
+                    rrf_k,
+                    fts_w,
+                    sem_w,
+                );
+                merged
+                    .iter()
+                    .map(|r| ScoredCandidate {
+                        chunk_id: r.chunk_id,
+                        base_score: r.rrf_score,
+                        final_score: r.rrf_score,
+                        source: r.source.as_str().to_string(),
+                    })
+                    .collect()
             }
-            SearchMode::Fts => {
-                fts_results.iter().map(|(id, score)| ScoredCandidate {
-                    chunk_id: *id, base_score: *score, final_score: *score,
+            SearchMode::Fts => fts_results
+                .iter()
+                .map(|(id, score)| ScoredCandidate {
+                    chunk_id: *id,
+                    base_score: *score,
+                    final_score: *score,
                     source: "fts".to_string(),
-                }).collect()
-            }
-            SearchMode::Semantic => {
-                semantic_results.iter().map(|(id, score)| ScoredCandidate {
-                    chunk_id: *id, base_score: *score, final_score: *score,
+                })
+                .collect(),
+            SearchMode::Semantic => semantic_results
+                .iter()
+                .map(|(id, score)| ScoredCandidate {
+                    chunk_id: *id,
+                    base_score: *score,
+                    final_score: *score,
                     source: "semantic".to_string(),
-                }).collect()
-            }
+                })
+                .collect(),
             _ => Vec::new(),
         };
 
@@ -650,21 +759,24 @@ impl CollectionManager {
         // Resolve recency preset into a full config (explicit `recency` wins)
         let recency_config = req.recency.clone().or_else(|| {
             req.recency_preset.as_deref().and_then(|preset| {
-                req.recency_field.as_deref().map(|field| {
-                    RecencyConfig::from_preset(preset, field.to_string())
-                }).flatten()
+                req.recency_field
+                    .as_deref()
+                    .map(|field| RecencyConfig::from_preset(preset, field.to_string()))
+                    .flatten()
             })
         });
 
-        let has_scoring = recency_config.is_some() || !req.boosts.is_empty() || req.relationship_boost.is_some();
+        let has_scoring =
+            recency_config.is_some() || !req.boosts.is_empty() || req.relationship_boost.is_some();
 
         if has_scoring && !candidates.is_empty() {
             let chunk_metadata: HashMap<u64, HashMap<String, MetadataValue>> = candidates
                 .iter()
                 .filter_map(|c| {
-                    loaded.chunks.get(&c.chunk_id).map(|chunk| {
-                        (c.chunk_id, chunk.metadata.clone())
-                    })
+                    loaded
+                        .chunks
+                        .get(&c.chunk_id)
+                        .map(|chunk| (c.chunk_id, chunk.metadata.clone()))
                 })
                 .collect();
 
@@ -689,9 +801,10 @@ impl CollectionManager {
         let hits: Vec<(DocumentChunk, f32, String)> = candidates
             .iter()
             .filter_map(|c| {
-                loaded.chunks.get(&c.chunk_id).map(|chunk| {
-                    (chunk.clone(), c.final_score, c.source.clone())
-                })
+                loaded
+                    .chunks
+                    .get(&c.chunk_id)
+                    .map(|chunk| (chunk.clone(), c.final_score, c.source.clone()))
             })
             .collect();
 
@@ -705,7 +818,10 @@ impl CollectionManager {
         collection_name: &str,
         query: &str,
         fields: &[String],
-    ) -> Result<(HashMap<String, HashMap<String, u64>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (HashMap<String, HashMap<String, u64>>, u64),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let collections = self.collections.read().await;
         let loaded = collections
             .get(collection_name)

@@ -16,10 +16,10 @@ use usearch::ScalarKind;
 // ── HNSW tuning parameters ──────────────────────────────────────────────────
 // These control the accuracy/speed tradeoff of the approximate nearest neighbor search.
 // Higher values = more accurate but slower. These are USearch defaults (good for ~97% recall).
-const HNSW_CONNECTIVITY: usize = 16;       // max edges per node in the graph
-const HNSW_EF_CONSTRUCTION: usize = 128;   // search width during index build (higher = better graph)
-const HNSW_EF_SEARCH: usize = 64;          // search width during queries (higher = more accurate)
-const HNSW_THRESHOLD: usize = 1000;         // below this count, brute-force beats HNSW
+const HNSW_CONNECTIVITY: usize = 16; // max edges per node in the graph
+const HNSW_EF_CONSTRUCTION: usize = 128; // search width during index build (higher = better graph)
+const HNSW_EF_SEARCH: usize = 64; // search width during queries (higher = more accurate)
+const HNSW_THRESHOLD: usize = 1000; // below this count, brute-force beats HNSW
 
 // ── VectorState ──────────────────────────────────────────────────────────────
 // Holds the HNSW index and the mapping from index keys back to chunk IDs.
@@ -51,25 +51,28 @@ pub struct VectorResult {
 }
 
 /// Create a new USearch HNSW index with the given dimensions and capacity.
-pub fn create_index(dims: usize, capacity: usize) -> Result<Index, Box<dyn std::error::Error + Send + Sync>> {
+pub fn create_index(
+    dims: usize,
+    capacity: usize,
+) -> Result<Index, Box<dyn std::error::Error + Send + Sync>> {
     let opts = IndexOptions {
         dimensions: dims,
-        metric: MetricKind::Cos,        // cosine similarity
-        quantization: ScalarKind::F32,   // store vectors as 32-bit floats
+        metric: MetricKind::Cos,       // cosine similarity
+        quantization: ScalarKind::F32, // store vectors as 32-bit floats
         connectivity: HNSW_CONNECTIVITY,
         expansion_add: HNSW_EF_CONSTRUCTION,
         expansion_search: HNSW_EF_SEARCH,
-        multi: false,                    // one vector per key
+        multi: false, // one vector per key
     };
-    let index = Index::new(&opts)
-        .map_err(|e| format!("Failed to create USearch index: {}", e))?;
+    let index = Index::new(&opts).map_err(|e| format!("Failed to create USearch index: {}", e))?;
     if capacity > 0 {
         // Reserve enough concurrent search slots for the spawn_blocking pool.
         // Default rayon threads (=CPU count) is too low when search runs on
         // tokio's blocking pool. 128 slots costs ~256KB and avoids the
         // "No available threads to lock" fallback to brute-force.
         let threads = 128.max(rayon::current_num_threads());
-        index.reserve_capacity_and_threads(capacity, threads)
+        index
+            .reserve_capacity_and_threads(capacity, threads)
             .map_err(|e| format!("Failed to reserve USearch capacity: {}", e))?;
     }
     Ok(index)
@@ -117,7 +120,8 @@ pub fn build_vector_index(
 
     // Insert vectors using parallel threads via rayon
     for (key, vec) in vectors.iter().enumerate() {
-        index.add(key as u64, vec)
+        index
+            .add(key as u64, vec)
             .map_err(|e| format!("Failed to add vector {}: {}", key, e))?;
     }
 
@@ -125,7 +129,8 @@ pub fn build_vector_index(
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    index.save(index_path.to_str().unwrap())
+    index
+        .save(index_path.to_str().unwrap())
         .map_err(|e| format!("Failed to save USearch index: {}", e))?;
 
     // Save the key-to-chunk-id mapping alongside the index
@@ -182,7 +187,8 @@ pub fn load_vector_index(
     // Load the HNSW index via mmap (near-instant regardless of index size)
     if index_path.exists() {
         let index = create_index(dims, 0)?;
-        index.view(index_path.to_str().unwrap())
+        index
+            .view(index_path.to_str().unwrap())
             .map_err(|e| format!("Failed to mmap USearch index: {}", e))?;
 
         Ok(VectorState {
@@ -205,18 +211,18 @@ pub fn load_vector_index(
 
 /// Search for the most similar vectors to a query vector.
 /// Uses HNSW for large datasets (sub-ms), brute-force cosine for small ones.
-pub fn search_vectors(
-    query_vec: &[f32],
-    state: &VectorState,
-    top_k: usize,
-) -> Vec<VectorResult> {
+pub fn search_vectors(query_vec: &[f32], state: &VectorState, top_k: usize) -> Vec<VectorResult> {
     // Try HNSW index first (fast approximate search)
     if let Some(ref index) = state.index {
         match index.search(query_vec, top_k) {
             Ok(matches) => {
-                return matches.keys.iter().zip(matches.distances.iter())
+                return matches
+                    .keys
+                    .iter()
+                    .zip(matches.distances.iter())
                     .map(|(&key, &distance)| {
-                        let chunk_id = state.key_to_chunk_id
+                        let chunk_id = state
+                            .key_to_chunk_id
                             .get(key as usize)
                             .copied()
                             .unwrap_or(key);
@@ -244,7 +250,9 @@ pub fn search_vectors(
             })
             .collect()
     } else {
-        state.vectors.iter()
+        state
+            .vectors
+            .iter()
             .enumerate()
             .map(|(i, v)| {
                 let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
@@ -256,13 +264,11 @@ pub fn search_vectors(
     // Sort by score descending (highest similarity first)
     scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    scores.into_iter()
+    scores
+        .into_iter()
         .take(top_k)
         .map(|(i, score)| {
-            let chunk_id = state.key_to_chunk_id
-                .get(i)
-                .copied()
-                .unwrap_or(i as u64);
+            let chunk_id = state.key_to_chunk_id.get(i).copied().unwrap_or(i as u64);
             VectorResult { chunk_id, score }
         })
         .collect()
@@ -309,7 +315,11 @@ fn load_vectors(
     let count = u32::from_le_bytes(buf[0..4].try_into()?) as usize;
     let dims = u32::from_le_bytes(buf[4..8].try_into()?) as usize;
     if dims != expected_dims {
-        return Err(format!("dimension mismatch: file has {} but expected {}", dims, expected_dims).into());
+        return Err(format!(
+            "dimension mismatch: file has {} but expected {}",
+            dims, expected_dims
+        )
+        .into());
     }
 
     let mut vectors = Vec::with_capacity(count);
@@ -327,7 +337,10 @@ fn load_vectors(
 }
 
 /// Save key-to-chunk-id mapping. Format: [u32 count] [count * u64 chunk_ids]
-pub fn save_key_map(path: &Path, chunk_ids: &[u64]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_key_map(
+    path: &Path,
+    chunk_ids: &[u64],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf: Vec<u8> = Vec::with_capacity(4 + chunk_ids.len() * 8);
     buf.extend_from_slice(&(chunk_ids.len() as u32).to_le_bytes());
     for &id in chunk_ids {

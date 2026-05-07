@@ -85,11 +85,7 @@ impl CuvsHnswIndex {
 
     /// Bulk-add vectors. Faster than calling [`VectorIndex::add`] in a loop
     /// because the GPU build is amortized over the whole batch.
-    pub fn add_batch(
-        &mut self,
-        vectors: &[Vec<f32>],
-        chunk_ids: &[u64],
-    ) -> Result<(), IndexError> {
+    pub fn add_batch(&mut self, vectors: &[Vec<f32>], chunk_ids: &[u64]) -> Result<(), IndexError> {
         if vectors.len() != chunk_ids.len() {
             return Err(IndexError::Backend(format!(
                 "vectors ({}) and chunk_ids ({}) length mismatch",
@@ -153,9 +149,10 @@ impl VectorIndex for CuvsHnswIndex {
                 actual: query.len(),
             });
         }
-        let inner = self.index.as_ref().ok_or_else(|| {
-            IndexError::Backend("search called before build".into())
-        })?;
+        let inner = self
+            .index
+            .as_ref()
+            .ok_or_else(|| IndexError::Backend("search called before build".into()))?;
 
         let raw = cuvs_bridge::search_hnsw(&inner.inner, query, top_k, self.params.ef_search)
             .map_err(|e| IndexError::Backend(format!("cuVS search failed: {e}")))?;
@@ -186,9 +183,10 @@ impl VectorIndex for CuvsHnswIndex {
     }
 
     fn save(&self, path: &Path) -> Result<(), IndexError> {
-        let inner = self.index.as_ref().ok_or_else(|| {
-            IndexError::Backend("save called before build".into())
-        })?;
+        let inner = self
+            .index
+            .as_ref()
+            .ok_or_else(|| IndexError::Backend("save called before build".into()))?;
         cuvs_bridge::serialize_hnsw(&inner.inner, path)
             .map_err(|e| IndexError::Io(format!("cuVS serialize failed: {e}")))?;
 
@@ -314,7 +312,10 @@ mod cuvs_bridge {
         // First-pass implementation lands in v0.2.0 of compass-vector-gpu.
 
         let _ = (vectors, dims, graph_degree, intermediate_graph_degree);
-        Err("cuVS build path not yet wired in this build; see crates/compass-vector-gpu/src/lib.rs".into())
+        Err(
+            "cuVS build path not yet wired in this build; see crates/compass-vector-gpu/src/lib.rs"
+                .into(),
+        )
     }
 
     pub(crate) fn search_hnsw(

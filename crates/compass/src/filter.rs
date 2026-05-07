@@ -12,10 +12,7 @@
 use crate::models::{DocumentChunk, FilterCondition, FilterValue, MetadataValue};
 use std::collections::HashMap;
 
-pub fn matches_filters(
-    chunk: &DocumentChunk,
-    filters: &HashMap<String, FilterValue>,
-) -> bool {
+pub fn matches_filters(chunk: &DocumentChunk, filters: &HashMap<String, FilterValue>) -> bool {
     filters.iter().all(|(key, filter_val)| {
         let meta_val = if key == "doc_type" {
             Some(MetadataValue::String(chunk.doc_type.clone()))
@@ -105,7 +102,10 @@ mod tests {
     #[test]
     fn exact_match_backward_compat() {
         let mut meta = HashMap::new();
-        meta.insert("department".to_string(), MetadataValue::String("Legal".to_string()));
+        meta.insert(
+            "department".to_string(),
+            MetadataValue::String("Legal".to_string()),
+        );
         let chunk = make_chunk("chunk", meta);
 
         let mut filters = HashMap::new();

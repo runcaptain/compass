@@ -33,7 +33,10 @@ impl MmapVectors {
         let file = File::open(path)?;
         let meta = file.metadata()?;
         if meta.len() < HEADER_SIZE as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small for header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file too small for header",
+            ));
         }
 
         let mmap = unsafe { MmapOptions::new().map(&file)? };
@@ -44,16 +47,32 @@ impl MmapVectors {
         if mmap.len() < expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("file size {} < expected {} for {} vectors × {} dims", mmap.len(), expected, count, dims),
+                format!(
+                    "file size {} < expected {} for {} vectors × {} dims",
+                    mmap.len(),
+                    expected,
+                    count,
+                    dims
+                ),
             ));
         }
 
-        Ok(Self { _file: file, mmap, dims, count, path: path.to_path_buf() })
+        Ok(Self {
+            _file: file,
+            mmap,
+            dims,
+            count,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Create a new vectors file and write initial data.
     pub fn create(path: &Path, dims: usize, vectors: &[Vec<f32>]) -> io::Result<Self> {
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
 
         // Header
         file.write_all(&(dims as u32).to_le_bytes())?;

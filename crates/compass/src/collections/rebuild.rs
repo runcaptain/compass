@@ -48,7 +48,8 @@ impl RebuildProgress {
 
 /// Shared state for tracking active rebuild jobs.
 /// Key = "collection_name/space_name"
-pub type RebuildTracker = Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<RebuildProgress>>>>>;
+pub type RebuildTracker =
+    Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<RebuildProgress>>>>>;
 
 pub fn new_tracker() -> RebuildTracker {
     Arc::new(RwLock::new(std::collections::HashMap::new()))
@@ -117,10 +118,14 @@ pub async fn start_rebuild(
             let vec = if let Some(ref _endpoint) = embed_endpoint {
                 // TODO: HTTP POST to external endpoint for GPU embedding
                 // For now, fall back to built-in embedder
-                embed_state.embed_query(text).unwrap_or_else(|_| vec![0.0; dims])
+                embed_state
+                    .embed_query(text)
+                    .unwrap_or_else(|_| vec![0.0; dims])
             } else {
                 // Use built-in Candle embedder
-                embed_state.embed_query(text).unwrap_or_else(|_| vec![0.0; dims])
+                embed_state
+                    .embed_query(text)
+                    .unwrap_or_else(|_| vec![0.0; dims])
             };
 
             all_vectors.push(vec);
@@ -137,13 +142,8 @@ pub async fn start_rebuild(
         }
 
         // Build the HNSW index from all vectors
-        let result = vector::build_vector_index(
-            &index_path,
-            &vectors_path,
-            &chunk_ids,
-            &all_vectors,
-            dims,
-        );
+        let result =
+            vector::build_vector_index(&index_path, &vectors_path, &chunk_ids, &all_vectors, dims);
 
         // Update final status
         let progress = progress.clone();
