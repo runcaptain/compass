@@ -45,6 +45,7 @@ impl UsearchHnswIndex {
             state: vector::VectorState {
                 index: None,
                 key_to_chunk_id: Vec::new(),
+                mmap_vectors: None,
                 vectors: Vec::new(),
                 dims: params.dims,
             },

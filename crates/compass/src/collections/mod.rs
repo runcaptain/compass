@@ -112,6 +112,7 @@ impl CollectionManager {
                 vector_spaces.insert(space_name.clone(), Arc::new(VectorState {
                     index: None,
                     key_to_chunk_id: Vec::new(),
+                    mmap_vectors: None,
                     vectors: Vec::new(),
                     dims: space_config.dims,
                 }));
@@ -194,6 +195,7 @@ impl CollectionManager {
             vs_map.insert(sname.clone(), Arc::new(VectorState {
                 index: None,
                 key_to_chunk_id: Vec::new(),
+                mmap_vectors: None,
                 vectors: Vec::new(),
                 dims: sconfig.dims,
             }));
@@ -261,6 +263,7 @@ impl CollectionManager {
         loaded.vector_spaces.insert(space_name.to_string(), Arc::new(VectorState {
             index: None,
             key_to_chunk_id: Vec::new(),
+            mmap_vectors: None,
             vectors: Vec::new(),
             dims,
         }));
@@ -460,18 +463,80 @@ impl CollectionManager {
             let index_path = vectors_dir.join(format!("{}.index", space_name));
             let vecs_path = vectors_dir.join(format!("{}.bin", space_name));
 
-            // Merge with existing vectors in this space
+            // Check if we can do incremental add (existing index + mmap vectors)
             let existing = loaded.vector_spaces.get(&space_name);
-            let mut all_ids: Vec<u64> = existing.map(|e| e.key_to_chunk_id.clone()).unwrap_or_default();
-            let mut all_vecs: Vec<Vec<f32>> = existing.map(|e| e.vectors.clone()).unwrap_or_default();
+            let can_incremental = existing.map(|e| e.mmap_vectors.is_some()).unwrap_or(false);
 
-            for (cid, vec) in new_vecs {
-                all_ids.push(cid);
-                all_vecs.push(vec);
+            if can_incremental {
+                // Incremental path: append to mmap file, add to HNSW, save
+                let arc = loaded.vector_spaces.remove(&space_name).unwrap();
+                let Ok(mut vs) = Arc::try_unwrap(arc) else {
+                    // Another thread holds a reference — fall back to full rebuild
+                    let existing = loaded.vector_spaces.get(&space_name);
+                    let mut all_ids: Vec<u64> = existing.map(|e| e.key_to_chunk_id.clone()).unwrap_or_default();
+                    let mut all_vecs: Vec<Vec<f32>> = existing
+                        .and_then(|e| e.mmap_vectors.as_ref())
+                        .map(|m| m.to_vecs())
+                        .unwrap_or_default();
+                    for (cid, vec) in new_vecs { all_ids.push(cid); all_vecs.push(vec); }
+                    let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
+                    loaded.vector_spaces.insert(space_name, Arc::new(vs));
+                    continue;
+                };
+
+                // Append new vectors to mmap file
+                if let Some(ref mut mmap) = vs.mmap_vectors {
+                    mmap.append(&new_vecs)?;
+                }
+
+                // Extend key mapping
+                let base_key = vs.key_to_chunk_id.len();
+                for (cid, _) in &new_vecs {
+                    vs.key_to_chunk_id.push(*cid);
+                }
+
+                // Add to HNSW index (use load() for mutability, not view())
+                let total = vs.key_to_chunk_id.len();
+                if total >= 1000 {
+                    if vs.index.is_none() || index_path.exists() {
+                        let index = vector::create_index(dims, total)?;
+                        if index_path.exists() {
+                            index.load(index_path.to_str().unwrap())
+                                .map_err(|e| format!("Failed to load USearch index: {}", e))?;
+                        }
+                        // Reserve for new vectors
+                        let threads = 128.max(rayon::current_num_threads());
+                        index.reserve_capacity_and_threads(total, threads)
+                            .map_err(|e| format!("Reserve failed: {}", e))?;
+                        // Add new vectors incrementally
+                        for (i, (_, vec)) in new_vecs.iter().enumerate() {
+                            index.add((base_key + i) as u64, vec)
+                                .map_err(|e| format!("Failed to add vector: {}", e))?;
+                        }
+                        index.save(index_path.to_str().unwrap())
+                            .map_err(|e| format!("Failed to save index: {}", e))?;
+                        vs.index = Some(index);
+                    }
+                }
+
+                // Save updated keymap
+                let map_path = index_path.with_extension("keymap");
+                vector::save_key_map(&map_path, &vs.key_to_chunk_id)?;
+
+                loaded.vector_spaces.insert(space_name, Arc::new(vs));
+            } else {
+                // Full rebuild path (first ingest or legacy data)
+                let mut all_ids: Vec<u64> = existing.map(|e| e.key_to_chunk_id.clone()).unwrap_or_default();
+                let mut all_vecs: Vec<Vec<f32>> = existing.map(|e| e.vectors.clone()).unwrap_or_default();
+
+                for (cid, vec) in new_vecs {
+                    all_ids.push(cid);
+                    all_vecs.push(vec);
+                }
+
+                let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
+                loaded.vector_spaces.insert(space_name, Arc::new(vs));
             }
-
-            let vs = vector::build_vector_index(&index_path, &vecs_path, &all_ids, &all_vecs, dims)?;
-            loaded.vector_spaces.insert(space_name, Arc::new(vs));
         }
 
         // Phase 6: Save metadata + relationships
