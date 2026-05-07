@@ -24,7 +24,10 @@ impl ChunkStore {
         Ok(Self { db })
     }
 
-    pub fn get(&self, id: u64) -> Result<Option<DocumentChunk>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get(
+        &self,
+        id: u64,
+    ) -> Result<Option<DocumentChunk>, Box<dyn std::error::Error + Send + Sync>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(CHUNKS_TABLE)?;
         match table.get(id)? {
@@ -36,7 +39,10 @@ impl ChunkStore {
         }
     }
 
-    pub fn get_batch(&self, ids: &[u64]) -> Result<Vec<(u64, DocumentChunk)>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_batch(
+        &self,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, DocumentChunk)>, Box<dyn std::error::Error + Send + Sync>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(CHUNKS_TABLE)?;
         let mut results = Vec::with_capacity(ids.len());
@@ -49,7 +55,11 @@ impl ChunkStore {
         Ok(results)
     }
 
-    pub fn insert(&self, id: u64, chunk: &DocumentChunk) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn insert(
+        &self,
+        id: u64,
+        chunk: &DocumentChunk,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bytes = serde_json::to_vec(chunk)?;
         let txn = self.db.begin_write()?;
         {
@@ -60,7 +70,10 @@ impl ChunkStore {
         Ok(())
     }
 
-    pub fn insert_batch(&self, chunks: &[(u64, DocumentChunk)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn insert_batch(
+        &self,
+        chunks: &[(u64, DocumentChunk)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(CHUNKS_TABLE)?;

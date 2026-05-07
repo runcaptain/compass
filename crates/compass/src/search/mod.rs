@@ -15,8 +15,8 @@ pub mod vector;
 // Re-export the stable trait surface. Internal callers (and the `compass`
 // library) bind to this so backends swap without touching call sites.
 pub use backend::{
-    build_backend, IndexError, IndexParams, LoadableIndex, UsearchHnswIndex,
-    VectorIndex, VectorMatch,
+    build_backend, IndexError, IndexParams, LoadableIndex, UsearchHnswIndex, VectorIndex,
+    VectorMatch,
 };
 
 /// Search mode — determines which search engines are used for a query.

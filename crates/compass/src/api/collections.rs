@@ -22,9 +22,7 @@ pub async fn create_collection(
 }
 
 /// GET /collections — list all collections
-pub async fn list_collections(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<CollectionInfo>> {
+pub async fn list_collections(State(state): State<Arc<AppState>>) -> Json<Vec<CollectionInfo>> {
     let collections = state.manager.list_collections().await;
     Json(collections.iter().map(collection_to_info).collect())
 }
@@ -34,8 +32,12 @@ pub async fn get_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionInfo>, (StatusCode, String)> {
-    let collection = state.manager.get_collection(&name).await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Collection '{}' not found", name)))?;
+    let collection = state.manager.get_collection(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Collection '{}' not found", name),
+        )
+    })?;
     Ok(Json(collection_to_info(&collection)))
 }
 
@@ -44,7 +46,10 @@ pub async fn delete_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.manager.delete_collection(&name).await
+    state
+        .manager
+        .delete_collection(&name)
+        .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -57,17 +62,21 @@ pub async fn add_vector_space(
     Path(name): Path<String>,
     Json(req): Json<AddVectorSpaceRequest>,
 ) -> Result<(StatusCode, Json<VectorSpaceInfo>), (StatusCode, String)> {
-    state.manager
+    state
+        .manager
         .add_vector_space(&name, &req.name, req.dims, &req.model)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    Ok((StatusCode::CREATED, Json(VectorSpaceInfo {
-        name: req.name,
-        dims: req.dims,
-        model: req.model,
-        status: "building".to_string(),
-    })))
+    Ok((
+        StatusCode::CREATED,
+        Json(VectorSpaceInfo {
+            name: req.name,
+            dims: req.dims,
+            model: req.model,
+            status: "building".to_string(),
+        }),
+    ))
 }
 
 /// GET /collections/:name/vector-spaces — list vector spaces
@@ -75,10 +84,15 @@ pub async fn list_vector_spaces(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<VectorSpaceInfo>>, (StatusCode, String)> {
-    let collection = state.manager.get_collection(&name).await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Collection '{}' not found", name)))?;
+    let collection = state.manager.get_collection(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Collection '{}' not found", name),
+        )
+    })?;
 
-    let spaces: Vec<VectorSpaceInfo> = collection.vector_spaces
+    let spaces: Vec<VectorSpaceInfo> = collection
+        .vector_spaces
         .iter()
         .map(|(sname, config)| VectorSpaceInfo {
             name: sname.clone(),
@@ -96,7 +110,10 @@ pub async fn delete_vector_space(
     State(state): State<Arc<AppState>>,
     Path((name, space)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.manager.delete_vector_space(&name, &space).await
+    state
+        .manager
+        .delete_vector_space(&name, &space)
+        .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -107,7 +124,10 @@ pub async fn set_default_vector_space(
     Path(name): Path<String>,
     Json(req): Json<SetDefaultSpaceRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.manager.set_default_vector_space(&name, &req.name).await
+    state
+        .manager
+        .set_default_vector_space(&name, &req.name)
+        .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(StatusCode::OK)
 }
@@ -119,15 +139,29 @@ pub async fn trigger_rebuild(
     Json(req): Json<RebuildRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     // Get collection metadata to find dims
-    let collection = state.manager.get_collection(&name).await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Collection '{}' not found", name)))?;
+    let collection = state.manager.get_collection(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Collection '{}' not found", name),
+        )
+    })?;
 
-    let dims = collection.vector_spaces.get(&space)
+    let dims = collection
+        .vector_spaces
+        .get(&space)
         .map(|c| c.dims)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Vector space '{}' not found", space)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Vector space '{}' not found", space),
+            )
+        })?;
 
     // Get all chunk data for re-embedding
-    let (texts, chunk_ids) = state.manager.get_all_chunk_data(&name).await
+    let (texts, chunk_ids) = state
+        .manager
+        .get_all_chunk_data(&name)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let vectors_dir = state.manager.vectors_dir(&name);
@@ -143,7 +177,9 @@ pub async fn trigger_rebuild(
         req.batch_size,
         state.manager.rebuild_tracker.clone(),
         name,
-    ).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    )
+    .await
+    .map_err(|e| (StatusCode::CONFLICT, e))?;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -154,15 +190,22 @@ pub async fn rebuild_status(
     Path((name, space)): Path<(String, String)>,
 ) -> Result<Json<RebuildStatus>, (StatusCode, String)> {
     let status = crate::collections::rebuild::get_rebuild_status(
-        &state.manager.rebuild_tracker, &name, &space,
-    ).await;
+        &state.manager.rebuild_tracker,
+        &name,
+        &space,
+    )
+    .await;
 
     match status {
         Some(s) => Ok(Json(s)),
         None => {
             // Check if the space exists and is already active
-            let collection = state.manager.get_collection(&name).await
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Collection '{}' not found", name)))?;
+            let collection = state.manager.get_collection(&name).await.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Collection '{}' not found", name),
+                )
+            })?;
             match collection.vector_spaces.get(&space) {
                 Some(config) => Ok(Json(RebuildStatus {
                     status: config.status.clone(),
@@ -170,7 +213,10 @@ pub async fn rebuild_status(
                     total: collection.chunk_count,
                     percent: 100.0,
                 })),
-                None => Err((StatusCode::NOT_FOUND, format!("Vector space '{}' not found", space))),
+                None => Err((
+                    StatusCode::NOT_FOUND,
+                    format!("Vector space '{}' not found", space),
+                )),
             }
         }
     }
