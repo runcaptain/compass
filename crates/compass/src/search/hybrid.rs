@@ -81,12 +81,20 @@ pub fn merge_rrf(
                 (false, true) => ResultSource::Semantic,
                 (false, false) => unreachable!(),
             };
-            HybridResult { chunk_id, rrf_score, source }
+            HybridResult {
+                chunk_id,
+                rrf_score,
+                source,
+            }
         })
         .collect();
 
     // Sort by RRF score descending (best matches first)
-    results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(limit);
     results
 }

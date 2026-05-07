@@ -28,29 +28,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/collections", post(collections::create_collection))
         .route("/collections", get(collections::list_collections))
         .route("/collections/{name}", get(collections::get_collection))
-        .route("/collections/{name}", delete(collections::delete_collection))
-
+        .route(
+            "/collections/{name}",
+            delete(collections::delete_collection),
+        )
         // ── Vector Space CRUD ────────────────────────────────────────────
-        .route("/collections/{name}/vector-spaces", post(collections::add_vector_space))
-        .route("/collections/{name}/vector-spaces", get(collections::list_vector_spaces))
-        .route("/collections/{name}/vector-spaces/{space}", delete(collections::delete_vector_space))
-        .route("/collections/{name}/vector-spaces/{space}/rebuild", post(collections::trigger_rebuild))
-        .route("/collections/{name}/vector-spaces/{space}/status", get(collections::rebuild_status))
-        .route("/collections/{name}/default-vector-space", put(collections::set_default_vector_space))
-
+        .route(
+            "/collections/{name}/vector-spaces",
+            post(collections::add_vector_space),
+        )
+        .route(
+            "/collections/{name}/vector-spaces",
+            get(collections::list_vector_spaces),
+        )
+        .route(
+            "/collections/{name}/vector-spaces/{space}",
+            delete(collections::delete_vector_space),
+        )
+        .route(
+            "/collections/{name}/vector-spaces/{space}/rebuild",
+            post(collections::trigger_rebuild),
+        )
+        .route(
+            "/collections/{name}/vector-spaces/{space}/status",
+            get(collections::rebuild_status),
+        )
+        .route(
+            "/collections/{name}/default-vector-space",
+            put(collections::set_default_vector_space),
+        )
         // ── Ingest ───────────────────────────────────────────────────────
         .route("/collections/{name}/ingest", post(ingest::ingest_chunks))
-
         // ── Search + Facets ──────────────────────────────────────────────
-        .route("/collections/{name}/search", post(search::search_collection))
+        .route(
+            "/collections/{name}/search",
+            post(search::search_collection),
+        )
         .route("/collections/{name}/facets", get(search::get_facets))
-
         // ── Health ───────────────────────────────────────────────────────
         .route("/health", get(health_check))
-
         // 64 MB body limit. Default 2 MB is too small for batched ingest with embeddings.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
-
         .with_state(state)
 }
 

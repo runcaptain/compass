@@ -13,7 +13,7 @@ edition = "2021"
 authors = ["Captain Technologies <eng@runcaptain.com>"]
 repository = "https://github.com/runcaptain/compass"
 homepage = "https://runcaptain.com"
-rust-version = "1.82"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Async runtime + web framework
@@ -43,6 +43,11 @@ candle-core = "0.8"
 candle-nn = "0.8"
 candle-transformers = "0.8"
 hf-hub = "0.3"
+
+# Mmap + disk storage
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+redb = "2.4"
 
 # Tracing
 tracing = "0.1"

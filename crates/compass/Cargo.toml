@@ -40,6 +40,9 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 hf-hub = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+redb = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

@@ -278,7 +278,11 @@ impl RecencyConfig {
             "archive" => (90.0, 0.5),
             _ => return None,
         };
-        Some(Self { field, half_life_days, min_score })
+        Some(Self {
+            field,
+            half_life_days,
+            min_score,
+        })
     }
 }
 

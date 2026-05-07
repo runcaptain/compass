@@ -21,7 +21,9 @@ use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, Language, TextAnalyzer};
+use tantivy::tokenizer::{
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
+};
 use tantivy::{Index, IndexWriter, ReloadPolicy};
 
 // ── Bitset implementation ────────────────────────────────────────────────────
@@ -49,6 +51,7 @@ impl BitSet {
 
     /// Create a bitset with ALL bits set to 1 (everything matches).
     /// Used for unfiltered facet queries where every document counts.
+    #[allow(dead_code)]
     fn all(num_bits: usize) -> Self {
         let num_words = (num_bits + 63) / 64;
         let mut words = vec![u64::MAX; num_words];
@@ -58,7 +61,10 @@ impl BitSet {
             let last = words.len() - 1;
             words[last] = (1u64 << trailing) - 1;
         }
-        Self { words, len: num_bits }
+        Self {
+            words,
+            len: num_bits,
+        }
     }
 
     /// Set a single bit to 1 (mark document at this position as matching).
@@ -165,7 +171,15 @@ fn build_schema() -> (Schema, FtsFields) {
     let metadata = builder.add_text_field("metadata", STORED);
 
     let schema = builder.build();
-    let fields = FtsFields { id, collection, file_id, chunk_index, page, text, metadata };
+    let fields = FtsFields {
+        id,
+        collection,
+        file_id,
+        chunk_index,
+        page,
+        text,
+        metadata,
+    };
     (schema, fields)
 }
 
@@ -299,11 +313,7 @@ pub fn open_index(dir: &Path) -> Result<FtsState, Box<dyn std::error::Error + Se
 
 /// Build facet bitsets from a batch of chunks.
 /// `offset` is the starting bit position (for appending to existing indices).
-fn build_facet_bitsets(
-    chunks: &[DocumentChunk],
-    offset: usize,
-    total_docs: usize,
-) -> FacetBitsets {
+fn build_facet_bitsets(chunks: &[DocumentChunk], offset: usize, total_docs: usize) -> FacetBitsets {
     let mut groups: HashMap<String, HashMap<String, BitSet>> = HashMap::new();
 
     // Scan all chunks and set bits for each metadata key-value pair.
@@ -386,10 +396,7 @@ pub fn search(
     };
 
     // Execute search: get top results + total count in a single pass
-    let (top_docs, total_count) = searcher.search(
-        &query,
-        &(TopDocs::with_limit(limit), Count),
-    )?;
+    let (top_docs, total_count) = searcher.search(&query, &(TopDocs::with_limit(limit), Count))?;
 
     // Extract document IDs and scores from results
     let mut results: Vec<(u64, f32)> = Vec::with_capacity(top_docs.len());
@@ -416,7 +423,8 @@ pub fn get_facets(
     state: &FtsState,
     query_str: &str,
     requested_fields: &[String],
-) -> Result<(HashMap<String, HashMap<String, u64>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(HashMap<String, HashMap<String, u64>>, u64), Box<dyn std::error::Error + Send + Sync>>
+{
     let start = std::time::Instant::now();
     let bs = &state.facet_bitsets;
 

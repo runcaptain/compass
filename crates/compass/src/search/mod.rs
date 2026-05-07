@@ -5,16 +5,21 @@
 //   Semantic: USearch HNSW approximate nearest neighbor search
 //   Hybrid:   Both combined via Reciprocal Rank Fusion (RRF, k=60)
 
+#[allow(dead_code)]
 pub mod backend;
+#[allow(dead_code)]
+pub mod chunk_store;
 pub mod hybrid;
+#[allow(dead_code)]
+pub mod mmap_vectors;
 pub mod tantivy_fts;
 pub mod vector;
 
-// Re-export the stable trait surface. Internal callers (and the `compass`
-// library) bind to this so backends swap without touching call sites.
+// Re-export the stable trait surface for external consumers and future use.
+#[allow(unused_imports)]
 pub use backend::{
-    build_backend, IndexError, IndexParams, LoadableIndex, UsearchHnswIndex,
-    VectorIndex, VectorMatch,
+    build_backend, IndexError, IndexParams, LoadableIndex, UsearchHnswIndex, VectorIndex,
+    VectorMatch,
 };
 
 /// Search mode — determines which search engines are used for a query.
