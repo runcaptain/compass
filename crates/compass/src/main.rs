@@ -1,5 +1,6 @@
 // Pre-existing clippy lints from newer toolchain — will be cleaned up separately.
 #![allow(
+    dead_code,
     clippy::too_many_arguments,
     clippy::type_complexity,
     clippy::collapsible_if,
@@ -7,7 +8,9 @@
     clippy::unnecessary_cast,
     clippy::option_map_or_none,
     clippy::manual_div_ceil,
-    clippy::ptr_arg
+    clippy::ptr_arg,
+    clippy::unnecessary_map_or,
+    clippy::vec_init_then_push
 )]
 // Compass — Embedded vector + full-text search engine for Captain.
 //
