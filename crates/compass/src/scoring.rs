@@ -75,10 +75,7 @@ pub fn recency_decay(
 
 /// Compute the combined metadata boost multiplier for a single candidate.
 /// Returns 1.0 if no boosts match.
-pub fn metadata_boost(
-    metadata: &HashMap<String, MetadataValue>,
-    boosts: &[BoostConfig],
-) -> f64 {
+pub fn metadata_boost(metadata: &HashMap<String, MetadataValue>, boosts: &[BoostConfig]) -> f64 {
     let mut factor = 1.0;
 
     for boost in boosts {

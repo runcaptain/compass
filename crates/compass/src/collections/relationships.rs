@@ -47,10 +47,7 @@ impl RelationshipStore {
 
         // Update reverse index (group_id -> sibling list)
         if let Some(ref gid) = group_id {
-            self.groups
-                .entry(gid.clone())
-                .or_default()
-                .push(chunk_id);
+            self.groups.entry(gid.clone()).or_default().push(chunk_id);
         }
     }
 

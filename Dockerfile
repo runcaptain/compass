@@ -4,7 +4,7 @@
 # to a minimal Debian runtime. Final image is ~120MB instead of ~2GB.
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:1.82-bookworm AS builder
+FROM rust:latest AS builder
 
 WORKDIR /app
 
@@ -28,12 +28,13 @@ RUN mkdir -p crates/compass/src crates/compass-index-api/src \
     && echo "" > crates/compass-index-api/src/lib.rs \
     && cargo build --release -p compass --no-default-features 2>/dev/null || true
 
-# Now bring in the real source.
+# Now bring in the real source and rebuild everything that changed.
 COPY crates/ crates/
-RUN cargo build --release -p compass
+RUN touch crates/compass-index-api/src/lib.rs crates/compass/src/main.rs \
+    && cargo build --release -p compass
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \

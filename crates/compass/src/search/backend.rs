@@ -45,6 +45,7 @@ impl UsearchHnswIndex {
             state: vector::VectorState {
                 index: None,
                 key_to_chunk_id: Vec::new(),
+                mmap_vectors: None,
                 vectors: Vec::new(),
                 dims: params.dims,
             },
@@ -78,12 +79,14 @@ impl UsearchHnswIndex {
 
 impl VectorIndex for UsearchHnswIndex {
     fn build(&mut self, vectors: &[Vec<f32>], chunk_ids: &[u64]) -> Result<(), IndexError> {
-        let index_path = self.persisted_at.clone().unwrap_or_else(|| {
-            std::path::PathBuf::from("./data/.compass-tmp.usearch")
-        });
-        let vectors_path = self.vectors_path.clone().unwrap_or_else(|| {
-            std::path::PathBuf::from("./data/.compass-tmp.vectors")
-        });
+        let index_path = self
+            .persisted_at
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/.compass-tmp.usearch"));
+        let vectors_path = self
+            .vectors_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/.compass-tmp.vectors"));
         let state = vector::build_vector_index(
             &index_path,
             &vectors_path,

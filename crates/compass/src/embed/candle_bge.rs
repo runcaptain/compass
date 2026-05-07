@@ -37,11 +37,15 @@ impl CandleBgeEmbedder {
             &self.device,
         )
         .unwrap()
-        .unsqueeze(0)   // add batch dimension: shape goes from [seq_len] to [1, seq_len]
+        .unsqueeze(0) // add batch dimension: shape goes from [seq_len] to [1, seq_len]
         .unwrap();
 
         let token_type_ids = Tensor::new(
-            type_ids.iter().map(|&x| x as u32).collect::<Vec<_>>().as_slice(),
+            type_ids
+                .iter()
+                .map(|&x| x as u32)
+                .collect::<Vec<_>>()
+                .as_slice(),
             &self.device,
         )
         .unwrap()
@@ -49,7 +53,10 @@ impl CandleBgeEmbedder {
         .unwrap();
 
         // Run the BERT model forward pass -> output shape is [1, seq_len, 384]
-        let output = self.model.forward(&input_ids, &token_type_ids, None).unwrap();
+        let output = self
+            .model
+            .forward(&input_ids, &token_type_ids, None)
+            .unwrap();
 
         // Cast to FP32 for pooling (model may run in FP16 on GPU)
         let output = output.to_dtype(DType::F32).unwrap();
@@ -77,7 +84,10 @@ pub struct ThreadSafeBgeEmbedder {
 impl ThreadSafeBgeEmbedder {
     /// Encode a query string into a normalized embedding vector.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
-        let embedder = self.inner.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+        let embedder = self
+            .inner
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
         Ok(embedder.encode(text))
     }
 }
@@ -101,7 +111,10 @@ pub fn init_candle_bge(model_dir: &Path) -> Option<ThreadSafeBgeEmbedder> {
         return None;
     }
 
-    tracing::info!("Loading BGE-small via Candle from {}...", model_dir.display());
+    tracing::info!(
+        "Loading BGE-small via Candle from {}...",
+        model_dir.display()
+    );
     let load_start = std::time::Instant::now();
 
     // Try CUDA GPU first, fall back to CPU
@@ -122,12 +135,8 @@ pub fn init_candle_bge(model_dir: &Path) -> Option<ThreadSafeBgeEmbedder> {
 
     // Load model weights from safetensors (always FP32 to avoid dtype mismatches in layer norms)
     let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(
-            &[weights_path.to_str().unwrap()],
-            DType::F32,
-            &device,
-        )
-        .ok()?
+        VarBuilder::from_mmaped_safetensors(&[weights_path.to_str().unwrap()], DType::F32, &device)
+            .ok()?
     };
 
     let model = BertModel::load(vb, &config).ok()?;
@@ -135,9 +144,16 @@ pub fn init_candle_bge(model_dir: &Path) -> Option<ThreadSafeBgeEmbedder> {
     // Load tokenizer
     let tokenizer = Tokenizer::from_file(tokenizer_path.to_str().unwrap()).ok()?;
 
-    tracing::info!("BGE-small loaded in {:.3}s", load_start.elapsed().as_secs_f64());
+    tracing::info!(
+        "BGE-small loaded in {:.3}s",
+        load_start.elapsed().as_secs_f64()
+    );
 
-    let embedder = CandleBgeEmbedder { model, tokenizer, device };
+    let embedder = CandleBgeEmbedder {
+        model,
+        tokenizer,
+        device,
+    };
 
     // Warmup: run one dummy query to trigger any lazy initialization
     let _ = embedder.encode("warmup");
