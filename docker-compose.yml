@@ -1,18 +1,49 @@
+version: '3.8'
+
 services:
   compass:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: compass
     ports:
       - "4001:4001"
-    volumes:
-      - compass-data:/app/data
     environment:
       PORT: 4001
       DATA_DIR: /app/data
+      RUST_LOG: compass=info
+    volumes:
+      - compass_data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4001/health"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 10s
+
+  # Optional: HuggingFace Text Embeddings Inference for GPU-accelerated embedding
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    container_name: tei
+    ports:
+      - "8080:80"
+    environment:
+      - MODEL_ID=microsoft/harrier-oss-v1-0.6b
+    volumes:
+      - hf_cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  compass-data:
+  compass_data:
+  hf_cache:
