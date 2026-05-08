@@ -75,7 +75,7 @@ Open an issue with:
 
 ## Reporting security issues
 
-Don't open a public issue. Email `security@runcaptain.com` with the details. We'll acknowledge within two business days.
+Don't open a public issue. Email `founders@runcaptain.com` with the details. We'll acknowledge within two business days.
 
 ## Code of conduct
 

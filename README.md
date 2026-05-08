@@ -1,4 +1,8 @@
 <div align="center">
+  <a href="https://runcaptain.com">
+    <img src="https://files.buildwithfern.com/runcaptain.docs.buildwithfern.com/7bb93ea0ee016bc6af0af57fa0f197f331125faa2c217c1af23b63789952e295/docs/assets/Captain-Wordmark.svg" height="40" alt="Captain" />
+  </a>
+  <br><br>
   <img src="docs/compass-logo.svg" height="80" alt="Compass" />
   <h1>Compass</h1>
   <p>Embedded vector + full-text search engine. Single binary, zero external dependencies.</p>
