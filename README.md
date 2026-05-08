@@ -1,10 +1,14 @@
-# Compass
+<div align="center">
+  <img src="docs/compass-logo.svg" height="80" alt="Compass" />
+  <h1>Compass</h1>
+  <p>Embedded vector + full-text search engine. Single binary, zero external dependencies.</p>
 
-[![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+  [![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml)
+  [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+  [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+</div>
 
-Embedded vector + full-text search engine for [Captain](https://runcaptain.com). Single binary, zero external dependencies. Designed for high-throughput retrieval. Built for on-prem enterprise deployments where customer data cannot leave their VPC.
+Built by [Captain](https://runcaptain.com) for high-throughput retrieval in on-prem enterprise deployments where customer data cannot leave their VPC.
 
 ## What it does
 

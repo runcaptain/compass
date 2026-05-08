@@ -1,16 +1,36 @@
-## Summary
+## Description
 
-<!-- What does this PR do? 1-3 bullet points. -->
+Briefly describe the changes in this PR.
 
-## Test plan
+## Related issue
 
-<!-- How did you verify this works? -->
+Fixes #(issue number) or closes #(issue number)
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` clean
-- [ ] `cargo fmt` clean
-- [ ] Tested with Docker build (if applicable)
+## Type of change
 
-## Changelog
+- [ ] Bug fix (non-breaking)
+- [ ] New feature (non-breaking)
+- [ ] Breaking change
+- [ ] Documentation update
+- [ ] Performance improvement
 
-<!-- Which CHANGELOG.md section does this belong in? (Added / Changed / Fixed / Removed) -->
+## Testing
+
+How have you tested these changes? Include steps to reproduce.
+
+## Checklist
+
+- [ ] `cargo fmt --all` is clean
+- [ ] `cargo clippy --workspace -- -D warnings` passes
+- [ ] `cargo test --workspace` passes
+- [ ] CHANGELOG.md updated under `[Unreleased]` section
+- [ ] Public API changes have rustdoc comments
+- [ ] Behavior changes have a regression test
+
+## Before/after (if applicable)
+
+Performance benchmarks, screenshots, or other evidence of the change:
+
+```
+(paste before/after data here)
+```
