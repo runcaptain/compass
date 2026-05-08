@@ -1,0 +1,9 @@
+# Default owners for everything
+* @runcaptain/eng
+
+# Vector backends
+crates/compass-index-api/ @runcaptain/eng
+crates/compass-vector-gpu/ @runcaptain/eng
+
+# CI and release
+.github/ @runcaptain/eng

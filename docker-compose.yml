@@ -1,0 +1,18 @@
+services:
+  compass:
+    build: .
+    ports:
+      - "4001:4001"
+    volumes:
+      - compass-data:/app/data
+    environment:
+      PORT: 4001
+      DATA_DIR: /app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  compass-data:
