@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: mailto:security@runcaptain.com
+    about: Report security issues privately via email — do not open a public issue.

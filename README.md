@@ -1,5 +1,9 @@
 # Compass
 
+[![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+
 Embedded vector + full-text search engine for [Captain](https://runcaptain.com). Single binary, zero external dependencies. Designed for high-throughput retrieval. Built for on-prem enterprise deployments where customer data cannot leave their VPC.
 
 ## What it does
@@ -7,6 +11,9 @@ Embedded vector + full-text search engine for [Captain](https://runcaptain.com).
 - **Full-text search** via Tantivy (BM25) with precomputed bitset faceting (microsecond facets)
 - **Vector search** via USearch HNSW (mmap-backed, disk-persistent)
 - **Hybrid search** via Reciprocal Rank Fusion (RRF, k=60)
+- **Memory-mapped vector storage**. Raw vectors live on disk, not in RAM. Zero-copy reads via mmap.
+- **Disk-backed chunk metadata** via redb (pure Rust embedded DB). Handles millions of documents without loading them all into memory.
+- **Incremental HNSW indexing**. Adding vectors appends to the index — no full rebuild required.
 - **Named vector spaces** ... run multiple embedding models on the same collection
 - **One-click model upgrades** with background re-embedding and atomic swap
 - **Parent-child documents** with relationship-aware scoring (TAMS video search compatible)
@@ -375,6 +382,29 @@ docker run -p 8080:80 --gpus all ghcr.io/huggingface/text-embeddings-inference \
 
 MTEB and MMEB are different benchmarks on different scales. MTEB scores are 0-100 (text tasks). MMEB scores are 0-1 (cross-modal retrieval). They cannot be compared directly.
 
+## Storage architecture
+
+Compass keeps vector data and chunk metadata on disk, not in RAM.
+
+```
+data/{collection}/
+├── collection.json                  # Collection metadata (name, dims, spaces)
+├── relationships.bin                # Parent-child + sibling graph
+├── tantivy/                         # BM25 inverted index (disk-backed)
+└── vectors/
+    ├── {space}.index                # USearch HNSW graph (mmap on read)
+    ├── {space}.bin                  # Raw f32 vectors (mmap via MmapVectors)
+    └── {space}.keymap               # HNSW key → chunk ID mapping
+```
+
+**Vectors**: Stored in a flat `[u32 dims][u32 count][f32...]` file, memory-mapped at query time. Adding vectors appends to the file and remaps — no full rewrite. At 1M vectors × 768 dims this is ~3GB on disk, near-zero RSS.
+
+**HNSW index**: Built incrementally via USearch `.add()` + `.save()`. Loaded via `.load()` for mutation or `.view()` for read-only mmap. The graph structure is separate from the raw vectors.
+
+**Chunk metadata**: Persisted via redb (pure Rust, ACID, MVCC). Point lookups by chunk ID during search result assembly. Batch inserts during ingestion.
+
+**Ingestion path**: New vectors are appended to the mmap file, inserted into the HNSW graph incrementally, and chunk metadata is written to redb — all without cloning existing data.
+
 ## Throughput and scaling
 
 **Query throughput.** USearch HNSW serves around 15k QPS per instance on a 16-core box at p99 < 50ms for top-10 retrieval. For very high QPS workloads, shard collections across multiple Compass instances behind a load balancer.
@@ -412,6 +442,14 @@ PUT    /collections/:name/default-vector-space         Switch default space
 
 GET    /health                                         Health check
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, PR guidelines, and commit conventions.
+
+## Security
+
+To report a vulnerability, email **security@runcaptain.com**. See [SECURITY.md](SECURITY.md) for details.
 
 ## License
 

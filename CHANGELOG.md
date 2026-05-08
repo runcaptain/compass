@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Memory-mapped vector storage.** New `MmapVectors` module (`search/mmap_vectors.rs`) replaces `Vec<Vec<f32>>` with a flat mmap-backed file. Zero-copy reads via `bytemuck::cast_slice`, append-only writes, near-zero RSS for vector data regardless of dataset size. File format: `[u32 dims][u32 count][f32...]`.
+- **Disk-backed chunk metadata.** New `ChunkStore` module (`search/chunk_store.rs`) backed by redb (pure Rust embedded DB). Replaces in-memory `HashMap<u64, DocumentChunk>` with persistent, ACID-compliant storage. Point lookups, batch inserts, full scans for rebuild.
+- **Incremental HNSW indexing.** Ingest path now loads the existing USearch index via `.load()`, appends new vectors with `.add()`, and saves — instead of cloning all vectors and rebuilding from scratch. Falls back to full rebuild when the `Arc` cannot be unwrapped.
+- **New dependencies:** `memmap2` (mmap), `bytemuck` (zero-copy cast), `redb` (embedded DB).
 - **Cargo workspace layout.** Source moved from a single crate to a workspace under `crates/`. Splits: `compass` (umbrella + binary), `compass-index-api` (stable trait surface), `compass-vector-gpu` (optional GPU backend).
 - **Vector index trait abstraction.** New `compass_index_api::VectorIndex` trait abstracts over CPU and GPU backends. The existing USearch path is wrapped in `UsearchHnswIndex`; new backends bind to the trait without touching call sites.
 - **Optional GPU backend (`--features gpu`).** New `compass-vector-gpu` crate integrates NVIDIA cuVS for CAGRA→HNSW build acceleration. CPU-side search after conversion. Linux + CUDA 12+ only. See `ARCHITECTURE.md` for build prerequisites.
@@ -25,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Cargo manifest** is now a workspace root with shared `[workspace.dependencies]` and `[workspace.package]` metadata. Per-crate manifests inherit version, edition, and rust-version.
 - **Compiler profile** adds `lto = "thin"` and `codegen-units = 1` to release builds for better optimization. Adds debug symbols to bench builds.
+- **MSRV bumped to 1.88** from 1.82. Required by `time@0.3.47` (edition 2024) and `icu_collections@2.2.0`.
+- **Dockerfile** upgraded to `rust:latest` + `debian:trixie-slim` for glibc compatibility with newer Rust toolchains.
 
 ### Deprecated
 
