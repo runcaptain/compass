@@ -3,85 +3,86 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            artifact: compass-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
-            artifact: compass-linux-arm64
-          - target: aarch64-apple-darwin
-            os: macos-14
-            artifact: compass-macos-arm64
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
-      - if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu cmake pkg-config libssl-dev
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-      - if: matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev
-      - run: cargo build --release --target ${{ matrix.target }} -p compass
-      - run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/compass dist/${{ matrix.artifact }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
 
-  docker:
-    name: Docker image
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify tag matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(grep "^version" crates/compass/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          if [ "${{ steps.version.outputs.version }}" != "$CARGO_VERSION" ]; then
+            echo "Tag version ${{ steps.version.outputs.version }} does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release -p compass
+
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          # Extract changelog between tag and previous tag
+          VERSION="${{ steps.version.outputs.version }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 $(git rev-list --tags --skip=1 -n1) 2>/dev/null || echo "HEAD")
+          
+          # Extract relevant section from CHANGELOG.md
+          CHANGELOG=$(sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '$ d')
+          
+          # Escape for GitHub Actions
+          CHANGELOG="${CHANGELOG//'%'/'%25'}"
+          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
+          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
+          
+          echo "body=$CHANGELOG" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release v${{ steps.version.outputs.version }}
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: false
+
+  publish-crate:
+    name: Publish to crates.io
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
+    needs: create-release
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
 
-  release:
-    name: GitHub Release
-    needs: [build, docker]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: dist/*
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests before publish
+        run: cargo test --workspace --exclude compass-vector-gpu
+
+      - name: Publish compass-index-api
+        run: cargo publish -p compass-index-api --token ${{ secrets.CARGO_TOKEN }}
+
+      - name: Publish compass
+        run: cargo publish -p compass --token ${{ secrets.CARGO_TOKEN }}
+        
+      - name: Wait for crates.io to index
+        run: sleep 30

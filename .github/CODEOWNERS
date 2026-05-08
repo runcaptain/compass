@@ -1,9 +1,25 @@
-# Default owners for everything
-* @runcaptain/eng
+# Global owners
+* @lewis @edgar
 
-# Vector backends
-crates/compass-index-api/ @runcaptain/eng
-crates/compass-vector-gpu/ @runcaptain/eng
+# Architecture and storage
+crates/compass/src/collections/ @lewis @edgar
+crates/compass/src/search/ @lewis @edgar
 
-# CI and release
-.github/ @runcaptain/eng
+# GPU backend
+crates/compass-vector-gpu/ @lewis @edgar
+
+# API trait
+crates/compass-index-api/ @lewis @edgar
+
+# Documentation
+*.md @lewis @edgar
+ARCHITECTURE.md @lewis @edgar
+CONTRIBUTING.md @lewis @edgar
+
+# CI/CD
+.github/ @lewis @edgar
+Dockerfile* @lewis @edgar
+
+# Dependency and manifest changes
+Cargo.toml @lewis @edgar
+Cargo.lock @lewis @edgar
