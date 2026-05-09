@@ -49,6 +49,9 @@ memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 redb = "2.4"
 
+# HTTP client (telemetry)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = "0.3"

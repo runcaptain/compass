@@ -32,6 +32,7 @@ mod filter;
 mod models;
 mod scoring;
 mod search;
+mod telemetry;
 
 use api::AppState;
 use std::env;
@@ -66,6 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+
+    // Anonymous telemetry — opt out with COMPASS_TELEMETRY=off or DO_NOT_TRACK=1
+    telemetry::spawn_telemetry(data_dir.clone(), app_state.manager.clone());
 
     let app = api::build_router(app_state).layer(cors);
 

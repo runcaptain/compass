@@ -43,6 +43,7 @@ hf-hub = { workspace = true }
 memmap2 = { workspace = true }
 bytemuck = { workspace = true }
 redb = { workspace = true }
+reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
