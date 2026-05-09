@@ -1,4 +1,4 @@
-//! Anonymous usage telemetry.
+//! Anonymous usage telemetry via PostHog.
 //!
 //! Sends a daily heartbeat with non-identifying metrics:
 //! instance UUID, Compass version, OS, architecture, collection count, total vectors.
@@ -10,9 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const TELEMETRY_ENDPOINT: &str = "https://telemetry.runcaptain.com/v1/events";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
-const STARTUP_DELAY: Duration = Duration::from_secs(60); // wait for collections to load
+const POSTHOG_ENDPOINT: &str = "https://us.i.posthog.com/capture/";
+const POSTHOG_API_KEY: &str = "phc_BFvsmH5rpe8GqJ8zwfqhH9jGAdZMXcNZhEao8mnDEd3X";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const STARTUP_DELAY: Duration = Duration::from_secs(60);
 
 /// Returns true if telemetry is enabled (default).
 pub fn is_enabled() -> bool {
@@ -41,14 +42,43 @@ fn get_or_create_instance_id(data_dir: &Path) -> String {
 }
 
 #[derive(serde::Serialize)]
-struct HeartbeatEvent {
-    instance_id: String,
+struct PostHogCapture {
+    api_key: &'static str,
+    event: String,
+    properties: PostHogProperties,
+    timestamp: String,
+}
+
+#[derive(serde::Serialize)]
+struct PostHogProperties {
+    distinct_id: String,
     version: String,
     os: String,
     arch: String,
     collections: u64,
     total_vectors: u64,
-    event: String,
+}
+
+fn now_iso8601() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Send a single event to PostHog. Fire-and-forget.
+async fn send_event(client: &reqwest::Client, event_name: &str, instance_id: &str, collections: u64, total_vectors: u64) {
+    let payload = PostHogCapture {
+        api_key: POSTHOG_API_KEY,
+        event: event_name.to_string(),
+        properties: PostHogProperties {
+            distinct_id: instance_id.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            collections,
+            total_vectors,
+        },
+        timestamp: now_iso8601(),
+    };
+    let _ = client.post(POSTHOG_ENDPOINT).json(&payload).send().await;
 }
 
 /// Spawn a background task that sends a heartbeat on startup and every 24 hours.
@@ -69,33 +99,27 @@ pub fn spawn_telemetry(
     );
 
     tokio::spawn(async move {
-        // Wait for startup to settle
         tokio::time::sleep(STARTUP_DELAY).await;
 
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Send startup event
+        let collections = manager.list_collections().await;
+        let total_vectors: u64 = collections.iter().map(|c| c.chunk_count).sum();
+        send_event(&client, "compass_started", &instance_id, collections.len() as u64, total_vectors).await;
+
         loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+
             let collections = manager.list_collections().await;
             let total_vectors: u64 = collections.iter().map(|c| c.chunk_count).sum();
-
-            let event = HeartbeatEvent {
-                instance_id: instance_id.clone(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                os: std::env::consts::OS.to_string(),
-                arch: std::env::consts::ARCH.to_string(),
-                collections: collections.len() as u64,
-                total_vectors,
-                event: "heartbeat".to_string(),
-            };
-
-            // Fire and forget — never block the server
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build();
-
-            if let Ok(client) = client {
-                let _ = client.post(TELEMETRY_ENDPOINT).json(&event).send().await;
-            }
-
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            send_event(&client, "compass_heartbeat", &instance_id, collections.len() as u64, total_vectors).await;
         }
     });
 }
