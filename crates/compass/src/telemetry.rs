@@ -64,7 +64,13 @@ fn now_iso8601() -> String {
 }
 
 /// Send a single event to PostHog. Fire-and-forget.
-async fn send_event(client: &reqwest::Client, event_name: &str, instance_id: &str, collections: u64, total_vectors: u64) {
+async fn send_event(
+    client: &reqwest::Client,
+    event_name: &str,
+    instance_id: &str,
+    collections: u64,
+    total_vectors: u64,
+) {
     let payload = PostHogCapture {
         api_key: POSTHOG_API_KEY,
         event: event_name.to_string(),
@@ -112,14 +118,28 @@ pub fn spawn_telemetry(
         // Send startup event
         let collections = manager.list_collections().await;
         let total_vectors: u64 = collections.iter().map(|c| c.chunk_count).sum();
-        send_event(&client, "compass_started", &instance_id, collections.len() as u64, total_vectors).await;
+        send_event(
+            &client,
+            "compass_started",
+            &instance_id,
+            collections.len() as u64,
+            total_vectors,
+        )
+        .await;
 
         loop {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
 
             let collections = manager.list_collections().await;
             let total_vectors: u64 = collections.iter().map(|c| c.chunk_count).sum();
-            send_event(&client, "compass_heartbeat", &instance_id, collections.len() as u64, total_vectors).await;
+            send_event(
+                &client,
+                "compass_heartbeat",
+                &instance_id,
+                collections.len() as u64,
+                total_vectors,
+            )
+            .await;
         }
     });
 }
