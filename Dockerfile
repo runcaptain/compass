@@ -38,12 +38,14 @@ FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY --from=builder /app/target/release/compass /app/compass
-RUN mkdir -p /app/data
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh && mkdir -p /app/data
 
 ENV PORT=4001
 ENV DATA_DIR=/app/data
