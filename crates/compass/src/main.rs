@@ -34,7 +34,7 @@ mod scoring;
 mod search;
 mod telemetry;
 
-use api::AppState;
+use api::{AppState, AuthConfig};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,7 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Anonymous telemetry — opt out with COMPASS_TELEMETRY=off or DO_NOT_TRACK=1
     telemetry::spawn_telemetry(data_dir.clone(), app_state.manager.clone());
 
-    let app = api::build_router(app_state).layer(cors);
+    // mosaic-compass: Bearer-token auth via COMPASS_API_KEY. When unset, auth is disabled.
+    let api_key = env::var("COMPASS_API_KEY").ok().filter(|s| !s.is_empty());
+    if api_key.is_some() {
+        tracing::info!("API key auth enabled (Authorization: Bearer required on all routes except /health)");
+    } else {
+        tracing::warn!("COMPASS_API_KEY not set — API is unauthenticated (dev mode)");
+    }
+    let auth_config = Arc::new(AuthConfig {
+        expected_key: api_key,
+    });
+
+    let app = api::build_router(app_state, auth_config).layer(cors);
 
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Compass listening on {}", addr);

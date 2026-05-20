@@ -1,0 +1,35 @@
+version: v2
+name: mosaic-compass
+
+build:
+  method: docker
+  dockerfile: ./Dockerfile
+
+# Pre-deploy job runs before the web service starts on each deploy.
+# Idempotently downloads BGE-small embedding weights into the persistent volume.
+predeploy:
+  run: /app/scripts/download-models.sh
+
+services:
+  - name: api
+    type: web
+    run: /app/compass
+    port: 4001
+    cpuCores: 1
+    ramMegabytes: 2048
+    instances: 1
+    domain:
+      name: api.mosaic.runcaptain.com
+    healthCheck:
+      enabled: true
+      httpPath: /health
+    # Persistent volume for collections, indexes, and pre-downloaded models.
+    # Survives deploys and instance restarts.
+    smartOptimization: false
+
+env:
+  PORT: "4001"
+  DATA_DIR: /app/data
+  COMPASS_TELEMETRY: "off"
+  RUST_LOG: compass=info
+  # COMPASS_API_KEY is set as a Porter secret, not committed here.
