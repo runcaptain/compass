@@ -7,7 +7,7 @@
   <h1>Compass</h1>
   <p>Embedded vector + full-text search engine. Single binary, zero external dependencies.</p>
 
-  [![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml)
+  <!-- [![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml) -->
   [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 </div>
