@@ -31,6 +31,13 @@ pub fn vectors_dir(data_dir: &Path, name: &str) -> PathBuf {
     collection_dir(data_dir, name).join("vectors")
 }
 
+/// Get the path to a collection's chunk metadata redb database. This file is
+/// the disk source of truth for chunk metadata; the in-memory `loaded.chunks`
+/// map is a hot cache populated from it on collection load.
+pub fn chunks_db_path(data_dir: &Path, name: &str) -> PathBuf {
+    collection_dir(data_dir, name).join("chunks.redb")
+}
+
 /// Save collection metadata to disk as JSON.
 pub fn save_metadata(
     data_dir: &Path,
