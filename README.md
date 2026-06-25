@@ -19,6 +19,7 @@ Built by [Captain](https://runcaptain.com) for high-throughput retrieval in on-p
 - **Full-text search** via Tantivy (BM25) with precomputed bitset faceting (microsecond facets)
 - **Vector search** via USearch HNSW (mmap-backed, disk-persistent)
 - **Hybrid search** via Reciprocal Rank Fusion (RRF, k=60)
+- **Filter-aware ANN with `/explain`**. Metadata filters are pushed into the HNSW walk via roaring-bitmap masks, so filtered semantic queries stay fast and recall-accurate instead of over-fetching and discarding. Set `"explain": true` to get the query plan back: filter selectivity, ANN engine, candidates inspected, and the effective `ef_search`.
 - **Memory-mapped vector storage**. Raw vectors live on disk, not in RAM. Zero-copy reads via mmap.
 - **Disk-backed chunk metadata** via redb (pure Rust embedded DB). Handles millions of documents without loading them all into memory.
 - **Incremental HNSW indexing**. Adding vectors appends to the index — no full rebuild required.
@@ -214,6 +215,36 @@ curl -X POST localhost:4001/collections/docs/search \
 ```
 
 All operators: exact match (backward compatible), `gte`/`lte` (numeric range), `contains` (array membership), `in` (set membership). Operators combine as AND across fields.
+
+### Filter-aware ANN + query explain
+
+When a semantic or hybrid query carries filters, Compass pushes the filter into the HNSW walk itself via a roaring-bitmap mask, rather than over-fetching neighbors and discarding the ones that fail the filter. Filtered vector search stays fast and keeps recall high even at low selectivity.
+
+Set `"explain": true` to get the query plan alongside the results:
+
+```bash
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "quarterly revenue",
+    "mode": "semantic",
+    "filters": {"department": "Finance", "priority": {"gte": 3}},
+    "explain": true
+  }'
+```
+
+The response adds an `explain` object:
+
+```json
+{
+  "explain": {
+    "filter": { "eligible_count": 1842, "universe_count": 50000, "selectivity": 0.0368 },
+    "ann":    { "engine": "hnsw", "candidates_inspected": 5120, "ef_search_used": 128 }
+  }
+}
+```
+
+`engine` is `"hnsw"` when the filter-aware walk ran, or `"brute_force"` for the exhaustive fallback at very low selectivity. Use the plan to see why a query was fast or slow without guessing.
 
 ### Parent-child documents + relationship boost
 
@@ -440,7 +471,7 @@ GET    /collections/:name                              Get collection info
 DELETE /collections/:name                              Delete collection + data
 
 POST   /collections/:name/ingest                       Bulk ingest chunks
-POST   /collections/:name/search                       Search (fts|semantic|hybrid)
+POST   /collections/:name/search                       Search (fts|semantic|hybrid); filter-aware ANN, "explain":true for query plan
 GET    /collections/:name/facets                       Facet counts
 
 POST   /collections/:name/vector-spaces                Add a vector space
