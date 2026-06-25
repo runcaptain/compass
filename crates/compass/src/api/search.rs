@@ -18,9 +18,19 @@ pub async fn search_collection(
     Path(name): Path<String>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    // Validate `top_k` at the API boundary. Zero crashes downstream stages
+    // (USearch reserves zero, FTS treats zero as "unbounded"); huge values
+    // would let one caller exhaust the box. Cap is generous; raise via PR.
+    if req.top_k == 0 {
+        return Err((StatusCode::BAD_REQUEST, "top_k must be >= 1".to_string()));
+    }
+    if req.top_k > 1000 {
+        return Err((StatusCode::BAD_REQUEST, "top_k must be <= 1000".to_string()));
+    }
+
     let mode_str = req.mode.clone();
 
-    let (results, total, took_us) = state
+    let (results, total, took_us, explain) = state
         .manager
         .search(&name, &req, &state.embed_state)
         .await
@@ -28,10 +38,11 @@ pub async fn search_collection(
 
     let hits: Vec<SearchHit> = results
         .into_iter()
-        .map(|(chunk, score, source)| SearchHit {
+        .map(|(chunk, score, source, parent_metadata)| SearchHit {
             chunk,
             score,
             source,
+            parent_metadata,
         })
         .collect();
 
@@ -40,6 +51,7 @@ pub async fn search_collection(
         total,
         took_us,
         mode: mode_str,
+        explain,
     }))
 }
 
