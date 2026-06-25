@@ -241,6 +241,11 @@ pub struct SearchRequest {
     /// Relationship-based score boosting
     #[serde(default)]
     pub relationship_boost: Option<RelationshipBoostConfig>,
+    /// Include an `explain` field in the response with filter selectivity,
+    /// candidates inspected, and ef_search used. Off by default; opt-in for
+    /// debugging "why did this query return X results?"
+    #[serde(default)]
+    pub explain: bool,
 }
 
 fn default_search_mode() -> String {
@@ -429,6 +434,40 @@ pub struct SearchResponse {
     pub total: usize,
     pub took_us: u64,
     pub mode: String,
+    /// Filter + ANN plan, only present when the request set `explain: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<ExplainPlan>,
+}
+
+/// Query plan returned alongside `/search` results when `explain: true`. The
+/// customer-facing differentiator: when a query returns few or surprising
+/// results, this is how a developer answers "why."
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainPlan {
+    pub filter: FilterExplain,
+    pub ann: AnnExplain,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FilterExplain {
+    /// Number of chunks the filter expression matched.
+    pub eligible_count: u64,
+    /// Total chunks in the collection.
+    pub universe_count: u64,
+    /// eligible / universe.
+    pub selectivity: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnExplain {
+    /// "hnsw" when USearch's filter-aware walk ran, "brute_force" otherwise.
+    pub engine: String,
+    /// Number of HNSW nodes the walk inspected. Counted via the filter
+    /// closure invocations; absent for the brute-force path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_inspected: Option<u64>,
+    /// Effective ef_search the walk used.
+    pub ef_search_used: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,6 +477,18 @@ pub struct SearchHit {
     pub score: f32,
     /// Which search method found this: "fts", "semantic", or "both"
     pub source: String,
+    /// Top-level metadata from the parent chunk, when this hit is a segment
+    /// whose parent exists in the collection.
+    ///
+    /// `None` is returned for: non-segment hits, segments without a
+    /// `parent_id`, and orphan segments whose `parent_id` points at a chunk
+    /// that is not in the collection.
+    ///
+    /// `Some({})` is returned only when the parent exists but has no metadata
+    /// fields of its own. The `Option` therefore distinguishes "no parent /
+    /// orphan" from "parent exists with no metadata."
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_metadata: Option<HashMap<String, MetadataValue>>,
 }
 
 #[derive(Debug, Serialize)]

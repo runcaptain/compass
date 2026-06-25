@@ -240,7 +240,7 @@ curl -X POST localhost:4001/collections/media/ingest \
         "parent_ref": "src-001",
         "group_id": "src-001",
         "text": "Goal celebration, minute 34",
-        "metadata": {"timerange_start": 2040.0, "timerange_end": 2055.0, "scene_type": "goal"}
+        "metadata": {"timerange_start_ms": 2040000, "timerange_end_ms": 2055000, "scene_type": "goal"}
       }
     ]
   }'
@@ -259,9 +259,11 @@ curl -X POST localhost:4001/collections/media/search \
 
 ### TAMS time-range search
 
-[TAMS](https://github.com/bbc/tams) (Time-Addressable Media Store) is BBC R&D's open spec for media archives. Media is addressed by time, not by file. The data model: **Source** (logical content) → **Flow** (specific rendition) → **Segment** (time-bounded chunk with `timerange_start`/`timerange_end`).
+[TAMS](https://github.com/bbc/tams) (Time-Addressable Media Store) is BBC R&D's open spec for media archives. Media is addressed by time, not by file. The data model: **Source** (logical content) → **Flow** (specific rendition) → **Segment** (time-bounded chunk with `timerange_start_ms`/`timerange_end_ms`).
 
-Compass models this hierarchy via `doc_type` + `parent_id` + `group_id`. Ingest segments with time range metadata, then query by content and time:
+Compass models this hierarchy via `doc_type` + `parent_id` + `group_id`. Time is stored as integer milliseconds throughout: `timerange_start_ms` and `timerange_end_ms` are numeric metadata fields. Instants (zero-duration events) are stored as segments where `timerange_start_ms == timerange_end_ms`.
+
+Ingest segments with time range metadata, then query by content and time:
 
 ```bash
 curl -X POST localhost:4001/collections/media/search \
@@ -270,14 +272,14 @@ curl -X POST localhost:4001/collections/media/search \
     "query": "goal celebration",
     "filters": {
       "doc_type": {"in": ["segment"]},
-      "timerange_start": {"gte": 2040.0},
-      "timerange_end": {"lte": 2100.0}
+      "timerange_start_ms": {"gte": 2040000},
+      "timerange_end_ms": {"lte": 2100000}
     },
     "relationship_boost": {"parent_weight": 0.3, "sibling_weight": 0.1}
   }'
 ```
 
-This finds segments matching "goal celebration" within the 2040-2100 second window. Relationship boosting surfaces sibling segments and the parent flow alongside the match.
+This finds segments matching "goal celebration" within the 2040000-2100000 ms window (33:60 → 35:00 in HH:MM:SS). Relationship boosting surfaces sibling segments and the parent flow alongside the match.
 
 ### Hybrid score weights
 
