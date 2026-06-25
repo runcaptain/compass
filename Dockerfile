@@ -4,7 +4,9 @@
 # to a minimal Debian runtime. Final image is ~120MB instead of ~2GB.
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:latest AS builder
+# Pin builder toolchain so deploys are reproducible and a compromised
+# rust:latest tag can't silently land in our image.
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
@@ -38,14 +40,29 @@ FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+# Note: `curl` stays because the predeploy job at `scripts/download-models.sh`
+# fetches BGE-small weights from HuggingFace via curl. Removing it breaks
+# every cold deploy.
+
+# Run the binary as an unprivileged user. The persistent disk mount path
+# under $DATA_DIR is chown'd at deploy time; this image only
+# needs to own /app and read its own scripts.
+RUN groupadd --system --gid 10001 compass \
+ && useradd  --system --uid 10001 --gid compass --no-create-home --shell /usr/sbin/nologin compass
 
 WORKDIR /app
 
 COPY --from=builder /app/target/release/compass /app/compass
-RUN mkdir -p /app/data
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh && mkdir -p /app/data && chown -R compass:compass /app
+
+USER compass
 
 ENV PORT=4001
+# Default data directory. Override DATA_DIR to point at your persistent
+# volume mount in production (e.g. a mounted disk or network volume).
 ENV DATA_DIR=/app/data
 EXPOSE 4001
 

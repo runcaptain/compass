@@ -1,0 +1,49 @@
+# cargo-audit configuration. Read by `cargo audit` in CI.
+#
+# All four entries below are transitive dependencies (Compass does not list
+# any of them as direct deps in any Cargo.toml). None are exploitable CVEs
+# against the running service. Three are informational "unmaintained" hints
+# where the upstream maintainer archived the crate; the implementation
+# still works. One is a real soundness bug in `lru` that's only reachable
+# if the caller exercises the IterMut API.
+#
+# Review this list whenever the advisory database adds new entries against
+# our dependency tree. Each ignore must keep a rationale comment so the
+# next reader can decide whether the upstream landscape has changed enough
+# to drop the ignore.
+
+[advisories]
+ignore = [
+    # `instant` (unmaintained) — tiny time helper, archived in favor of `web-time`.
+    # Pulled in via tantivy 0.22.1 → measure_time 0.8.3. No runtime risk.
+    # Drop when tantivy upgrades past measure_time 0.8.x.
+    "RUSTSEC-2024-0384",
+
+    # `number_prefix` (unmaintained) — byte-size formatter ("KiB", "MiB").
+    # Pulled in via hf-hub and tokenizers → indicatif 0.17.x. Cosmetic only.
+    # Drop when indicatif drops the dependency.
+    "RUSTSEC-2025-0119",
+
+    # `paste` (unmaintained) — compile-time-only proc macro for token pasting.
+    # Pulled in via candle-core, gemm-*, tokenizers. No runtime code; this
+    # crate vanishes after compilation. David Tolnay deprecated it in favor
+    # of stdlib token pasting. Drop when those crates migrate.
+    "RUSTSEC-2024-0436",
+
+    # `lru` 0.12.5 (unsound) — `IterMut` violates Stacked Borrows. Pulled in
+    # via tantivy 0.22.1. Only memory-unsafe if a caller exercises IterMut on
+    # an LruCache, which our usage of tantivy does not appear to trigger.
+    # Drop when tantivy ships against lru >= the fixed version.
+    "RUSTSEC-2026-0002",
+
+    # `quinn-proto` 0.11.14 — remote memory exhaustion via unbounded
+    # out-of-order QUIC stream reassembly. Compass does not speak QUIC; this
+    # is dragged in transitively (likely reqwest -> hyper-util -> h3) but no
+    # code path in the binary opens a QUIC listener. Drop when reqwest's
+    # dependency tree updates past quinn-proto 0.11.14.
+    "RUSTSEC-2026-0185",
+
+    # `quinn-proto` 0.11.14 — sibling advisory to RUSTSEC-2026-0185, same
+    # code path. Same rationale. Drop when the dep updates.
+    "RUSTSEC-2026-0186",
+]

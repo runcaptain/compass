@@ -1,0 +1,12 @@
+# Keep the build context small. Without this, Docker streams the entire
+# workspace (target/ alone can be multi-GB) to the daemon on every build.
+target/
+data/
+.git/
+.github/
+.tmp-investigation/
+.vscode/
+.idea/
+beir_data/
+*.md
+LICENSE
