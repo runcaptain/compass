@@ -29,12 +29,15 @@ struct DistilledEmbedder {
 
 impl DistilledEmbedder {
     /// Encode a query string into a normalized embedding vector.
-    fn encode(&self, text: &str) -> Vec<f32> {
-        let encoding = self.tokenizer.encode(text, false).unwrap();
+    fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| format!("tokenizer encode failed: {e}"))?;
         let ids = encoding.get_ids();
 
         if ids.is_empty() {
-            return vec![0.0; self.dims];
+            return Ok(vec![0.0; self.dims]);
         }
 
         // Mean pool: sum the embedding rows for each token, then divide by count
@@ -65,7 +68,7 @@ impl DistilledEmbedder {
             }
         }
 
-        sum
+        Ok(sum)
     }
 }
 
@@ -81,7 +84,7 @@ impl ThreadSafeDistilledEmbedder {
             .inner
             .lock()
             .map_err(|e| format!("Lock poisoned: {}", e))?;
-        Ok(embedder.encode(text))
+        embedder.encode(text)
     }
 }
 

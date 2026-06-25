@@ -24,21 +24,26 @@ pub struct CandleBgeEmbedder {
 impl CandleBgeEmbedder {
     /// Encode a text query into a 384-dim normalized embedding vector.
     /// Steps: tokenize -> run through BERT -> mean pool over token positions -> L2 normalize
-    pub fn encode(&self, text: &str) -> Vec<f32> {
+    pub fn encode(&self, text: &str) -> Result<Vec<f32>, String> {
         // Tokenize the input text (adds [CLS] and [SEP] tokens automatically)
-        let encoding = self.tokenizer.encode(text, true).unwrap();
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| format!("tokenizer encode failed: {e}"))?;
         let ids = encoding.get_ids();
         let type_ids = encoding.get_type_ids();
         let seq_len = ids.len();
+
+        let tensor_err = |e: candle_core::Error| format!("tensor op failed: {e}");
 
         // Convert token IDs to tensors with batch dimension of 1
         let input_ids = Tensor::new(
             ids.iter().map(|&x| x as u32).collect::<Vec<_>>().as_slice(),
             &self.device,
         )
-        .unwrap()
-        .unsqueeze(0) // add batch dimension: shape goes from [seq_len] to [1, seq_len]
-        .unwrap();
+        .map_err(tensor_err)?
+        .unsqueeze(0)
+        .map_err(tensor_err)?;
 
         let token_type_ids = Tensor::new(
             type_ids
@@ -48,30 +53,37 @@ impl CandleBgeEmbedder {
                 .as_slice(),
             &self.device,
         )
-        .unwrap()
+        .map_err(tensor_err)?
         .unsqueeze(0)
-        .unwrap();
+        .map_err(tensor_err)?;
 
         // Run the BERT model forward pass -> output shape is [1, seq_len, 384]
         let output = self
             .model
             .forward(&input_ids, &token_type_ids, None)
-            .unwrap();
+            .map_err(tensor_err)?;
 
-        // Cast to FP32 for pooling (model may run in FP16 on GPU)
-        let output = output.to_dtype(DType::F32).unwrap();
+        let output = output.to_dtype(DType::F32).map_err(tensor_err)?;
 
-        // Mean pooling: average across all token positions
-        // sum over dim 1 (seq_len) -> shape [1, 384] -> squeeze to [384]
-        let sum = output.sum(1).unwrap().squeeze(0).unwrap();
-        let count = Tensor::new(&[seq_len as f32], &self.device).unwrap();
-        let mean = sum.broadcast_div(&count).unwrap();
+        // Mean pooling across token positions, then L2 normalize.
+        let sum = output
+            .sum(1)
+            .map_err(tensor_err)?
+            .squeeze(0)
+            .map_err(tensor_err)?;
+        let count = Tensor::new(&[seq_len as f32], &self.device).map_err(tensor_err)?;
+        let mean = sum.broadcast_div(&count).map_err(tensor_err)?;
 
-        // L2 normalize so cosine similarity = dot product
-        let norm = mean.sqr().unwrap().sum_all().unwrap().sqrt().unwrap();
-        let normalized = mean.broadcast_div(&norm).unwrap();
+        let norm = mean
+            .sqr()
+            .map_err(tensor_err)?
+            .sum_all()
+            .map_err(tensor_err)?
+            .sqrt()
+            .map_err(tensor_err)?;
+        let normalized = mean.broadcast_div(&norm).map_err(tensor_err)?;
 
-        normalized.to_vec1::<f32>().unwrap()
+        normalized.to_vec1::<f32>().map_err(tensor_err)
     }
 }
 
@@ -88,7 +100,7 @@ impl ThreadSafeBgeEmbedder {
             .inner
             .lock()
             .map_err(|e| format!("Lock poisoned: {}", e))?;
-        Ok(embedder.encode(text))
+        embedder.encode(text)
     }
 }
 

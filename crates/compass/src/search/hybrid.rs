@@ -79,7 +79,11 @@ pub fn merge_rrf(
                 (true, true) => ResultSource::Both,
                 (true, false) => ResultSource::Fts,
                 (false, true) => ResultSource::Semantic,
-                (false, false) => unreachable!(),
+                // Unreachable in practice (or_insert is always followed by
+                // setting one of the flags). Treating it as `Both` is the
+                // safest defensive default if the invariant ever drifts;
+                // panicking inside a hot path on user input is not.
+                (false, false) => ResultSource::Both,
             };
             HybridResult {
                 chunk_id,

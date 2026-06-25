@@ -7,6 +7,7 @@
 //     distilled Model2Vec fallback (~100μs)
 //   - For datasets under 1000 docs, we skip HNSW and use brute-force cosine similarity
 
+use roaring::RoaringBitmap;
 use std::path::Path;
 use usearch::Index;
 use usearch::IndexOptions;
@@ -18,7 +19,17 @@ use usearch::ScalarKind;
 // Higher values = more accurate but slower. These are USearch defaults (good for ~97% recall).
 const HNSW_CONNECTIVITY: usize = 16; // max edges per node in the graph
 const HNSW_EF_CONSTRUCTION: usize = 128; // search width during index build (higher = better graph)
-const HNSW_EF_SEARCH: usize = 64; // search width during queries (higher = more accurate)
+                                         // Search width during queries. Bumped from 64 to 128 in the a follow-up:
+                                         // loose filters at high selectivity were under-walking the graph (recall 0.915
+                                         // at 10% selectivity with ef=64). 128 is a flat ~2x bump that pushes recall
+                                         // closer to 1.0 across all selectivity bands without per-query mutation.
+                                         // USearch's change_expansion_search is global, so per-query adjustment is
+                                         // race-prone under concurrent searches; true adaptive ef is a follow-up.
+const HNSW_EF_SEARCH: usize = 128;
+/// Exposed so `/explain` can report the ef the walk actually used.
+pub const fn hnsw_ef_search_default() -> usize {
+    HNSW_EF_SEARCH
+}
 const HNSW_THRESHOLD: usize = 1000; // below this count, brute-force beats HNSW
 
 // ── VectorState ──────────────────────────────────────────────────────────────
@@ -207,6 +218,147 @@ pub fn load_vector_index(
             dims,
         })
     }
+}
+
+/// Diagnostic info from a filtered ANN search. Surfaced via `explain()` in the
+/// follow-up PR; benchmarks collect them so benchmarks can verify the recall
+/// + selectivity story end-to-end.
+#[derive(Debug, Clone, Default)]
+pub struct FilteredSearchExplain {
+    /// |eligible| at query time.
+    pub eligible_count: u64,
+    /// |universe| at query time.
+    pub universe_count: u64,
+    /// eligible / universe.
+    pub selectivity: f64,
+    /// Whether the HNSW filtered walk was used (vs. brute force fallback).
+    pub used_hnsw: bool,
+    /// Number of HNSW candidates inspected. Counted via the filter closure
+    /// invocation count, which is the only signal the USearch Rust binding
+    /// exposes today.
+    pub candidates_inspected: u64,
+}
+
+/// Search for the most similar vectors to a query vector, restricted to the
+/// `eligible` set. Uses USearch's native filter callback (pre-filter pushdown
+/// into the HNSW walk) when the HNSW index is present; falls back to a
+/// brute-force scan over the eligible set otherwise.
+///
+/// Benchmark entry point: this is the function the benchmark exercises.
+/// The production API (where -> FilterExpr -> eligible -> filtered_search) is
+/// the follow-up PR.
+pub fn search_vectors_filtered(
+    query_vec: &[f32],
+    state: &VectorState,
+    top_k: usize,
+    eligible: &RoaringBitmap,
+) -> (Vec<VectorResult>, FilteredSearchExplain) {
+    let universe = state.key_to_chunk_id.len() as u64;
+    let eligible_count = eligible.len();
+    let mut explain = FilteredSearchExplain {
+        eligible_count,
+        universe_count: universe,
+        selectivity: if universe == 0 {
+            1.0
+        } else {
+            eligible_count as f64 / universe as f64
+        },
+        used_hnsw: false,
+        candidates_inspected: 0,
+    };
+    if eligible_count == 0 {
+        return (Vec::new(), explain);
+    }
+
+    if let Some(ref index) = state.index {
+        let inspected = std::cell::Cell::new(0u64);
+        let result = index.filtered_search(query_vec, top_k, |key: u64| {
+            inspected.set(inspected.get() + 1);
+            let chunk_id = state
+                .key_to_chunk_id
+                .get(key as usize)
+                .copied()
+                .unwrap_or(key);
+            // FilterIndex keys are u32; out-of-range chunk IDs are treated as
+            // ineligible.
+            u32::try_from(chunk_id)
+                .map(|k| eligible.contains(k))
+                .unwrap_or(false)
+        });
+        explain.used_hnsw = true;
+        explain.candidates_inspected = inspected.get();
+        match result {
+            Ok(matches) => {
+                let hits = matches
+                    .keys
+                    .iter()
+                    .zip(matches.distances.iter())
+                    .map(|(&key, &distance)| {
+                        let chunk_id = state
+                            .key_to_chunk_id
+                            .get(key as usize)
+                            .copied()
+                            .unwrap_or(key);
+                        VectorResult {
+                            chunk_id,
+                            score: 1.0 - distance,
+                        }
+                    })
+                    .collect();
+                return (hits, explain);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "USearch filtered_search failed: {}, falling back to brute-force",
+                    e
+                );
+                explain.used_hnsw = false;
+            }
+        }
+    }
+
+    let mut scores: Vec<(usize, f32)> = if let Some(ref mmap) = state.mmap_vectors {
+        (0..mmap.len())
+            .filter(|i| match state.key_to_chunk_id.get(*i).copied() {
+                Some(chunk_id) => u32::try_from(chunk_id)
+                    .map(|k| eligible.contains(k))
+                    .unwrap_or(false),
+                None => false,
+            })
+            .map(|i| {
+                let v = mmap.get(i);
+                let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (i, score)
+            })
+            .collect()
+    } else {
+        state
+            .vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| match state.key_to_chunk_id.get(*i).copied() {
+                Some(chunk_id) => u32::try_from(chunk_id)
+                    .map(|k| eligible.contains(k))
+                    .unwrap_or(false),
+                None => false,
+            })
+            .map(|(i, v)| {
+                let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (i, score)
+            })
+            .collect()
+    };
+
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let hits = scores
+        .into_iter()
+        .take(top_k)
+        .map(|(i, score)| {
+            let chunk_id = state.key_to_chunk_id.get(i).copied().unwrap_or(i as u64);
+            VectorResult { chunk_id, score }
+        })
+        .collect();
+    (hits, explain)
 }
 
 /// Search for the most similar vectors to a query vector.
