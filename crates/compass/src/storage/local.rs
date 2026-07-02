@@ -383,11 +383,10 @@ mod tests {
         assert!(s.get_range("k", 5..5).await.unwrap().is_empty());
         // Empty read exactly at EOF → empty, not an error.
         assert!(s.get_range("k", 10..10).await.unwrap().is_empty());
-        // start > end → error.
-        assert!(matches!(
-            s.get_range("k", 6..3).await,
-            Err(StorageError::InvalidRange { .. })
-        ));
+        // start > end → error. (The reversed range is the point of the test.)
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = s.get_range("k", 6..3).await;
+        assert!(matches!(reversed, Err(StorageError::InvalidRange { .. })));
         // end past EOF → error.
         assert!(matches!(
             s.get_range("k", 8..11).await,

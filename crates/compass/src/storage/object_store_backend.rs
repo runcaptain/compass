@@ -27,7 +27,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
 use object_store::{
-    Error as OsError, GetOptions, GetRange, ObjectStore, PutMode, PutOptions, UpdateVersion,
+    Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    UpdateVersion,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -162,7 +163,7 @@ impl Storage for ObjectStoreBackend {
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = OsPath::from(key);
         let opts = GetOptions {
-            range: Some(GetRange::Bounded(range.start as usize..range.end as usize)),
+            range: Some(GetRange::Bounded(range)),
             ..Default::default()
         };
         let res = self
@@ -281,7 +282,7 @@ impl Storage for ObjectStoreBackend {
             let meta = item.map_err(|e| map_os_err(prefix, e))?;
             out.push(ObjectMeta {
                 key: meta.location.to_string(),
-                size: meta.size as u64,
+                size: meta.size,
                 version: meta.e_tag.map(Version::etag),
             });
         }

@@ -62,7 +62,7 @@ bytes = "1"
 sha2 = "0.10"
 # Object-storage backend (S3/GCS/Azure/local/memory) for the opt-in
 # ObjectStoreBackend. One crate covers all providers + byte-range reads + CAS.
-object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 futures = "0.3"
 # Bounded LRU for the out-of-core chunk cache (source of truth = ChunkStore).
 lru = "0.12"
