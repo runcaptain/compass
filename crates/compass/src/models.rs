@@ -128,7 +128,13 @@ pub struct Collection {
     /// Legacy field for backward compat (maps to the default space's dims)
     #[serde(default = "default_dims")]
     pub embedding_dims: usize,
+    /// Live (non-deleted) chunk count. Decremented by delete.
     pub chunk_count: u64,
+    /// Monotonic high-water mark for chunk id assignment. NEVER decremented (not
+    /// by delete), so ids are never reused even after soft-deletes or when the
+    /// local chunk store is empty on a cold restart. Persisted in metadata.
+    #[serde(default)]
+    pub next_id: u64,
     #[serde(default)]
     pub config: CollectionConfig,
 }
@@ -246,6 +252,105 @@ pub struct SearchRequest {
     /// debugging "why did this query return X results?"
     #[serde(default)]
     pub explain: bool,
+    /// When true, each hit is enriched with its chunk relations (typed,
+    /// many-to-many edges). Off by default — zero change for existing callers.
+    #[serde(default)]
+    pub include_relations: bool,
+    /// Restrict relation enrichment to these relation_types. None = all types.
+    #[serde(default)]
+    pub relation_types: Option<Vec<String>>,
+    /// Which edges to include per hit when `include_relations` is set.
+    #[serde(default)]
+    pub relation_direction: RelationDirection,
+}
+
+// ── Chunk Relations ───────────────────────────────────────────────────────
+// Directed, typed, many-to-many edges between chunks. Independent of the
+// parent/group hierarchy (which stays as-is for TAMS + scoring). An edge is
+// `source_chunk_id --relation_type--> target_chunk_id`. A chunk participates
+// via either endpoint; `RelationDirection` selects which side to read.
+
+/// Which edges to return relative to a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RelationDirection {
+    /// Edges where the chunk is the `source` (chunk --> others).
+    #[default]
+    Outgoing,
+    /// Edges where the chunk is the `target` (others --> chunk).
+    Incoming,
+    /// Both directions.
+    Both,
+}
+
+/// A directed, typed edge between two chunks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChunkRelation {
+    /// Collection-unique id, server-minted (UUIDv4) at create time.
+    pub relation_id: String,
+    pub source_chunk_id: u64,
+    pub target_chunk_id: u64,
+    /// Optional: the target may live in a document not yet ingested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_document_id: Option<String>,
+    /// Caller-defined edge label, e.g. "cites", "supersedes", "derived_from".
+    pub relation_type: String,
+    /// Whether `target_chunk_id` resolves to a chunk in this collection.
+    /// "found" | "missing" | "unknown" — computed at read time, not stored.
+    pub target_status: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, MetadataValue>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// POST /collections/:name/relations — batch create.
+#[derive(Debug, Deserialize)]
+pub struct CreateRelationsRequest {
+    pub relations: Vec<CreateRelation>,
+}
+
+/// A single edge to create. `relation_id` and `created_at` are assigned by the
+/// server; `target_status` is computed at read time.
+#[derive(Debug, Deserialize)]
+pub struct CreateRelation {
+    pub source_chunk_id: u64,
+    pub target_chunk_id: u64,
+    #[serde(default)]
+    pub target_document_id: Option<String>,
+    pub relation_type: String,
+    #[serde(default)]
+    pub metadata: HashMap<String, MetadataValue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateRelationsResponse {
+    /// The created edges, with server-assigned ids.
+    pub relations: Vec<ChunkRelation>,
+    pub created: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkRelationsResponse {
+    pub relations: Vec<ChunkRelation>,
+    pub total: usize,
+}
+
+/// POST /collections/:name/delete — soft-delete chunks by filter (and/or ids).
+#[derive(Debug, Deserialize)]
+pub struct DeleteRequest {
+    /// Explicit chunk ids to delete.
+    #[serde(default)]
+    pub ids: Vec<u64>,
+    /// Metadata filter (exact/range/contains/in) selecting chunks to delete,
+    /// e.g. {"file_id": "abc"} to delete every chunk of a document.
+    #[serde(default)]
+    pub filters: HashMap<String, FilterValue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteResponse {
+    /// Number of chunks newly soft-deleted (excludes already-deleted/missing).
+    pub deleted: usize,
 }
 
 fn default_search_mode() -> String {
@@ -489,6 +594,11 @@ pub struct SearchHit {
     /// orphan" from "parent exists with no metadata."
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_metadata: Option<HashMap<String, MetadataValue>>,
+    /// Chunk relations for this hit, present only when the search request set
+    /// `include_relations: true`. Absent from the JSON otherwise (the `Option`
+    /// distinguishes "not requested" from "requested, none found" = `Some([])`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relations: Option<Vec<ChunkRelation>>,
 }
 
 #[derive(Debug, Serialize)]

@@ -21,3 +21,6 @@ Thumbs.db
 
 # Benchmark data (large BEIR datasets)
 beir_data/
+
+# Committed template — .env.* above must not swallow it
+!.env.example

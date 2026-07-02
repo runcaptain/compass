@@ -30,10 +30,18 @@ RUN mkdir -p crates/compass/src crates/compass-index-api/src \
     && echo "" > crates/compass-index-api/src/lib.rs \
     && cargo build --release -p compass --no-default-features 2>/dev/null || true
 
+# Optional cargo features for the build (e.g. "object-storage" for the S3/GCS/
+# Azure backend). Empty by default → the lean local-first build.
+ARG CARGO_FEATURES=""
+
 # Now bring in the real source and rebuild everything that changed.
 COPY crates/ crates/
 RUN touch crates/compass-index-api/src/lib.rs crates/compass/src/main.rs \
-    && cargo build --release -p compass
+    && if [ -n "$CARGO_FEATURES" ]; then \
+         cargo build --release -p compass --features "$CARGO_FEATURES"; \
+       else \
+         cargo build --release -p compass; \
+       fi
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM debian:trixie-slim

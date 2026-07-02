@@ -26,10 +26,13 @@ Built by [Captain](https://runcaptain.com) for high-throughput retrieval in on-p
 - **Named vector spaces** ... run multiple embedding models on the same collection
 - **One-click model upgrades** with background re-embedding and atomic swap
 - **Parent-child documents** with relationship-aware scoring (TAMS video search compatible)
+- **Typed chunk relations**: directed, labeled, many-to-many edges between chunks (`cites`, `supersedes`, anything) — disk-backed, queryable per chunk, returnable inline with search results
+- **Deletes**: soft-delete by id or metadata filter (tombstones — instant disappearance from results), with compaction to reclaim space
 - **Query-time scoring**: recency decay, metadata boosting, relationship boosting
 - **Metadata filtering**: exact match, numeric range (gte/lte), array contains, set membership. Typed values (string, int, float, bool, timestamp, string list)
 - **Native query embedding** via Candle BGE-small (Rust, no Python). GPU endpoint support for larger models.
 - **Fully offline**. No API calls. Model weights on disk. Data never leaves the machine.
+- **Optional object-storage persistence** (`--features object-storage`): point `COMPASS_STORAGE` at S3/GCS/Azure/MinIO/R2 and the bucket becomes the source of truth — an ephemeral container that loses its disk recovers every collection (chunks, hierarchy, relations) from the bucket on boot. Local disk stays the zero-config default.
 
 ## Quick start
 
@@ -39,7 +42,7 @@ cargo build --release
 # Listening on http://localhost:4001
 ```
 
-Environment variables: `PORT` (default 4001), `DATA_DIR` (default ./data).
+Environment variables: `PORT` (default 4001), `DATA_DIR` (default ./data), `COMPASS_API_KEY` (bearer-token auth; unauthenticated when unset), `COMPASS_STORAGE` (see [Object storage](#object-storage-s3--gcs--azure)). See [`.env.example`](.env.example) for the full list.
 
 ## Examples
 
@@ -312,6 +315,52 @@ curl -X POST localhost:4001/collections/media/search \
 
 This finds segments matching "goal celebration" within the 2040000-2100000 ms window (33:60 → 35:00 in HH:MM:SS). Relationship boosting surfaces sibling segments and the parent flow alongside the match.
 
+### Typed chunk relations
+
+Beyond the parent/group hierarchy, chunks can be linked with directed, labeled, many-to-many edges:
+
+```bash
+# Create relations (server mints relation_ids)
+curl -X POST localhost:4001/collections/docs/relations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "relations": [
+      {"source_chunk_id": 12, "target_chunk_id": 40, "relation_type": "cites"},
+      {"source_chunk_id": 12, "target_chunk_id": 41, "relation_type": "supersedes"}
+    ]
+  }'
+
+# List a chunk's relations (direction: outgoing|incoming|both; optional type filter)
+curl 'localhost:4001/collections/docs/chunks/12/relations?direction=both&types=cites'
+
+# Delete an edge
+curl -X DELETE localhost:4001/collections/docs/relations/{relation_id}
+
+# Return relations inline with search hits
+curl -X POST localhost:4001/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "contract", "include_relations": true, "relation_direction": "outgoing"}'
+```
+
+Each edge carries a `target_status` (`"found"` / `"missing"`) resolved against the live chunk set, so dangling references are visible, never silent.
+
+### Deleting chunks
+
+Deletes are soft (tombstones): the chunk disappears from search results immediately; physical removal happens at the next compaction/rebuild.
+
+```bash
+# Delete one chunk
+curl -X DELETE localhost:4001/collections/docs/chunks/42
+
+# Delete by ids and/or metadata filter
+curl -X POST localhost:4001/collections/docs/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"ids": [1, 2], "filters": {"file_id": "old-report"}}'
+
+# Reclaim space (object-storage mode; folds the WAL + segments, drops tombstoned data)
+curl -X POST localhost:4001/collections/docs/compact
+```
+
 ### Hybrid score weights
 
 Control how FTS and semantic scores blend in hybrid mode. Useful when one signal matters more for your use case:
@@ -368,6 +417,32 @@ curl -X DELETE localhost:4001/collections/docs/vector-spaces/default
 ```bash
 docker build -t compass .
 docker run -p 4001:4001 -v ./data:/app/data compass
+```
+
+## Object storage (S3 / GCS / Azure)
+
+By default Compass persists to local disk — zero config, no credentials. Optionally, it can persist to your own cloud object storage instead (a hard either/or, chosen at startup):
+
+```bash
+# Build with the object-storage backend (off by default; local builds stay lean)
+cargo build --release --features object-storage
+
+# Point at a bucket; credentials come from the standard provider env vars
+COMPASS_STORAGE=s3://my-bucket/my-prefix \
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 \
+./target/release/compass
+```
+
+Supported: `s3://bucket[/prefix]` (AWS S3, MinIO, Cloudflare R2 — set `COMPASS_S3_ENDPOINT` for S3-compatible endpoints), `gs://bucket[/prefix]`, `az://container[/prefix]`. The optional `/prefix` scopes all keys so multiple deployments can share one bucket.
+
+In this mode the bucket is the **source of truth**: every write lands durably in object storage first (an LSM of immutable WAL fragments + a CAS-committed manifest), and a node that boots with an empty disk discovers its collections from the bucket and rebuilds all local indexes — chunks, hierarchy, and typed relations included. Compaction (automatic past a WAL threshold, or via `POST /compact`) folds fragments into segments and physically reclaims deleted data.
+
+Scope, honestly: reads are served from the locally rebuilt indexes (durable-via-cloud, fast-via-local) — this is not stateless multi-node serving, and cold-start recovery materializes the live set in RAM. See [CHANGELOG](CHANGELOG.md) for details.
+
+For local development against MinIO:
+
+```bash
+docker compose -f docker-compose.minio.yml up   # MinIO + Compass wired together
 ```
 
 ## Embedding models
@@ -430,6 +505,8 @@ Compass keeps vector data and chunk metadata on disk, not in RAM.
 ```
 data/{collection}/
 ├── collection.json                  # Collection metadata (name, dims, spaces)
+├── chunks.redb                      # Chunk metadata + delete tombstones (redb)
+├── relations.redb                   # Typed chunk relations + endpoint indexes (redb)
 ├── relationships.bin                # Parent-child + sibling graph
 ├── tantivy/                         # BM25 inverted index (disk-backed)
 └── vectors/
@@ -438,7 +515,7 @@ data/{collection}/
     └── {space}.keymap               # HNSW key → chunk ID mapping
 ```
 
-**Vectors**: Stored in a flat `[u32 dims][u32 count][f32...]` file, memory-mapped at query time. Adding vectors appends to the file and remaps — no full rewrite. At 1M vectors × 768 dims this is ~3GB on disk, near-zero RSS.
+**Vectors**: Stored in a flat `[magic "CMV2"][u32 dims][u64 count][f32...]` file, memory-mapped at query time. Adding vectors appends to the file and remaps — no full rewrite. Legacy u32-count files read transparently and migrate on first append. At 1M vectors × 768 dims this is ~3GB on disk, near-zero RSS.
 
 **HNSW index**: Built incrementally via USearch `.add()` + `.save()`. Loaded via `.load()` for mutation or `.view()` for read-only mmap. The graph structure is separate from the raw vectors.
 
@@ -473,6 +550,14 @@ DELETE /collections/:name                              Delete collection + data
 POST   /collections/:name/ingest                       Bulk ingest chunks
 POST   /collections/:name/search                       Search (fts|semantic|hybrid); filter-aware ANN, "explain":true for query plan
 GET    /collections/:name/facets                       Facet counts
+
+DELETE /collections/:name/chunks/:id                   Soft-delete one chunk
+POST   /collections/:name/delete                       Soft-delete by ids and/or metadata filters
+POST   /collections/:name/compact                      Fold WAL + segments, reclaim deleted data (object-storage mode)
+
+POST   /collections/:name/relations                    Create typed chunk relations (batch)
+DELETE /collections/:name/relations/:relation_id       Delete a relation
+GET    /collections/:name/chunks/:id/relations         List a chunk's relations (?direction=&types=)
 
 POST   /collections/:name/vector-spaces                Add a vector space
 GET    /collections/:name/vector-spaces                List vector spaces

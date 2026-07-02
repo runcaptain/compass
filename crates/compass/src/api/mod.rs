@@ -7,7 +7,9 @@
 // except /health. See `AuthConfig` and `auth_middleware` below.
 
 pub mod collections;
+pub mod delete;
 pub mod ingest;
+pub mod relations;
 pub mod search;
 pub mod segments;
 
@@ -107,6 +109,16 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
         )
         // ── Ingest ───────────────────────────────────────────────────────
         .route("/collections/{name}/ingest", post(ingest::ingest_chunks))
+        // ── Delete (soft-delete chunks) ──────────────────────────────────
+        .route(
+            "/collections/{name}/chunks/{chunk_id}",
+            delete(delete::delete_chunk),
+        )
+        .route("/collections/{name}/delete", post(delete::delete_by_query))
+        .route(
+            "/collections/{name}/compact",
+            post(delete::compact_collection),
+        )
         // ── Search + Facets ──────────────────────────────────────────────
         .route(
             "/collections/{name}/search",
@@ -117,6 +129,19 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
         .route(
             "/collections/{name}/segments/at",
             get(segments::segments_at),
+        )
+        // ── Chunk relations (typed, many-to-many edges) ──────────────────
+        .route(
+            "/collections/{name}/relations",
+            post(relations::create_relations),
+        )
+        .route(
+            "/collections/{name}/relations/{relation_id}",
+            delete(relations::delete_relation),
+        )
+        .route(
+            "/collections/{name}/chunks/{chunk_id}/relations",
+            get(relations::get_chunk_relations),
         )
         .layer(from_fn_with_state(auth, auth_middleware));
 
