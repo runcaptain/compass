@@ -96,6 +96,8 @@ impl SeqTracker {
 
 struct LoadedCollection {
     metadata: Collection,
+    /// LRU stamp for lazy-attach eviction (process-monotonic tick).
+    last_used: std::sync::atomic::AtomicU64,
     /// Manifest seqs applied to this node's local indexes (see [`SeqTracker`]).
     applied: SeqTracker,
     /// Cloud-mode id pool: ranges CAS-leased from `{ns}/id-alloc`. In cloud
@@ -159,6 +161,16 @@ pub struct CollectionManager {
         tokio::sync::Mutex<HashMap<String, std::collections::VecDeque<std::ops::Range<u64>>>>,
     /// Cache of bucket collection configs for stateless-writer validation.
     bucket_configs: tokio::sync::RwLock<HashMap<String, cloud::BucketConfig>>,
+    /// Lazy attach (COMPASS_LAZY_ATTACH): namespaces discovered in the bucket
+    /// but not yet attached. Attach happens on first request.
+    registered: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// Per-namespace attach mutexes: a request stampede on a cold namespace
+    /// rebuilds ONCE, without holding the global collections lock.
+    attach_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Lazy attach enabled (cloud mode + COMPASS_LAZY_ATTACH=true).
+    lazy_attach: bool,
+    /// LRU budget for attached collections (COMPASS_MAX_ATTACHED; 0 = unbounded).
+    max_attached: usize,
 }
 
 /// What this node does. Parsed from `COMPASS_ROLE` (default `full`).
@@ -207,6 +219,26 @@ impl CollectionManager {
         storage: Arc<dyn Storage>,
         role: NodeRole,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let lazy = std::env::var("COMPASS_LAZY_ATTACH")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let max_attached = std::env::var("COMPASS_MAX_ATTACHED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Self::new_with_storage_opts(data_dir, storage, role, lazy, max_attached).await
+    }
+
+    /// Fully-explicit constructor (role + lazy-attach + LRU budget), used by
+    /// tests to avoid process-global env races and by callers embedding
+    /// Compass as a library.
+    pub async fn new_with_storage_opts(
+        data_dir: &Path,
+        storage: Arc<dyn Storage>,
+        role: NodeRole,
+        lazy_attach: bool,
+        max_attached: usize,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(data_dir)?;
 
         // Clean up any stale rebuild directories from crashes
@@ -229,6 +261,10 @@ impl CollectionManager {
             role,
             writer_pools: tokio::sync::Mutex::new(HashMap::new()),
             bucket_configs: tokio::sync::RwLock::new(HashMap::new()),
+            registered: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            attach_locks: tokio::sync::Mutex::new(HashMap::new()),
+            lazy_attach: cloud_mode && lazy_attach,
+            max_attached,
         });
 
         // Writer role: no local collections, no recovery — the node serves
@@ -266,6 +302,12 @@ impl CollectionManager {
                         if already {
                             continue;
                         }
+                        if manager.lazy_attach {
+                            // Lazy mode: register only — attach on first
+                            // request. Boot cost is O(namespaces), not O(data).
+                            manager.registered.write().await.insert(ns.clone());
+                            continue;
+                        }
                         match manager.rebuild_collection_from_storage(ns).await {
                             Ok(n) => {
                                 recovered += 1;
@@ -282,6 +324,12 @@ impl CollectionManager {
                     }
                     if recovered > 0 {
                         tracing::info!("Recovered {} collection(s) from object storage", recovered);
+                    }
+                    if manager.lazy_attach {
+                        let n = manager.registered.read().await.len();
+                        if n > 0 {
+                            tracing::info!("Registered {} collection(s) for lazy attach", n);
+                        }
                     }
                 }
                 Err(e) => tracing::error!("Could not list collections from object storage: {}", e),
@@ -406,6 +454,7 @@ impl CollectionManager {
         let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
             // Persistent-disk restart: local indexes reflect fragments
             // 0..applied_seq (persisted on every apply); the refresher applies
             // the delta instead of a full rebuild.
@@ -517,6 +566,7 @@ impl CollectionManager {
 
             let loaded = LoadedCollection {
                 id_pool: Default::default(),
+                last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
                 applied: SeqTracker::default(),
                 metadata: collection.clone(),
                 fts,
@@ -596,11 +646,45 @@ impl CollectionManager {
     }
 
     pub async fn list_collections(&self) -> Vec<Collection> {
-        let collections = self.collections.read().await;
-        collections.values().map(|c| c.metadata.clone()).collect()
+        let mut out: Vec<Collection> = {
+            let collections = self.collections.read().await;
+            collections.values().map(|c| c.metadata.clone()).collect()
+        };
+        if self.lazy_attach {
+            let attached: std::collections::HashSet<String> =
+                out.iter().map(|c| c.name.clone()).collect();
+            let names: Vec<String> = {
+                let reg = self.registered.read().await;
+                reg.iter()
+                    .filter(|n| !attached.contains(*n))
+                    .cloned()
+                    .collect()
+            };
+            for name in names {
+                if let Ok(Some(cfg)) = cloud::read_bucket_config(self.storage.as_ref(), &name).await
+                {
+                    out.push(Collection {
+                        name: cfg.name,
+                        created_at: cfg.created_at,
+                        vector_spaces: cfg.vector_spaces,
+                        default_vector_space: cfg.default_vector_space,
+                        embedding_dims: cfg.embedding_dims,
+                        // Live counts are known only once attached.
+                        chunk_count: 0,
+                        next_id: 0,
+                        config: cfg.config,
+                        applied_seq: 0,
+                    });
+                }
+            }
+        }
+        out
     }
 
     pub async fn get_collection(&self, name: &str) -> Option<Collection> {
+        // Lazy mode: a registered-but-unattached collection attaches on its
+        // first request — including a metadata read.
+        let _ = self.ensure_attached(name).await;
         let collections = self.collections.read().await;
         collections.get(name).map(|c| c.metadata.clone())
     }
@@ -643,6 +727,7 @@ impl CollectionManager {
         // character set as collection names.
         validate_name_segment(space_name, "Vector space")?;
 
+        self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions only.
         {
             let collections = self.collections.read().await;
@@ -714,6 +799,7 @@ impl CollectionManager {
         // `remove_file` calls below.
         validate_name_segment(space_name, "Vector space")?;
 
+        self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions.
         {
             let collections = self.collections.read().await;
@@ -763,6 +849,7 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions.
         {
             let collections = self.collections.read().await;
@@ -803,6 +890,7 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_attached(collection_name).await?;
         // Bucket-first status flip (NO lock during the CAS).
         if self.cloud_mode {
             cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
@@ -1131,6 +1219,7 @@ impl CollectionManager {
         }
 
         let count = ingest_chunks.len();
+        self.ensure_attached(collection_name).await?;
 
         // Cloud mode: ids come from CAS-leased blocks (storage/id_alloc.rs) so
         // they can NEVER collide with a stateless writer's ids. This happens
@@ -1630,6 +1719,7 @@ impl CollectionManager {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
+        self.ensure_attached(collection_name).await?;
 
         // Read-your-writes: wait (bounded) until fragments up to `min_seq` are
         // applied locally, refreshing on demand. A `min_seq` beyond the
@@ -1643,6 +1733,9 @@ impl CollectionManager {
                         let loaded = collections
                             .get(collection_name)
                             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+                        loaded
+                            .last_used
+                            .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
                         loaded.applied.covers(min_seq)
                     };
                     if covered {
@@ -2016,6 +2109,7 @@ impl CollectionManager {
             }
             return Ok(built);
         }
+        self.ensure_attached(collection_name).await?;
         // Phase 1 (read lock): build the edges, resolving target_status against
         // the chunk map. Then release the lock BEFORE the S3 round-trip (#2/#4).
         let now = Utc::now();
@@ -2128,6 +2222,7 @@ impl CollectionManager {
             .map_err(|e| format!("cloud relation-delete append failed: {e}"))?;
             return Ok(true);
         }
+        self.ensure_attached(collection_name).await?;
         // Existence check under a short read lock, then release before S3 I/O.
         {
             let collections = self.collections.read().await;
@@ -2178,6 +2273,7 @@ impl CollectionManager {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
+        self.ensure_attached(collection_name).await?;
         let collections = self.collections.read().await;
         let loaded = collections
             .get(collection_name)
@@ -2340,6 +2436,99 @@ impl CollectionManager {
         }
     }
 
+    /// Lazy attach: make sure `ns` is attached (rebuilt from the bucket) before
+    /// serving a request against it. No-op when already attached or when lazy
+    /// attach is off. A request stampede on a cold namespace rebuilds ONCE via
+    /// the per-namespace mutex; the global collections lock is never held
+    /// across the rebuild.
+    async fn ensure_attached(
+        &self,
+        ns: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.lazy_attach {
+            return Ok(());
+        }
+        if self.collections.read().await.contains_key(ns) {
+            return Ok(());
+        }
+        // Per-namespace attach mutex (created on demand).
+        let lock = {
+            let mut locks = self.attach_locks.lock().await;
+            locks.entry(ns.to_string()).or_default().clone()
+        };
+        let _guard = lock.lock().await;
+        // Double-check under the attach mutex: a racer may have attached.
+        if self.collections.read().await.contains_key(ns) {
+            return Ok(());
+        }
+        // Confirm the namespace exists in the bucket. Check the registry first
+        // (boot-time discovery), then the bucket itself — a collection created
+        // by ANOTHER node after our boot is attachable too.
+        let known = self.registered.read().await.contains(ns);
+        if !known {
+            validate_name_segment(ns, "Collection")?;
+            let exists = cloud::read_bucket_config(self.storage.as_ref(), ns)
+                .await?
+                .is_some()
+                || self
+                    .storage
+                    .exists(&format!("{ns}/manifest"))
+                    .await
+                    .unwrap_or(false);
+            if !exists {
+                return Err(format!("Collection '{}' not found", ns).into());
+            }
+            self.registered.write().await.insert(ns.to_string());
+        }
+        let start = std::time::Instant::now();
+        let n = self.rebuild_collection_from_storage(ns).await?;
+        tracing::info!(
+            "Attached '{}' on demand ({} chunks in {:.2}s)",
+            ns,
+            n,
+            start.elapsed().as_secs_f64()
+        );
+        self.maybe_evict_lru(ns).await;
+        Ok(())
+    }
+
+    /// Enforce the attached-collection budget: detach the least-recently-used
+    /// collection (never `just_attached`). Detach is safe — the bucket is the
+    /// source of truth — and local files are deleted only AFTER the global
+    /// lock is released (never filesystem I/O under the lock). The evicted
+    /// namespace stays registered for future re-attach.
+    async fn maybe_evict_lru(&self, just_attached: &str) {
+        if self.max_attached == 0 {
+            return;
+        }
+        let evicted: Option<String> = {
+            let mut collections = self.collections.write().await;
+            if collections.len() <= self.max_attached {
+                None
+            } else {
+                let victim = collections
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != just_attached)
+                    .min_by_key(|(_, l)| l.last_used.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|(name, _)| name.clone());
+                match victim {
+                    Some(name) => {
+                        collections.remove(&name);
+                        Some(name)
+                    }
+                    None => None,
+                }
+            }
+        }; // global lock released before any filesystem work.
+        if let Some(name) = evicted {
+            self.registered.write().await.insert(name.clone());
+            if let Err(e) = store::delete_collection_data(&self.data_dir, &name) {
+                tracing::warn!("detach '{}': local cleanup failed: {}", name, e);
+            }
+            tracing::info!("Detached '{}' (LRU, budget {})", name, self.max_attached);
+        }
+    }
+
     /// Converge this node's local indexes with the bucket manifest: apply
     /// fragments this node hasn't seen (a remote writer's, or another serving
     /// node's), in seq order, idempotently. Returns the manifest's `next_seq`.
@@ -2467,6 +2656,7 @@ impl CollectionManager {
             );
             return Ok((newly.len(), Some(seq)));
         }
+        self.ensure_attached(collection_name).await?;
 
         // Phase 1 (read lock): determine which ids are actually deletable.
         // DEDUP the input — `{"ids":[5,5,5]}` must count (and decrement
@@ -2568,6 +2758,7 @@ impl CollectionManager {
                     .into(),
             );
         }
+        self.ensure_attached(collection_name).await?;
         // Collect matching, not-yet-deleted ids under a read lock first.
         let ids: Vec<u64> = {
             let collections = self.collections.read().await;
@@ -2604,6 +2795,7 @@ impl CollectionManager {
         if !self.cloud_mode {
             return Ok(0);
         }
+        self.ensure_attached(collection_name).await?;
         // Verify the collection exists (under a short read lock).
         {
             let collections = self.collections.read().await;
@@ -2786,6 +2978,7 @@ impl CollectionManager {
 
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
             // A rebuild materialized EVERYTHING in the manifest it read.
             applied: SeqTracker::starting_at(manifest.next_seq),
             metadata,
@@ -2817,6 +3010,7 @@ impl CollectionManager {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
+        self.ensure_attached(collection_name).await?;
         let collections = self.collections.read().await;
         let loaded = collections
             .get(collection_name)
@@ -3215,6 +3409,12 @@ fn maybe_auto_compact(
 /// `eligible`/selectivity agree with what search may actually return, on every
 /// load path (local load, ingest rebuild, cloud recovery). Freshly-deleted ids
 /// are additionally masked post-retrieval until the next rebuild.
+/// Process-monotonic LRU tick (no wall clock — avoids Date-based flakiness).
+fn next_lru_tick() -> u64 {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn build_filter_index_from_chunks(
     chunks: &HashMap<u64, DocumentChunk>,
     tombstones: &std::collections::HashSet<u64>,
@@ -5537,6 +5737,176 @@ mod cloud_ingest_tests {
             .search("ryw", &cloud_search_req(Some(9_999)), &embed)
             .await
             .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // ── Warm-serverless: lazy attach + LRU detach ─────────────────────────
+
+    // Lazy boot registers namespaces without rebuilding; the first request
+    // attaches; a concurrent stampede attaches exactly once.
+    #[tokio::test]
+    async fn lazy_attach_on_first_request() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        // Seed the bucket with a collection via an eager node.
+        let dir_seed = unique_data_dir();
+        std::fs::create_dir_all(&dir_seed).unwrap();
+        {
+            let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&dir_seed, st)
+                .await
+                .unwrap();
+            m.create_collection("lazy", None, Some(4), None)
+                .await
+                .unwrap();
+            m.ingest("lazy", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&dir_seed).unwrap();
+
+        // Lazy node: boot must NOT rebuild (no local dir for the collection).
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 0)
+            .await
+            .unwrap();
+        assert!(
+            !dir.join("lazy").join("chunks.redb").exists(),
+            "lazy boot must not rebuild collections"
+        );
+
+        // Stampede: 8 concurrent first-requests; all succeed, attach happens once.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m2 = m.clone();
+            let e2 = embed_state();
+            handles.push(tokio::spawn(async move {
+                let (hits, _, _, _) = m2
+                    .search("lazy", &cloud_search_req(None), &e2)
+                    .await
+                    .unwrap();
+                hits.len()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), 2);
+        }
+        assert!(dir.join("lazy").join("chunks.redb").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // LRU detach: with a budget of 1, attaching a second collection evicts the
+    // least-recently-used one; the evicted collection re-attaches on demand
+    // with all its data (bucket is the source of truth).
+    #[tokio::test]
+    async fn lru_detach_and_reattach_roundtrip() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_seed = unique_data_dir();
+        std::fs::create_dir_all(&dir_seed).unwrap();
+        {
+            let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&dir_seed, st)
+                .await
+                .unwrap();
+            for name in ["one", "two"] {
+                m.create_collection(name, None, Some(4), None)
+                    .await
+                    .unwrap();
+                m.ingest(name, vec![ingest_chunk(0)], &embed).await.unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&dir_seed).unwrap();
+
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 1)
+            .await
+            .unwrap();
+
+        // Attach "one", then "two" — budget 1 evicts "one".
+        let (hits, _, _, _) = m
+            .search("one", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let (hits, _, _, _) = m
+            .search("two", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        {
+            let attached = m.collections.read().await;
+            assert_eq!(attached.len(), 1, "LRU budget enforced");
+            assert!(attached.contains_key("two"));
+        }
+        assert!(!dir.join("one").join("chunks.redb").exists());
+
+        // Evicted collection re-attaches on demand, data intact.
+        let (hits, _, _, _) = m
+            .search("one", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "re-attach after eviction serves all data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Lazy mode keeps metadata correct: list/get see registered collections;
+    // a collection created on ANOTHER node after boot attaches on demand.
+    #[tokio::test]
+    async fn lazy_attach_discovers_foreign_creates() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        // Lazy node boots FIRST (empty bucket).
+        let b = CollectionManager::new_with_storage_opts(&dir_b, sb, NodeRole::Full, true, 0)
+            .await
+            .unwrap();
+        // Another node creates + writes afterwards.
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("late", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("late", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+
+        // B never saw "late" at boot; first request attaches it anyway.
+        let (hits, _, _, _) = b
+            .search("late", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "foreign create attaches on demand");
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
