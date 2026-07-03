@@ -150,6 +150,15 @@ async fn commit_manifest(
     }
 }
 
+/// Fetch one WAL fragment's payload by id.
+pub async fn read_fragment(
+    storage: &dyn Storage,
+    ns: &str,
+    id: &str,
+) -> Result<Bytes, StorageError> {
+    storage.get(&fragment_key(ns, id)).await
+}
+
 /// Create-only commit of an EMPTY manifest for a new namespace, making a
 /// zero-ingest collection discoverable (`list_namespaces` keys off
 /// `{ns}/manifest`). `AlreadyExists` bubbles up — it means the namespace

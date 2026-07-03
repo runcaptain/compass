@@ -51,6 +51,15 @@ pub async fn seed(storage: &dyn Storage, ns: &str, start: u64) -> Result<(), Sto
     }
 }
 
+/// The current allocation frontier: every legitimately-minted id is < this.
+/// `NotFound` when the allocator was never seeded (pre-v0.4 namespace).
+pub async fn frontier(storage: &dyn Storage, ns: &str) -> Result<u64, StorageError> {
+    let bytes = storage.get(&alloc_key(ns)).await?;
+    let state: AllocState = serde_json::from_slice(&bytes)
+        .map_err(|e| StorageError::Io(format!("id-alloc decode for '{ns}': {e}")))?;
+    Ok(state.next_block_start)
+}
+
 /// Claim a block of at least `count` ids (min [`BLOCK`]) via CAS. Returns the
 /// claimed half-open range. `NotFound` means the allocator was never seeded
 /// (pre-v0.4 namespace) — the caller migrates via [`seed`] and retries.

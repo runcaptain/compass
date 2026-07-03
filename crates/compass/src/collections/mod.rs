@@ -226,7 +226,19 @@ impl CollectionManager {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        Self::new_with_storage_opts(data_dir, storage, role, lazy, max_attached).await
+        let refresh_interval_secs = std::env::var("COMPASS_REFRESH_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        Self::new_with_storage_opts(
+            data_dir,
+            storage,
+            role,
+            lazy,
+            max_attached,
+            refresh_interval_secs,
+        )
+        .await
     }
 
     /// Fully-explicit constructor (role + lazy-attach + LRU budget), used by
@@ -238,6 +250,7 @@ impl CollectionManager {
         role: NodeRole,
         lazy_attach: bool,
         max_attached: usize,
+        refresh_interval_secs: u64,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(data_dir)?;
 
@@ -341,10 +354,7 @@ impl CollectionManager {
         // other serving nodes). COMPASS_REFRESH_INTERVAL seconds, default 5,
         // 0 disables. Holds only a Weak — the task dies with the manager.
         if cloud_mode {
-            let interval_secs: u64 = std::env::var("COMPASS_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5);
+            let interval_secs = refresh_interval_secs;
             if interval_secs > 0 {
                 let weak = Arc::downgrade(&manager);
                 tokio::spawn(async move {
@@ -495,6 +505,11 @@ impl CollectionManager {
         embedding_dims: Option<usize>,
         config: Option<CollectionConfig>,
     ) -> Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
+        if self.role == NodeRole::Writer {
+            return Err(
+                "this node runs in writer role; create collections via a serving node".into(),
+            );
+        }
         validate_name_segment(name, "Collection")?;
 
         let collection = {
@@ -693,11 +708,34 @@ impl CollectionManager {
         &self,
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut collections = self.collections.write().await;
-        if collections.remove(name).is_none() {
-            return Err(format!("Collection '{}' not found", name).into());
+        // Lazy mode: the collection may be registered-but-unattached (or LRU
+        // evicted) — deleting it must still purge the bucket.
+        let attached = {
+            let mut collections = self.collections.write().await;
+            collections.remove(name).is_some()
+        }; // write lock released BEFORE any filesystem/S3 work.
+        let registered = self.registered.write().await.remove(name);
+        if !attached && !registered {
+            // Not known locally; in cloud mode it may still exist in the bucket
+            // (created by another node).
+            let in_bucket = self.cloud_mode
+                && cloud::read_bucket_config(self.storage.as_ref(), name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+            if !in_bucket {
+                return Err(format!("Collection '{}' not found", name).into());
+            }
         }
-        store::delete_collection_data(&self.data_dir, name)?;
+        if attached {
+            store::delete_collection_data(&self.data_dir, name)?;
+        }
+        // Purge every node-local cache tied to the namespace so a later
+        // recreate can't consume stale pooled ids or stale configs.
+        self.bucket_configs.write().await.remove(name);
+        self.writer_pools.lock().await.remove(name);
+        self.attach_locks.lock().await.remove(name);
         // Cloud mode: also purge the collection's objects from storage, so it
         // can't be resurrected from S3 on a later cold start (and so a racing
         // ingest's orphan fragment doesn't bring a "deleted" collection back).
@@ -727,6 +765,11 @@ impl CollectionManager {
         // character set as collection names.
         validate_name_segment(space_name, "Vector space")?;
 
+        if self.role == NodeRole::Writer {
+            return Err(
+                "this node runs in writer role; manage vector spaces via a serving node".into(),
+            );
+        }
         self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions only.
         {
@@ -799,6 +842,11 @@ impl CollectionManager {
         // `remove_file` calls below.
         validate_name_segment(space_name, "Vector space")?;
 
+        if self.role == NodeRole::Writer {
+            return Err(
+                "this node runs in writer role; manage vector spaces via a serving node".into(),
+            );
+        }
         self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions.
         {
@@ -849,6 +897,11 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.role == NodeRole::Writer {
+            return Err(
+                "this node runs in writer role; manage vector spaces via a serving node".into(),
+            );
+        }
         self.ensure_attached(collection_name).await?;
         // Phase 1 (short read lock): preconditions.
         {
@@ -890,6 +943,11 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.role == NodeRole::Writer {
+            return Err(
+                "this node runs in writer role; manage vector spaces via a serving node".into(),
+            );
+        }
         self.ensure_attached(collection_name).await?;
         // Bucket-first status flip (NO lock during the CAS).
         if self.cloud_mode {
@@ -1136,6 +1194,15 @@ impl CollectionManager {
                             .unwrap_or(cfg.embedding_dims);
                         if emb.len() == expected {
                             embeddings.insert(default_space.clone(), emb);
+                        } else {
+                            tracing::warn!(
+                                "writer ingest: built-in embedder produces {} dims but space \
+                                 '{}' expects {} — chunk {} will be FTS-only",
+                                emb.len(),
+                                default_space,
+                                expected,
+                                i
+                            );
                         }
                     }
                 }
@@ -1409,11 +1476,28 @@ impl CollectionManager {
         // so no concurrent ingest can collide; applying by id is order-independent.
         let mut collections = self.collections.write().await;
         let loaded = match collections.get_mut(collection_name) {
-            Some(l) => l,
+            Some(l) => {
+                l.last_used
+                    .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
+                l
+            }
             None => {
-                // Collection was deleted in the lock gap. `delete_collection`
-                // purges S3, but our fragment may have landed after that purge —
-                // append a tombstone so a re-materialize (which would recreate a
+                // Missing from the map: either DELETED or merely LRU-EVICTED in
+                // the lock gap. If the bucket still has the collection, the
+                // append is healthy and durable — do NOT erase it; the next
+                // attach/refresh applies it.
+                if self.cloud_mode
+                    && cloud::read_bucket_config(self.storage.as_ref(), collection_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                {
+                    return Ok((count, client_id_map, appended_seq));
+                }
+                // Genuinely deleted: `delete_collection` purges S3, but our
+                // fragment may have landed after that purge — append a
+                // tombstone so a re-materialize (which would recreate a
                 // manifest referencing only our orphan fragment) yields nothing.
                 if self.cloud_mode {
                     if let Err(te) = crate::storage::lsm::append_tombstone(
@@ -1453,10 +1537,6 @@ impl CollectionManager {
         // written a durable S3 fragment for these ids, so we compensate with a
         // tombstone (below) — otherwise a partial local commit + orphan S3
         // fragment would resurrect/duplicate the batch on a cold restart (F2).
-        if let Some(seq) = appended_seq {
-            loaded.applied.mark(seq);
-            loaded.metadata.applied_seq = loaded.applied.contiguous;
-        }
         let commit_result = Self::apply_ingest_commit(
             &self.data_dir,
             collection_name,
@@ -1466,6 +1546,12 @@ impl CollectionManager {
             space_vectors,
             count,
         );
+        if commit_result.is_ok() {
+            if let Some(seq) = appended_seq {
+                loaded.applied.mark(seq);
+                loaded.metadata.applied_seq = loaded.applied.contiguous;
+            }
+        }
         if let Err(e) = commit_result {
             if self.cloud_mode {
                 // Compensate for the durable S3 fragment whose local commit
@@ -1764,6 +1850,9 @@ impl CollectionManager {
         let loaded = collections
             .get(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        loaded
+            .last_used
+            .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
 
         let mode = SearchMode::from_str_param(&req.mode);
         let rerank_k = req.top_k * 3; // fetch extra candidates for scoring
@@ -2172,11 +2261,16 @@ impl CollectionManager {
                     if appended_seq.map(|s| loaded.applied.covers(s)) == Some(true) {
                         Ok(())
                     } else {
-                        if let Some(seq) = appended_seq {
-                            loaded.applied.mark(seq);
-                            loaded.metadata.applied_seq = loaded.applied.contiguous;
+                        let r = loaded.relation_store.insert_batch(&built);
+                        if r.is_ok() {
+                            // Mark only after a successful apply (see C2).
+                            if let Some(seq) = appended_seq {
+                                loaded.applied.mark(seq);
+                                loaded.metadata.applied_seq = loaded.applied.contiguous;
+                                let _ = store::save_metadata(&self.data_dir, &loaded.metadata);
+                            }
                         }
-                        loaded.relation_store.insert_batch(&built)
+                        r
                     }
                 }
                 None => Err(format!("Collection '{}' not found", collection_name).into()),
@@ -2254,11 +2348,16 @@ impl CollectionManager {
         if appended_seq.map(|s| loaded.applied.covers(s)) == Some(true) {
             return Ok(true); // refresher already applied our delete
         }
-        if let Some(seq) = appended_seq {
-            loaded.applied.mark(seq);
-            loaded.metadata.applied_seq = loaded.applied.contiguous;
+        let r = loaded.relation_store.delete(relation_id);
+        if r.is_ok() {
+            // Mark only after a successful apply (see C2).
+            if let Some(seq) = appended_seq {
+                loaded.applied.mark(seq);
+                loaded.metadata.applied_seq = loaded.applied.contiguous;
+                let _ = store::save_metadata(&self.data_dir, &loaded.metadata);
+            }
         }
-        loaded.relation_store.delete(relation_id)
+        r
     }
 
     /// List a single chunk's relations, with `target_status` resolved against
@@ -2278,6 +2377,9 @@ impl CollectionManager {
         let loaded = collections
             .get(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        loaded
+            .last_used
+            .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
         let mut edges = loaded
             .relation_store
             .for_chunk(chunk_id, direction, types)?;
@@ -2436,6 +2538,15 @@ impl CollectionManager {
         }
     }
 
+    /// The per-namespace attach mutex (created on demand). Serializes every
+    /// destructive local-state transition for a namespace: attach, refresh-
+    /// triggered full re-attach, and LRU detach — so two of them can never run
+    /// concurrently on the same live index directory.
+    async fn attach_lock(&self, ns: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.attach_locks.lock().await;
+        locks.entry(ns.to_string()).or_default().clone()
+    }
+
     /// Lazy attach: make sure `ns` is attached (rebuilt from the bucket) before
     /// serving a request against it. No-op when already attached or when lazy
     /// attach is off. A request stampede on a cold namespace rebuilds ONCE via
@@ -2451,11 +2562,7 @@ impl CollectionManager {
         if self.collections.read().await.contains_key(ns) {
             return Ok(());
         }
-        // Per-namespace attach mutex (created on demand).
-        let lock = {
-            let mut locks = self.attach_locks.lock().await;
-            locks.entry(ns.to_string()).or_default().clone()
-        };
+        let lock = self.attach_lock(ns).await;
         let _guard = lock.lock().await;
         // Double-check under the attach mutex: a racer may have attached.
         if self.collections.read().await.contains_key(ns) {
@@ -2476,6 +2583,8 @@ impl CollectionManager {
                     .await
                     .unwrap_or(false);
             if !exists {
+                // Don't leak an attach-lock entry per garbage name probed.
+                self.attach_locks.lock().await.remove(ns);
                 return Err(format!("Collection '{}' not found", ns).into());
             }
             self.registered.write().await.insert(ns.to_string());
@@ -2501,32 +2610,38 @@ impl CollectionManager {
         if self.max_attached == 0 {
             return;
         }
-        let evicted: Option<String> = {
-            let mut collections = self.collections.write().await;
+        // Pick the victim under a short read lock.
+        let victim: Option<String> = {
+            let collections = self.collections.read().await;
             if collections.len() <= self.max_attached {
                 None
             } else {
-                let victim = collections
+                collections
                     .iter()
                     .filter(|(name, _)| name.as_str() != just_attached)
                     .min_by_key(|(_, l)| l.last_used.load(std::sync::atomic::Ordering::Relaxed))
-                    .map(|(name, _)| name.clone());
-                match victim {
-                    Some(name) => {
-                        collections.remove(&name);
-                        Some(name)
-                    }
-                    None => None,
-                }
+                    .map(|(name, _)| name.clone())
             }
-        }; // global lock released before any filesystem work.
-        if let Some(name) = evicted {
-            self.registered.write().await.insert(name.clone());
-            if let Err(e) = store::delete_collection_data(&self.data_dir, &name) {
-                tracing::warn!("detach '{}': local cleanup failed: {}", name, e);
+        };
+        let Some(name) = victim else { return };
+        // Serialize with attach/re-attach on the same namespace: file deletion
+        // must never race a rebuild into the same directory.
+        let lock = self.attach_lock(&name).await;
+        let _guard = lock.lock().await;
+        {
+            let mut collections = self.collections.write().await;
+            // Re-check under the attach mutex (a racer may have evicted or the
+            // budget may have been satisfied meanwhile).
+            if collections.len() <= self.max_attached || !collections.contains_key(&name) {
+                return;
             }
-            tracing::info!("Detached '{}' (LRU, budget {})", name, self.max_attached);
+            collections.remove(&name);
+        } // global lock released before any filesystem work.
+        self.registered.write().await.insert(name.clone());
+        if let Err(e) = store::delete_collection_data(&self.data_dir, &name) {
+            tracing::warn!("detach '{}': local cleanup failed: {}", name, e);
         }
+        tracing::info!("Detached '{}' (LRU, budget {})", name, self.max_attached);
     }
 
     /// Converge this node's local indexes with the bucket manifest: apply
@@ -2545,9 +2660,79 @@ impl CollectionManager {
         if !self.cloud_mode {
             return Ok(0);
         }
-        let (manifest, _) =
-            crate::storage::lsm::read_manifest(self.storage.as_ref(), collection_name).await?;
+        // Deleted-collection detection (no namespace generations yet): a
+        // manifest that has VANISHED means the collection was deleted on
+        // another node — detach instead of warning forever while serving dead
+        // data.
+        let (manifest, _) = match crate::storage::lsm::read_manifest(
+            self.storage.as_ref(),
+            collection_name,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                let manifest_gone = !self
+                    .storage
+                    .exists(&format!("{collection_name}/manifest"))
+                    .await
+                    .unwrap_or(true);
+                if manifest_gone {
+                    self.detach_deleted(collection_name).await;
+                    return Err(format!(
+                        "collection '{collection_name}' was deleted in object storage"
+                    )
+                    .into());
+                }
+                return Err(e.into());
+            }
+        };
         let next_seq = manifest.next_seq;
+
+        // Config convergence: vector-space adds/removes/default switches are
+        // CAS'd into {ns}/collection.json, NOT written as fragments — sync them
+        // here so already-attached nodes learn about them. A recreate (config
+        // created_at differs from ours) forces a full re-attach.
+        let bucket_cfg = cloud::read_bucket_config(self.storage.as_ref(), collection_name).await?;
+        let mut force_reattach = false;
+        if let Some(cfg) = &bucket_cfg {
+            let mut collections = self.collections.write().await;
+            if let Some(loaded) = collections.get_mut(collection_name) {
+                if loaded.metadata.created_at != cfg.created_at {
+                    // Same name, different collection: it was deleted and
+                    // recreated while we were attached.
+                    force_reattach = true;
+                } else if loaded.metadata.vector_spaces != cfg.vector_spaces
+                    || loaded.metadata.default_vector_space != cfg.default_vector_space
+                {
+                    for (name, spec) in &cfg.vector_spaces {
+                        if !loaded.vector_spaces.contains_key(name) {
+                            loaded.vector_spaces.insert(
+                                name.clone(),
+                                Arc::new(VectorState {
+                                    index: None,
+                                    key_to_chunk_id: Vec::new(),
+                                    mmap_vectors: None,
+                                    vectors: Vec::new(),
+                                    dims: spec.dims,
+                                }),
+                            );
+                        }
+                    }
+                    loaded
+                        .vector_spaces
+                        .retain(|name, _| cfg.vector_spaces.contains_key(name));
+                    loaded.metadata.vector_spaces = cfg.vector_spaces.clone();
+                    loaded.metadata.default_vector_space = cfg.default_vector_space.clone();
+                    loaded.metadata.config = cfg.config.clone();
+                    store::save_metadata(&self.data_dir, &loaded.metadata)?;
+                    tracing::info!(
+                        "refresh '{}': synced vector-space config from bucket",
+                        collection_name
+                    );
+                }
+            }
+        }
 
         let contiguous = {
             let collections = self.collections.read().await;
@@ -2557,44 +2742,71 @@ impl CollectionManager {
             loaded.applied.contiguous
         };
 
-        if let Some(wm) = manifest.compaction_watermark {
-            if wm + 1 > contiguous {
-                // Fragments we never applied were compacted away — full re-attach.
+        let needs_reattach = force_reattach
+            || manifest
+                .compaction_watermark
+                .map(|wm| wm + 1 > contiguous)
+                .unwrap_or(false);
+        if needs_reattach {
+            // Full re-attach, SERIALIZED on the per-namespace attach mutex so
+            // concurrent refresh ticks / min_seq waiters can't run destructive
+            // rebuilds into the same live directory.
+            let lock = self.attach_lock(collection_name).await;
+            let _guard = lock.lock().await;
+            // Re-check under the mutex: a racer may have already re-attached.
+            let still_needed = {
+                let collections = self.collections.read().await;
+                match collections.get(collection_name) {
+                    Some(loaded) => {
+                        force_reattach
+                            && loaded.metadata.created_at
+                                != bucket_cfg
+                                    .as_ref()
+                                    .map(|c| c.created_at)
+                                    .unwrap_or(loaded.metadata.created_at)
+                            || manifest
+                                .compaction_watermark
+                                .map(|wm| wm + 1 > loaded.applied.contiguous)
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                }
+            };
+            if still_needed {
                 tracing::info!(
-                    "refresh '{}': compaction passed local frontier ({} > {}); re-attaching",
-                    collection_name,
-                    wm + 1,
-                    contiguous
+                    "refresh '{}': full re-attach (compaction passed local frontier or recreate)",
+                    collection_name
                 );
                 self.rebuild_collection_from_storage(collection_name)
                     .await?;
-                return Ok(next_seq);
             }
-        }
-
-        // Fetch pending fragment payloads WITHOUT any lock held.
-        let frags = crate::storage::lsm::read_uncompacted_fragments(
-            self.storage.as_ref(),
-            collection_name,
-            &manifest,
-        )
-        .await?;
-        let pending: Vec<_> = frags
-            .into_iter()
-            .filter(|(r, _)| r.seq >= contiguous)
-            .collect();
-        if pending.is_empty() {
             return Ok(next_seq);
         }
 
-        // Apply in seq order under the write lock, skipping anything the node
-        // applied out-of-band (its own recent appends).
-        let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        // Filter fragment REFS first, fetch only what we need (a caught-up
+        // node fetches nothing), then apply per-fragment with the lock
+        // RELEASED between fragments so a large backlog can't cause a
+        // node-wide read outage.
+        let pending_refs: Vec<crate::storage::lsm::FragmentRef> = manifest
+            .uncompacted()
+            .filter(|r| r.seq >= contiguous)
+            .cloned()
+            .collect();
+        if pending_refs.is_empty() {
+            return Ok(next_seq);
+        }
         let mut applied_any = false;
-        for (fref, bytes) in pending {
+        for fref in pending_refs {
+            let bytes = crate::storage::lsm::read_fragment(
+                self.storage.as_ref(),
+                collection_name,
+                &fref.id,
+            )
+            .await?;
+            let mut collections = self.collections.write().await;
+            let loaded = collections
+                .get_mut(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
             if loaded.applied.covers(fref.seq) {
                 continue;
             }
@@ -2609,13 +2821,35 @@ impl CollectionManager {
             applied_any = true;
         }
         if applied_any {
-            loaded.metadata.applied_seq = loaded.applied.contiguous;
-            store::save_metadata(&self.data_dir, &loaded.metadata)?;
+            let mut collections = self.collections.write().await;
+            if let Some(loaded) = collections.get_mut(collection_name) {
+                loaded.metadata.applied_seq = loaded.applied.contiguous;
+                store::save_metadata(&self.data_dir, &loaded.metadata)?;
+            }
         }
         Ok(next_seq)
     }
 
-    /// Refresh every attached collection (the background refresher's tick).
+    /// Detach a collection whose bucket namespace disappeared (deleted by
+    /// another node): drop it from the map + registry + caches and remove
+    /// local files, serialized on the attach mutex.
+    async fn detach_deleted(&self, ns: &str) {
+        let lock = self.attach_lock(ns).await;
+        let _guard = lock.lock().await;
+        let removed = {
+            let mut collections = self.collections.write().await;
+            collections.remove(ns).is_some()
+        };
+        self.registered.write().await.remove(ns);
+        self.bucket_configs.write().await.remove(ns);
+        self.writer_pools.lock().await.remove(ns);
+        if removed {
+            let _ = store::delete_collection_data(&self.data_dir, ns);
+            tracing::info!("Detached '{}': deleted in object storage", ns);
+        }
+    }
+
+    /// Refresh every attached collection    /// Refresh every attached collection (the background refresher's tick).
     pub async fn refresh_all(&self) {
         let names: Vec<String> = {
             let collections = self.collections.read().await;
@@ -2637,10 +2871,26 @@ impl CollectionManager {
         // filter to ids-that-exist; a tombstone for an absent id is an
         // idempotent no-op on replay, so append the deduped set as-is.
         if self.role == NodeRole::Writer {
+            validate_name_segment(collection_name, "Collection")?;
+            // Existence check: without it, a tombstone for a bogus namespace
+            // would CREATE that namespace in the bucket (phantom collection).
+            self.bucket_config(collection_name, false).await?;
             let mut seen = std::collections::HashSet::new();
             let newly: Vec<u64> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
             if newly.is_empty() {
                 return Ok((0, None));
+            }
+            // Ids can never legitimately reach the allocator frontier; a bogus
+            // huge id would otherwise poison max_id forever (rebuilds compute
+            // next_id = max_id + 1 → overflow / id reuse).
+            let frontier =
+                crate::storage::id_alloc::frontier(self.storage.as_ref(), collection_name).await?;
+            if let Some(bad) = newly.iter().find(|id| **id >= frontier) {
+                return Err(format!(
+                    "chunk id {bad} was never allocated in '{collection_name}' \
+                     (allocator frontier {frontier})"
+                )
+                .into());
             }
             let seq = crate::storage::lsm::append_tombstone(
                 self.storage.as_ref(),
@@ -2716,8 +2966,6 @@ impl CollectionManager {
             if loaded.applied.covers(seq) {
                 return Ok((newly.len(), appended_seq));
             }
-            loaded.applied.mark(seq);
-            loaded.metadata.applied_seq = loaded.applied.contiguous;
         }
         let apply: Vec<u64> = newly
             .iter()
@@ -2729,6 +2977,14 @@ impl CollectionManager {
         }
 
         Self::apply_tombstones_locally(&self.data_dir, loaded, &apply)?;
+        // Mark ONLY after the apply succeeded: marking first would make a
+        // failed apply invisible to the refresher forever (the node would keep
+        // serving deleted data).
+        if let Some(seq) = appended_seq {
+            loaded.applied.mark(seq);
+            loaded.metadata.applied_seq = loaded.applied.contiguous;
+            store::save_metadata(&self.data_dir, &loaded.metadata)?;
+        }
 
         tracing::info!(
             "Deleted {} chunk(s) from '{}' (tombstoned{})",
@@ -3015,6 +3271,9 @@ impl CollectionManager {
         let loaded = collections
             .get(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        loaded
+            .last_used
+            .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
         tantivy_fts::get_facets(&loaded.fts, query, fields)
     }
 
@@ -5777,7 +6036,7 @@ mod cloud_ingest_tests {
             store.clone(),
             "object-store:memory",
         ));
-        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 0)
+        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 0, 0)
             .await
             .unwrap();
         assert!(
@@ -5837,7 +6096,7 @@ mod cloud_ingest_tests {
             store.clone(),
             "object-store:memory",
         ));
-        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 1)
+        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 1, 0)
             .await
             .unwrap();
 
@@ -5887,7 +6146,7 @@ mod cloud_ingest_tests {
             "object-store:memory",
         ));
         // Lazy node boots FIRST (empty bucket).
-        let b = CollectionManager::new_with_storage_opts(&dir_b, sb, NodeRole::Full, true, 0)
+        let b = CollectionManager::new_with_storage_opts(&dir_b, sb, NodeRole::Full, true, 0, 0)
             .await
             .unwrap();
         // Another node creates + writes afterwards.
@@ -5908,6 +6167,476 @@ mod cloud_ingest_tests {
             .unwrap();
         assert_eq!(hits.len(), 1, "foreign create attaches on demand");
 
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // ── Review-driven regression tests (adversarial round) ───────────────
+
+    #[test]
+    fn seq_tracker_semantics() {
+        let mut t = SeqTracker::default();
+        assert!(!t.covers(0));
+        t.mark(0);
+        assert_eq!(t.contiguous, 1);
+        // Out-of-band mark ahead of the frontier; contiguous holds.
+        t.mark(2);
+        assert!(t.covers(2) && !t.covers(1));
+        assert_eq!(t.contiguous, 1);
+        // Filling the gap drains the whole out-of-band run.
+        t.mark(1);
+        assert_eq!(t.contiguous, 3);
+        assert!(t.out_of_band.is_empty());
+        // Duplicate + below-frontier marks are no-ops (no unbounded growth).
+        t.mark(1);
+        t.mark(2);
+        assert_eq!(t.contiguous, 3);
+        assert!(t.out_of_band.is_empty());
+        // starting_at seeds the frontier.
+        let t2 = SeqTracker::starting_at(7);
+        assert!(t2.covers(6) && !t2.covers(7));
+    }
+
+    // H4 regression: eviction must be least-recently-USED, not least-recently-
+    // attached. 3 collections, budget 2: attach a, attach b, USE a, attach c
+    // → b (not a) is evicted.
+    #[tokio::test]
+    async fn lru_evicts_least_recently_used() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_seed = unique_data_dir();
+        std::fs::create_dir_all(&dir_seed).unwrap();
+        {
+            let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&dir_seed, st)
+                .await
+                .unwrap();
+            for name in ["a", "b", "c"] {
+                m.create_collection(name, None, Some(4), None)
+                    .await
+                    .unwrap();
+                m.ingest(name, vec![ingest_chunk(0)], &embed).await.unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&dir_seed).unwrap();
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage_opts(&dir, st, NodeRole::Full, true, 2, 0)
+            .await
+            .unwrap();
+        m.search("a", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        m.search("b", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        // USE a again — it is now hotter than b.
+        m.search("a", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        m.search("c", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        let attached = m.collections.read().await;
+        assert!(attached.contains_key("a"), "hot collection must survive");
+        assert!(!attached.contains_key("b"), "cold collection is the victim");
+        assert!(attached.contains_key("c"));
+    }
+
+    // C1 regression: a vector space added on node A becomes visible on an
+    // already-attached node B via refresh (config is synced, not just
+    // fragments), so B never quarantines chunks carrying the new space.
+    #[tokio::test]
+    async fn vector_space_add_propagates_via_refresh() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("vsprop", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("vsprop", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        let b = CollectionManager::new_with_storage(&dir_b, sb)
+            .await
+            .unwrap();
+
+        // A adds an 8-dim space, then ingests a chunk carrying it.
+        a.add_vector_space("vsprop", "wide", 8, "test-model")
+            .await
+            .unwrap();
+        let mut ic = ingest_chunk(1);
+        ic.embeddings.insert("wide".to_string(), vec![0.1; 8]);
+        a.ingest("vsprop", vec![ic], &embed).await.unwrap();
+
+        // B refreshes: must learn the space AND apply the chunk (no quarantine).
+        b.refresh_collection("vsprop").await.unwrap();
+        let bc = b.get_collection("vsprop").await.unwrap();
+        assert!(bc.vector_spaces.contains_key("wide"), "config converged");
+        let (hits, _, _, _) = b
+            .search("vsprop", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "chunk with the new space applied, not quarantined"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // Rank-1 regression: ingest racing a refresher loop never double-applies
+    // (chunk_count exact, no duplicate hits).
+    #[tokio::test]
+    async fn ingest_races_refresher_no_double_apply() {
+        let embed = std::sync::Arc::new(embed_state());
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&dir, st).await.unwrap();
+        m.create_collection("race", None, Some(4), None)
+            .await
+            .unwrap();
+
+        let n = 10usize;
+        let refresher = {
+            let m2 = m.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    let _ = m2.refresh_collection("race").await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let m2 = m.clone();
+            let e2 = embed.clone();
+            handles.push(tokio::spawn(async move {
+                m2.ingest("race", vec![ingest_chunk(i as u32)], &e2).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        refresher.await.unwrap();
+        let _ = m.refresh_collection("race").await;
+
+        let c = m.get_collection("race").await.unwrap();
+        assert_eq!(c.chunk_count as usize, n, "no double-count under the race");
+        let (hits, _, _, _) = m
+            .search("race", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), n, "no duplicate/lost chunks under the race");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Rank-6: persistent-disk restart catches up the REMOTE delta via refresh
+    // instead of serving stale data (applied_seq persistence path).
+    #[tokio::test]
+    async fn persistent_restart_catches_up_remote_delta() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_w = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_w).unwrap();
+        {
+            let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let a = CollectionManager::new_with_storage(&dir_a, sa)
+                .await
+                .unwrap();
+            a.create_collection("pd", None, Some(4), None)
+                .await
+                .unwrap();
+            a.ingest("pd", vec![ingest_chunk(0)], &embed).await.unwrap();
+        } // node A down; its disk PERSISTS.
+        {
+            let sw: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let w = CollectionManager::new_with_storage_role(&dir_w, sw, NodeRole::Writer)
+                .await
+                .unwrap();
+            w.ingest("pd", vec![ingest_chunk(1)], &embed).await.unwrap();
+        }
+        // A restarts on the SAME dir (load_collection path, not rebuild).
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.refresh_collection("pd").await.unwrap();
+        let (hits, _, _, _) = a
+            .search("pd", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "restart + refresh catches up the writer's delta"
+        );
+        let c = a.get_collection("pd").await.unwrap();
+        assert_eq!(c.chunk_count, 2, "delta applied exactly once");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_w);
+    }
+
+    // Rank-8: a wrong-dims chunk inside a fragment is quarantined on replay
+    // without corrupting anything else.
+    #[tokio::test]
+    async fn refresh_quarantines_wrong_dims_without_corruption() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&dir, st.clone())
+            .await
+            .unwrap();
+        m.create_collection("quar", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest("quar", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+
+        // Hand-craft a fragment with one bad (3-dim) and one good chunk,
+        // simulating a poisoned foreign writer.
+        let mut bad = DocumentChunk {
+            id: 500_000,
+            collection: "quar".into(),
+            file_id: "bad".into(),
+            chunk_index: 0,
+            page: None,
+            text: "bad chunk".into(),
+            metadata: HashMap::new(),
+            doc_type: "chunk".into(),
+            parent_id: None,
+            group_id: None,
+            embeddings: HashMap::new(),
+            embedding: None,
+        };
+        bad.embeddings.insert("default".into(), vec![0.1, 0.2, 0.3]);
+        let mut good = bad.clone();
+        good.id = 500_001;
+        good.file_id = "good".into();
+        good.text = "good chunk".into();
+        good.embeddings
+            .insert("default".into(), vec![0.1, 0.2, 0.3, 0.4]);
+        let payload = serde_json::to_vec(&vec![bad, good]).unwrap();
+        crate::storage::lsm::append_fragment(st.as_ref(), "quar", bytes::Bytes::from(payload), 2)
+            .await
+            .unwrap();
+
+        m.refresh_collection("quar").await.unwrap();
+        let (hits, _, _, _) = m
+            .search("quar", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<u64> = hits.iter().map(|(c, _, _, _, _)| c.id).collect();
+        assert!(ids.contains(&500_001), "good chunk applied");
+        assert!(!ids.contains(&500_000), "bad chunk quarantined");
+        // Post-quarantine ingest still works and searches correctly (mmap not shifted).
+        m.ingest("quar", vec![ingest_chunk(9)], &embed)
+            .await
+            .unwrap();
+        let (hits, _, _, _) = m
+            .search("quar", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Rank-9: min_seq is ignored in local mode; exact boundary at next_seq.
+    #[tokio::test]
+    async fn min_seq_local_mode_and_boundary() {
+        let embed = embed_state();
+        // Local mode: min_seq must be ignored, not error.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = CollectionManager::new(&dir).await.unwrap();
+        m.create_collection("loc", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest("loc", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        let (hits, _, _, _) = m
+            .search("loc", &cloud_search_req(Some(999)), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "local mode ignores min_seq");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Cloud: last valid seq (next_seq-1) succeeds; next_seq is rejected.
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir2 = unique_data_dir();
+        std::fs::create_dir_all(&dir2).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&dir2, st)
+            .await
+            .unwrap();
+        m2.create_collection("bnd", None, Some(4), None)
+            .await
+            .unwrap();
+        let (_, _, seq) = m2
+            .ingest("bnd", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        let seq = seq.unwrap();
+        assert!(m2
+            .search("bnd", &cloud_search_req(Some(seq)), &embed)
+            .await
+            .is_ok());
+        assert!(m2
+            .search("bnd", &cloud_search_req(Some(seq + 1)), &embed)
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // Rank-4/H3: a writer delete against a bogus namespace must NOT create a
+    // phantom collection, and absurd ids are rejected by the allocator frontier.
+    #[tokio::test]
+    async fn writer_delete_validates_namespace_and_ids() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let w = CollectionManager::new_with_storage_role(&dir, st.clone(), NodeRole::Writer)
+            .await
+            .unwrap();
+        // Bogus namespace: error + nothing created in the bucket.
+        assert!(w.delete_chunks("ghost", &[1]).await.is_err());
+        assert!(
+            !st.exists("ghost/manifest").await.unwrap(),
+            "no phantom namespace"
+        );
+
+        // Real collection: absurd id rejected (would poison max_id forever).
+        let dir_f = unique_data_dir();
+        std::fs::create_dir_all(&dir_f).unwrap();
+        let sf: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let f = CollectionManager::new_with_storage(&dir_f, sf)
+            .await
+            .unwrap();
+        f.create_collection("real", None, Some(4), None)
+            .await
+            .unwrap();
+        f.ingest("real", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        assert!(w.delete_chunks("real", &[u64::MAX]).await.is_err());
+        // In-range delete works.
+        assert!(w.delete_chunks("real", &[0]).await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_f);
+    }
+
+    // H1-lite: delete+recreate on another node is detected via created_at and
+    // the stale node re-attaches to the NEW collection.
+    #[tokio::test]
+    async fn delete_recreate_detected_by_refresh() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("cycle", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest(
+            "cycle",
+            vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+            &embed,
+        )
+        .await
+        .unwrap();
+        let b = CollectionManager::new_with_storage(&dir_b, sb)
+            .await
+            .unwrap();
+
+        // A deletes and recreates with different content.
+        a.delete_collection("cycle").await.unwrap();
+        a.create_collection("cycle", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("cycle", vec![ingest_chunk(9)], &embed)
+            .await
+            .unwrap();
+
+        // B refreshes: must serve the NEW collection (1 chunk), not the old 3.
+        b.refresh_collection("cycle").await.unwrap();
+        let (hits, _, _, _) = b
+            .search("cycle", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "stale node re-attached to the recreated collection"
+        );
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
     }

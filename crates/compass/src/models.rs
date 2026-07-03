@@ -52,7 +52,7 @@ impl MetadataValue {
 // same collection (e.g. BGE-small for text, CLIP for images) and swap models
 // without re-indexing everything at once.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorSpaceConfig {
     /// Dimensionality of vectors in this space (e.g. 384 for BGE-small)
     pub dims: usize,

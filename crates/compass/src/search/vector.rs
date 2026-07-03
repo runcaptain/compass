@@ -115,8 +115,13 @@ pub fn build_vector_index(
     }
     let mmap = super::mmap_vectors::MmapVectors::create(vectors_path, dims, vectors)?;
 
-    // For small datasets, skip HNSW and use brute-force search
+    // For small datasets, skip HNSW and use brute-force search. The keymap
+    // must STILL be persisted: without it a restart loses key->chunk-id
+    // mapping and falls back to identity, which silently returns wrong ids
+    // once ids are non-dense (block-allocated ids exposed this).
     if vectors.len() < HNSW_THRESHOLD {
+        let map_path = index_path.with_extension("keymap");
+        save_key_map(&map_path, chunk_ids)?;
         return Ok(VectorState {
             index: None,
             key_to_chunk_id: chunk_ids.to_vec(),
@@ -198,7 +203,18 @@ pub fn load_vector_index(
 
     // Load the key-to-chunk-id mapping
     let map_path = index_path.with_extension("keymap");
-    let key_to_chunk_id = load_key_map(&map_path)?;
+    let mut key_to_chunk_id = load_key_map(&map_path)?;
+    // Pre-fix local dirs never persisted the keymap for small datasets and
+    // relied implicitly on identity mapping (dense ids from 0). Make that
+    // explicit so a later incremental append can't push new ids onto an empty
+    // keymap and misalign every existing vector.
+    if key_to_chunk_id.is_empty() {
+        if let Some(m) = &mmap {
+            if !m.is_empty() {
+                key_to_chunk_id = (0..m.len() as u64).collect();
+            }
+        }
+    }
 
     // For small datasets, skip HNSW
     if count < HNSW_THRESHOLD {

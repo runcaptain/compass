@@ -85,7 +85,14 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev
-      - run: cargo test -p compass --features object-storage
+      # The s3_integration tests skip silently without the env; guard against
+      # env-name drift turning this job into a green no-op.
+      - run: |
+          cargo test -p compass --features object-storage -- --nocapture 2>&1 | tee /tmp/cloud-tests.log
+          if grep -q '^skipped: COMPASS_TEST_S3_BUCKET' /tmp/cloud-tests.log; then
+            echo '::error::s3_integration tests were skipped — MinIO env wiring is broken'
+            exit 1
+          fi
 
   # Developer Certificate of Origin: every PR commit carries a Signed-off-by
   # trailer. Dependency-free check over the PR range.
@@ -98,7 +105,7 @@ jobs:
           fetch-depth: 0
       - run: |
           missing=0
-          for sha in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
+          for sha in $(git rev-list --no-merges ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
             if ! git log -1 --format=%B "$sha" | grep -q '^Signed-off-by: '; then
               echo "::error::commit $sha is missing a Signed-off-by trailer (git commit -s)"
               missing=1
