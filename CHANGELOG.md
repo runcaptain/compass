@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Facet counts were wiped by every ingest after the first (each batch replaced the accumulated facet state; latent since v0.2), came back empty after any restart (nothing rebuilt them from disk), and counted deleted chunks until a full FTS rebuild. Facets are now roaring treemaps keyed by chunk id: batches accumulate, the load/rebuild scan reconstructs them, and counts intersect the live-id universe so tombstoned chunks are excluded. Found by the new live-stack E2E harness (`scripts/e2e.sh`, 44 checks across every endpoint and both node roles).
 - Sub-1000-vector collections never persisted the vector keymap, silently relying on identity key→id mapping that returned wrong chunk ids once ids were non-dense (exposed by block allocation; latent since v0.2). The keymap is now saved on every build and synthesized as identity for pre-fix directories.
 
 ### Scope & limitations (honest)
