@@ -12,7 +12,7 @@
 //
 // Storage shape (v0):
 //   - equality:   (field, canonical_string) -> RoaringTreemap of chunk_ids
-//   - numeric:    field -> Vec<(value: f64, chunk_id)> sorted by value
+//   - numeric:    field -> BTreeMap<ordered f64 bits, ids> (O(log N) ops)
 //   - string_list:(field, element) -> RoaringTreemap (for `contains`)
 //   - present:    field -> RoaringTreemap of chunk_ids that have any value
 //
@@ -55,8 +55,10 @@ pub struct FilterIndex {
     equality: HashMap<String, HashMap<MetadataKey, RoaringTreemap>>,
     /// field -> string value -> chunk_ids (for `in` semantics on strings).
     equality_strings: HashMap<String, HashMap<String, RoaringTreemap>>,
-    /// field -> sorted (value, chunk_id) for range predicates.
-    numeric: HashMap<String, Vec<(f64, u64)>>,
+    /// field -> total-order-encoded f64 -> ids, for range predicates.
+    /// BTreeMap keys let inserts/removes stay O(log N) (a sorted Vec made
+    /// every incremental update O(N) — disqualifying at scale).
+    numeric: HashMap<String, std::collections::BTreeMap<u64, RoaringTreemap>>,
     /// field -> element -> chunk_ids whose StringList contains the element.
     string_list_contains: HashMap<String, HashMap<String, RoaringTreemap>>,
     /// field -> chunk_ids that have any value for this field.
@@ -64,6 +66,17 @@ pub struct FilterIndex {
     /// Universe of all known chunk ids. Used as the starting set for empty
     /// expressions and as a fallback when a predicate spans the whole field.
     universe: RoaringTreemap,
+}
+
+/// Map f64 to a u64 preserving total order (IEEE-754 bit trick; NaNs are
+/// filtered before insertion by `as_f64`).
+fn f64_ord_key(x: f64) -> u64 {
+    let b = x.to_bits();
+    if b >> 63 == 1 {
+        !b
+    } else {
+        b | (1 << 63)
+    }
 }
 
 impl FilterIndex {
@@ -107,7 +120,9 @@ impl FilterIndex {
                 self.numeric
                     .entry(field.clone())
                     .or_default()
-                    .push((n, chunk_id));
+                    .entry(f64_ord_key(n))
+                    .or_default()
+                    .insert(chunk_id);
             }
             if let MetadataValue::StringList(xs) = value {
                 for x in xs {
@@ -122,10 +137,60 @@ impl FilterIndex {
         }
     }
 
-    /// Call after all inserts so range scans are O(log N) per bound.
-    pub fn finalize(&mut self) {
-        for v in self.numeric.values_mut() {
-            v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    /// No-op since the numeric index moved to a BTreeMap (kept so existing
+    /// build sites don't churn).
+    pub fn finalize(&mut self) {}
+
+    /// Remove one chunk (reverse of `insert`). O(log N) per field value —
+    /// deletes no longer trigger an O(collection) index rebuild.
+    pub fn remove(&mut self, chunk_id: u64, metadata: &HashMap<String, MetadataValue>) {
+        self.universe.remove(chunk_id);
+        for (field, value) in metadata {
+            if let Some(tm) = self.present.get_mut(field) {
+                tm.remove(chunk_id);
+            }
+            if let Some(vals) = self.equality.get_mut(field) {
+                let key = MetadataKey::from_metadata(value);
+                if let Some(tm) = vals.get_mut(&key) {
+                    tm.remove(chunk_id);
+                    if tm.is_empty() {
+                        vals.remove(&key);
+                    }
+                }
+            }
+            if let MetadataValue::String(sv) = value {
+                if let Some(vals) = self.equality_strings.get_mut(field) {
+                    if let Some(tm) = vals.get_mut(sv) {
+                        tm.remove(chunk_id);
+                        if tm.is_empty() {
+                            vals.remove(sv);
+                        }
+                    }
+                }
+            }
+            if let Some(n) = value.as_f64() {
+                if let Some(vals) = self.numeric.get_mut(field) {
+                    let key = f64_ord_key(n);
+                    if let Some(tm) = vals.get_mut(&key) {
+                        tm.remove(chunk_id);
+                        if tm.is_empty() {
+                            vals.remove(&key);
+                        }
+                    }
+                }
+            }
+            if let MetadataValue::StringList(xs) = value {
+                if let Some(vals) = self.string_list_contains.get_mut(field) {
+                    for x in xs {
+                        if let Some(tm) = vals.get_mut(x) {
+                            tm.remove(chunk_id);
+                            if tm.is_empty() {
+                                vals.remove(x);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -181,17 +246,14 @@ impl FilterIndex {
     }
 
     fn range(&self, field: &str, gte: Option<f64>, lte: Option<f64>) -> RoaringTreemap {
-        let Some(sorted) = self.numeric.get(field) else {
+        let Some(vals) = self.numeric.get(field) else {
             return RoaringTreemap::new();
         };
-        let lo = gte.unwrap_or(f64::NEG_INFINITY);
-        let hi = lte.unwrap_or(f64::INFINITY);
-        // sorted is by value; binary-search the bounds.
-        let start = sorted.partition_point(|(v, _)| *v < lo);
-        let end = sorted.partition_point(|(v, _)| *v <= hi);
+        let lo = f64_ord_key(gte.unwrap_or(f64::NEG_INFINITY));
+        let hi = f64_ord_key(lte.unwrap_or(f64::INFINITY));
         let mut out = RoaringTreemap::new();
-        for (_, id) in &sorted[start..end] {
-            out.insert(*id);
+        for (_, tm) in vals.range(lo..=hi) {
+            out |= tm;
         }
         out
     }
@@ -383,14 +445,17 @@ impl FilterIndex {
 
         write_map_str_tm(&mut buf, &self.equality_strings);
 
-        // numeric: field -> Vec<(f64 bits, u64)>
+        // numeric: field -> flattened (ordered-bits, id) pairs.
         buf.extend_from_slice(&(self.numeric.len() as u32).to_le_bytes());
         for (field, vals) in &self.numeric {
             write_str(&mut buf, field);
-            buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
-            for (v, id) in vals {
-                buf.extend_from_slice(&v.to_bits().to_le_bytes());
-                buf.extend_from_slice(&id.to_le_bytes());
+            let n: u64 = vals.values().map(|tm| tm.len()).sum();
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            for (key, tm) in vals {
+                for id in tm {
+                    buf.extend_from_slice(&key.to_le_bytes());
+                    buf.extend_from_slice(&id.to_le_bytes());
+                }
             }
         }
 
@@ -430,11 +495,11 @@ impl FilterIndex {
         for _ in 0..n_num {
             let field = read_str(buf, &mut pos)?;
             let n_vals = read_u32(buf, &mut pos)? as usize;
-            let mut vals = Vec::with_capacity(n_vals);
+            let mut vals: std::collections::BTreeMap<u64, RoaringTreemap> = Default::default();
             for _ in 0..n_vals {
-                let v = f64::from_bits(read_u64(buf, &mut pos)?);
+                let key = read_u64(buf, &mut pos)?;
                 let id = read_u64(buf, &mut pos)?;
-                vals.push((v, id));
+                vals.entry(key).or_default().insert(id);
             }
             idx.numeric.insert(field, vals);
         }

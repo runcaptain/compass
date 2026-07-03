@@ -96,6 +96,11 @@ impl SeqTracker {
 
 struct LoadedCollection {
     metadata: Collection,
+    /// Per-space count of ingest batches since the HNSW index was last saved
+    /// (saving rewrites the whole index file — O(index) per batch was a scale
+    /// wall). A stale on-disk index is detected at load (size < keymap) and
+    /// rebuilt from the mmap file. u32::MAX means "no mutable in-RAM index".
+    hnsw_unsaved: HashMap<String, u32>,
     /// LRU stamp for lazy-attach eviction (process-monotonic tick).
     last_used: std::sync::atomic::AtomicU64,
     /// Manifest seqs applied to this node's local indexes (see [`SeqTracker`]).
@@ -464,6 +469,7 @@ impl CollectionManager {
         let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            hnsw_unsaved: HashMap::new(),
             last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
             // Persistent-disk restart: local indexes reflect fragments
             // 0..applied_seq (persisted on every apply); the refresher applies
@@ -581,6 +587,7 @@ impl CollectionManager {
 
             let loaded = LoadedCollection {
                 id_pool: Default::default(),
+                hnsw_unsaved: HashMap::new(),
                 last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
                 applied: SeqTracker::default(),
                 metadata: collection.clone(),
@@ -1575,10 +1582,10 @@ impl CollectionManager {
                 }
                 for id in &assigned_ids {
                     loaded.tombstones.insert(*id);
-                    loaded.chunks.remove(id);
+                    if let Some(c) = loaded.chunks.remove(id) {
+                        loaded.filter_index.remove(*id, &filter_meta(&c));
+                    }
                 }
-                loaded.filter_index =
-                    build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
                 drop(collections);
                 if let Err(te) = crate::storage::lsm::append_tombstone(
                     self.storage.as_ref(),
@@ -1688,6 +1695,17 @@ impl CollectionManager {
                     continue;
                 };
 
+                // Save-batching state lives on the collection (the closure
+                // owns only the unwrapped VectorState).
+                let prev = loaded
+                    .hnsw_unsaved
+                    .get(&space_name)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                let mut mutable_flag = prev != u32::MAX;
+                let mut unsaved_ctr = if mutable_flag { prev } else { 0 };
+                let unsaved = &mut unsaved_ctr;
+                let mutable_now = &mut mutable_flag;
                 // Run the fallible updates in a closure so the space is ALWAYS
                 // re-inserted into `vector_spaces` afterward — an early `?` here
                 // used to drop the unwrapped space entirely, silently disabling
@@ -1709,39 +1727,57 @@ impl CollectionManager {
                     let map_path = index_path.with_extension("keymap");
                     vector::save_key_map(&map_path, &vs.key_to_chunk_id)?;
 
-                    // Add to HNSW index (use load() for mutability, not view())
+                    // Add to HNSW index. The in-RAM index stays mutable across
+                    // batches (first mutation loads from disk once); the FILE is
+                    // rewritten only every HNSW_SAVE_EVERY batches — per-batch
+                    // saves were O(index size), a scale wall. A crash between
+                    // saves leaves a stale file, detected and rebuilt from the
+                    // mmap at next load (vectors are already durable there).
+                    const HNSW_SAVE_EVERY: u32 = 16;
                     let total = vs.key_to_chunk_id.len();
-                    if total >= 1000 && (vs.index.is_none() || index_path.exists()) {
+                    if total >= 1000 {
                         let index_path_str = index_path
                             .to_str()
                             .ok_or("USearch index path is not valid UTF-8")?;
-                        let index = vector::create_index(dims, total)?;
-                        if index_path.exists() {
-                            index
-                                .load(index_path_str)
-                                .map_err(|e| format!("Failed to load USearch index: {}", e))?;
-                        }
-                        // Reserve for new vectors
+                        let (index, was_fresh) = match (*mutable_now, vs.index.take()) {
+                            (true, Some(idx)) => (idx, false),
+                            _ => {
+                                let idx = vector::create_index(dims, total)?;
+                                if index_path.exists() {
+                                    idx.load(index_path_str).map_err(|e| {
+                                        format!("Failed to load USearch index: {}", e)
+                                    })?;
+                                }
+                                (idx, true)
+                            }
+                        };
                         let threads = 128.max(rayon::current_num_threads());
                         index
                             .reserve_capacity_and_threads(total, threads)
                             .map_err(|e| format!("Reserve failed: {}", e))?;
-                        // Add new vectors incrementally
                         for (i, (_, vec)) in new_vecs.iter().enumerate() {
                             index
                                 .add((base_key + i) as u64, vec)
                                 .map_err(|e| format!("Failed to add vector: {}", e))?;
                         }
-                        index
-                            .save(index_path_str)
-                            .map_err(|e| format!("Failed to save index: {}", e))?;
+                        *unsaved += 1;
+                        if was_fresh || *unsaved >= HNSW_SAVE_EVERY {
+                            index
+                                .save(index_path_str)
+                                .map_err(|e| format!("Failed to save index: {}", e))?;
+                            *unsaved = 0;
+                        }
                         vs.index = Some(index);
+                        *mutable_now = true;
                     }
                     Ok(())
                 })();
                 // Space goes back in whatever happened; a partial update is
                 // recoverable (caller compensates the batch), a vanished space
                 // is a silent outage.
+                if mutable_flag {
+                    loaded.hnsw_unsaved.insert(space_name.clone(), unsaved_ctr);
+                }
                 loaded.vector_spaces.insert(space_name, Arc::new(vs));
                 result?;
             } else {
@@ -1771,7 +1807,12 @@ impl CollectionManager {
         store::save_metadata(data_dir, &loaded.metadata)?;
         let rel_path = store::collection_dir(data_dir, collection_name).join("relationships.bin");
         loaded.relationships.save(&rel_path)?;
-        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+        // Incremental: O(batch), not O(collection) — a full index rebuild here
+        // made every ingest/replay cost scale with the whole collection.
+        for c in chunks {
+            loaded.filter_index.insert(c.id, &filter_meta(c));
+        }
+        loaded.filter_index.finalize();
         Ok(())
     }
 
@@ -2422,9 +2463,12 @@ impl CollectionManager {
         loaded.metadata.chunk_count = loaded.metadata.chunk_count.saturating_sub(removed);
         store::save_metadata(data_dir, &loaded.metadata)?;
         // Keep the filter index in step with the tombstones so `eligible` /
-        // selectivity don't count deleted chunks (which would underfill top-k
-        // on deleted-heavy collections).
-        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+        // selectivity don't count deleted chunks — incrementally (O(batch)).
+        for id in apply {
+            if let Some(c) = loaded.chunks.get(id) {
+                loaded.filter_index.remove(*id, &filter_meta(c));
+            }
+        }
         // Prune relations incident on the deleted chunks (F6: propagate errors;
         // on failure the edges are orphaned but target_status reports their
         // endpoints as missing, and cloud replay prunes them independently).
@@ -3234,6 +3278,7 @@ impl CollectionManager {
 
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            hnsw_unsaved: HashMap::new(),
             last_used: std::sync::atomic::AtomicU64::new(next_lru_tick()),
             // A rebuild materialized EVERYTHING in the manifest it read.
             applied: SeqTracker::starting_at(manifest.next_seq),
@@ -3709,6 +3754,17 @@ fn maybe_auto_compact(
 fn next_lru_tick() -> u64 {
     static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The metadata view the filter index sees: chunk metadata plus the mirrored
+/// doc_type field (the filter language treats it as metadata).
+fn filter_meta(chunk: &DocumentChunk) -> HashMap<String, MetadataValue> {
+    let mut m = chunk.metadata.clone();
+    m.insert(
+        "doc_type".to_string(),
+        MetadataValue::String(chunk.doc_type.clone()),
+    );
+    m
 }
 
 pub(crate) fn build_filter_index_from_chunks(

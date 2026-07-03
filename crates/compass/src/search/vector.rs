@@ -237,6 +237,37 @@ pub fn load_vector_index(
             .view(index_path_str)
             .map_err(|e| format!("Failed to mmap USearch index: {}", e))?;
 
+        // Crash recovery for batched HNSW saves: vectors are durable in the
+        // mmap file per batch, but the index file is rewritten only every N
+        // batches — a crash in between leaves it stale. Detect (index smaller
+        // than the keymap) and rebuild from the mmap.
+        let index = if index.size() < key_to_chunk_id.len() {
+            tracing::warn!(
+                "HNSW index at {} is stale ({} < {}); rebuilding from mmap",
+                index_path.display(),
+                index.size(),
+                key_to_chunk_id.len()
+            );
+            let rebuilt = create_index(dims, key_to_chunk_id.len())?;
+            let threads = 128.max(rayon::current_num_threads());
+            rebuilt
+                .reserve_capacity_and_threads(key_to_chunk_id.len(), threads)
+                .map_err(|e| format!("Reserve failed: {}", e))?;
+            if let Some(m) = &mmap {
+                for (i, v) in m.iter().enumerate() {
+                    rebuilt
+                        .add(i as u64, v)
+                        .map_err(|e| format!("Failed to add vector: {}", e))?;
+                }
+            }
+            rebuilt
+                .save(index_path_str)
+                .map_err(|e| format!("Failed to save rebuilt index: {}", e))?;
+            rebuilt
+        } else {
+            index
+        };
+
         Ok(VectorState {
             index: Some(index),
             key_to_chunk_id,
