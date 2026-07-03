@@ -163,6 +163,13 @@ pub trait Storage: Send + Sync {
         Ok(dirs)
     }
 
+    /// Large-object write. Default delegates to `put`; the object-store
+    /// backend overrides with multipart upload (S3 caps single PUTs at 5GB —
+    /// compacted segments can exceed that).
+    async fn put_large(&self, key: &str, bytes: Bytes) -> Result<Version, StorageError> {
+        self.put(key, bytes).await
+    }
+
     /// Whether an object exists.
     async fn exists(&self, key: &str) -> Result<bool, StorageError> {
         match self.get_versioned(key).await {

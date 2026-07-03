@@ -153,30 +153,179 @@ pub struct Segment {
     /// only and REUSE deleted ids, breaking the monotonic-id invariant.
     #[serde(default)]
     pub max_id: u64,
+    /// Chunk ids deleted in the folded range that may still exist in OLDER
+    /// segments (partitioned compaction folds only the WAL tail, so deletes
+    /// must carry across segment boundaries until a full merge drops them).
+    #[serde(default)]
+    pub tombstones: Vec<u64>,
+    /// Relation ids deleted in the folded range (same cross-segment rule).
+    #[serde(default)]
+    pub relation_tombstones: Vec<String>,
 }
 
-const SEGMENT_VERSION: u8 = 1;
+/// v2 binary segment magic. v1 segments are JSON (decoded via fallback).
+const SEG_MAGIC_V2: [u8; 8] = *b"CSEG0002";
 
-/// Serialize a live set as a segment payload. `max_id` must be the id
-/// high-water mark INCLUDING tombstoned ids (pass `Materialized::max_id`, not
-/// the max of the live set).
+/// Encode a segment in the v2 sectioned binary layout:
+/// `[magic][u64 max_id][u32 toc_len][toc JSON][sections...]`
+/// Sections: `meta` (JSON chunks with embeddings STRIPPED), `emb:<space>`
+/// (`[u32 dims][u64 n][n × (u64 id + dims×f32 LE)]`), `rels` (JSON),
+/// `tombs` (u64 LE array), `rtombs` (JSON ids). Embeddings dominate segment
+/// size; storing them as raw f32 instead of JSON decimals is ~10× smaller and
+/// range-readable by section.
+pub fn encode_segment_v2(seg: &Segment) -> Result<Vec<u8>, StorageError> {
+    let err = |e: String| StorageError::Io(format!("segment v2 encode: {e}"));
+    let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
+
+    let mut meta_chunks: Vec<DocumentChunk> = Vec::with_capacity(seg.chunks.len());
+    let mut by_space: std::collections::BTreeMap<String, Vec<(u64, Vec<f32>)>> =
+        std::collections::BTreeMap::new();
+    for c in &seg.chunks {
+        let mut m = c.clone();
+        for (space, emb) in std::mem::take(&mut m.embeddings) {
+            by_space.entry(space).or_default().push((c.id, emb));
+        }
+        meta_chunks.push(m);
+    }
+    sections.push((
+        "meta".into(),
+        serde_json::to_vec(&meta_chunks).map_err(|e| err(e.to_string()))?,
+    ));
+    for (space, rows) in by_space {
+        let dims = rows.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
+        let mut buf = Vec::with_capacity(12 + rows.len() * (8 + dims as usize * 4));
+        buf.extend_from_slice(&dims.to_le_bytes());
+        buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+        for (id, v) in &rows {
+            if v.len() as u32 != dims {
+                return Err(err(format!("ragged dims in space '{space}'")));
+            }
+            buf.extend_from_slice(&id.to_le_bytes());
+            for x in v {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        sections.push((format!("emb:{space}"), buf));
+    }
+    sections.push((
+        "rels".into(),
+        serde_json::to_vec(&seg.relations).map_err(|e| err(e.to_string()))?,
+    ));
+    let mut tombs = Vec::with_capacity(seg.tombstones.len() * 8);
+    for id in &seg.tombstones {
+        tombs.extend_from_slice(&id.to_le_bytes());
+    }
+    sections.push(("tombs".into(), tombs));
+    sections.push((
+        "rtombs".into(),
+        serde_json::to_vec(&seg.relation_tombstones).map_err(|e| err(e.to_string()))?,
+    ));
+
+    let toc: Vec<(String, u64)> = sections
+        .iter()
+        .map(|(n, b)| (n.clone(), b.len() as u64))
+        .collect();
+    let toc_bytes = serde_json::to_vec(&toc).map_err(|e| err(e.to_string()))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&SEG_MAGIC_V2);
+    out.extend_from_slice(&seg.max_id.to_le_bytes());
+    out.extend_from_slice(&(toc_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&toc_bytes);
+    for (_, b) in sections {
+        out.extend_from_slice(&b);
+    }
+    Ok(out)
+}
+
+fn decode_segment_v2(bytes: &[u8]) -> Result<Segment, StorageError> {
+    let err = |e: String| StorageError::Io(format!("segment v2 decode: {e}"));
+    let need = |n: usize, have: usize| -> Result<(), StorageError> {
+        if have < n {
+            Err(err("truncated".into()))
+        } else {
+            Ok(())
+        }
+    };
+    need(20, bytes.len())?;
+    let max_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let toc_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    need(20 + toc_len, bytes.len())?;
+    let toc: Vec<(String, u64)> =
+        serde_json::from_slice(&bytes[20..20 + toc_len]).map_err(|e| err(e.to_string()))?;
+    let mut pos = 20 + toc_len;
+    let mut seg = Segment {
+        version: 2,
+        max_id,
+        ..Default::default()
+    };
+    let mut embs: HashMap<u64, HashMap<String, Vec<f32>>> = HashMap::new();
+    for (name, len) in toc {
+        let len = len as usize;
+        need(pos + len, bytes.len())?;
+        let body = &bytes[pos..pos + len];
+        pos += len;
+        if name == "meta" {
+            seg.chunks = serde_json::from_slice(body).map_err(|e| err(e.to_string()))?;
+        } else if let Some(space) = name.strip_prefix("emb:") {
+            need(12, body.len())?;
+            let dims = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+            let n = u64::from_le_bytes(body[4..12].try_into().unwrap()) as usize;
+            let row = 8 + dims * 4;
+            need(12 + n * row, body.len())?;
+            for i in 0..n {
+                let off = 12 + i * row;
+                let id = u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
+                let mut v = Vec::with_capacity(dims);
+                for d in 0..dims {
+                    let o = off + 8 + d * 4;
+                    v.push(f32::from_le_bytes(body[o..o + 4].try_into().unwrap()));
+                }
+                embs.entry(id).or_default().insert(space.to_string(), v);
+            }
+        } else if name == "rels" {
+            seg.relations = serde_json::from_slice(body).map_err(|e| err(e.to_string()))?;
+        } else if name == "tombs" {
+            seg.tombstones = body
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+        } else if name == "rtombs" {
+            seg.relation_tombstones =
+                serde_json::from_slice(body).map_err(|e| err(e.to_string()))?;
+        }
+        // Unknown sections are skipped (forward compat).
+    }
+    for c in &mut seg.chunks {
+        if let Some(e) = embs.remove(&c.id) {
+            c.embeddings = e;
+        }
+    }
+    Ok(seg)
+}
+
+/// Serialize a live set as a segment payload (v2 binary). `max_id` must be
+/// the id high-water mark INCLUDING tombstoned ids.
 pub fn encode_segment(
     chunks: &[DocumentChunk],
     relations: &[ChunkRelation],
     max_id: u64,
 ) -> Result<Vec<u8>, StorageError> {
-    let seg = Segment {
-        version: SEGMENT_VERSION,
+    encode_segment_v2(&Segment {
+        version: 2,
         chunks: chunks.to_vec(),
         relations: relations.to_vec(),
         max_id,
-    };
-    serde_json::to_vec(&seg).map_err(|e| StorageError::Io(format!("segment encode: {e}")))
+        tombstones: Vec::new(),
+        relation_tombstones: Vec::new(),
+    })
 }
 
 fn decode_segment(bytes: &[u8]) -> Result<Segment, StorageError> {
-    // Back-compat: an older segment was a bare JSON array of chunks. Try the
-    // versioned object first, then fall back to a plain chunk array.
+    // v2 binary (magic-tagged) first; then v1 JSON object; then the oldest
+    // bare-JSON-array form.
+    if bytes.len() >= 8 && bytes[0..8] == SEG_MAGIC_V2 {
+        return decode_segment_v2(bytes);
+    }
     if let Ok(seg) = serde_json::from_slice::<Segment>(bytes) {
         return Ok(seg);
     }
@@ -185,8 +334,7 @@ fn decode_segment(bytes: &[u8]) -> Result<Segment, StorageError> {
     Ok(Segment {
         version: 0,
         chunks,
-        relations: Vec::new(),
-        max_id: 0,
+        ..Default::default()
     })
 }
 
@@ -205,6 +353,57 @@ fn decode_relations(bytes: &[u8]) -> Result<Vec<ChunkRelation>, StorageError> {
 fn decode_relation_ids(bytes: &[u8]) -> Result<Vec<String>, StorageError> {
     serde_json::from_slice(bytes)
         .map_err(|e| StorageError::Io(format!("relation-delete decode: {e}")))
+}
+
+/// Fold ONLY a WAL tail (uncompacted fragments, in seq order) into a Segment
+/// — the bounded-work unit of partitioned compaction. Deletes that don't hit
+/// a chunk/relation within the tail are carried as segment tombstones so they
+/// still apply to OLDER segments at materialize time.
+pub fn fold_tail(frags: &[(lsm::FragmentRef, bytes::Bytes)]) -> Result<Segment, StorageError> {
+    let mut chunks: HashMap<u64, DocumentChunk> = HashMap::new();
+    let mut relations: HashMap<String, ChunkRelation> = HashMap::new();
+    let mut tombs: std::collections::BTreeSet<u64> = Default::default();
+    let mut rtombs: std::collections::BTreeSet<String> = Default::default();
+    let mut max_id = 0u64;
+    for (fref, bytes) in frags {
+        match fref.kind {
+            FragmentKind::Data => {
+                for chunk in decode_chunks(bytes)? {
+                    max_id = max_id.max(chunk.id);
+                    tombs.remove(&chunk.id); // re-created after an earlier delete
+                    chunks.insert(chunk.id, chunk);
+                }
+            }
+            FragmentKind::Tombstone => {
+                for id in decode_ids(bytes)? {
+                    max_id = max_id.max(id);
+                    chunks.remove(&id);
+                    relations.retain(|_, r| r.source_chunk_id != id && r.target_chunk_id != id);
+                    tombs.insert(id); // must ALSO apply to older segments
+                }
+            }
+            FragmentKind::RelationUpsert => {
+                for rel in decode_relations(bytes)? {
+                    rtombs.remove(&rel.relation_id);
+                    relations.insert(rel.relation_id.clone(), rel);
+                }
+            }
+            FragmentKind::RelationDelete => {
+                for rid in decode_relation_ids(bytes)? {
+                    relations.remove(&rid);
+                    rtombs.insert(rid);
+                }
+            }
+        }
+    }
+    Ok(Segment {
+        version: 2,
+        chunks: chunks.into_values().collect(),
+        relations: relations.into_values().collect(),
+        max_id,
+        tombstones: tombs.into_iter().collect(),
+        relation_tombstones: rtombs.into_iter().collect(),
+    })
 }
 
 /// Materialize the full live state (chunks + relations) from a manifest: read
@@ -227,6 +426,17 @@ pub async fn materialize(
         // The stored high-water mark covers tombstoned ids that compaction
         // physically dropped — required so next_id never regresses/reuses.
         max_id = max_id.max(segment.max_id);
+        // Cross-segment deletes first: a tail-fold segment's tombstones apply
+        // to everything OLDER than it (already accumulated), never to its own
+        // surviving chunks (compaction removed those before encoding).
+        for id in &segment.tombstones {
+            max_id = max_id.max(*id);
+            chunks.remove(id);
+            relations.retain(|_, r| r.source_chunk_id != *id && r.target_chunk_id != *id);
+        }
+        for rid in &segment.relation_tombstones {
+            relations.remove(rid);
+        }
         for chunk in segment.chunks {
             max_id = max_id.max(chunk.id);
             chunks.insert(chunk.id, chunk);
@@ -447,5 +657,95 @@ mod tests {
             "compensated ingest must not resurrect, got {:?}",
             r.chunks.keys().collect::<Vec<_>>()
         );
+    }
+
+    // ── Segment v2 / partitioned compaction ───────────────────────────────
+
+    #[test]
+    fn segment_v2_roundtrip_with_embeddings_and_tombstones() {
+        let mut c1 = chunk(1, "one");
+        c1.embeddings
+            .insert("default".into(), vec![0.1, 0.2, 0.3, 0.4]);
+        let mut c2 = chunk(2, "two");
+        c2.embeddings
+            .insert("default".into(), vec![0.5, 0.6, 0.7, 0.8]);
+        c2.embeddings.insert("wide".into(), vec![1.0; 8]);
+        let seg = Segment {
+            version: 2,
+            chunks: vec![c1, c2],
+            relations: vec![relation("r1", 1, 2)],
+            max_id: 42,
+            tombstones: vec![7, 9],
+            relation_tombstones: vec!["dead".into()],
+        };
+        let bytes = encode_segment_v2(&seg).unwrap();
+        assert_eq!(&bytes[0..8], b"CSEG0002");
+        let back = decode_segment(&bytes).unwrap();
+        assert_eq!(back.max_id, 42);
+        assert_eq!(back.tombstones, vec![7, 9]);
+        assert_eq!(back.relation_tombstones, vec!["dead".to_string()]);
+        assert_eq!(back.chunks.len(), 2);
+        let c2b = back.chunks.iter().find(|c| c.id == 2).unwrap();
+        assert_eq!(c2b.embeddings["default"], vec![0.5, 0.6, 0.7, 0.8]);
+        assert_eq!(c2b.embeddings["wide"].len(), 8);
+        assert_eq!(back.relations.len(), 1);
+    }
+
+    // A delete folded into a NEWER tail segment must erase a chunk living in
+    // an OLDER segment at materialize time (cross-segment tombstones).
+    #[tokio::test]
+    async fn tail_segment_tombstones_apply_to_older_segments() {
+        let s = store("xseg");
+        // Older state via a REAL fold: data + relation fragments -> segment A.
+        let mut c1 = chunk(1, "old");
+        c1.embeddings
+            .insert("default".into(), vec![0.1, 0.2, 0.3, 0.4]);
+        let data = serde_json::to_vec(&vec![c1, chunk(2, "keep")]).unwrap();
+        lsm::append_fragment(s.as_ref(), "ns", Bytes::from(data), 2)
+            .await
+            .unwrap();
+        let rels = serde_json::to_vec(&vec![relation("r1", 1, 2)]).unwrap();
+        lsm::append_relation_upsert(s.as_ref(), "ns", Bytes::from(rels), 1)
+            .await
+            .unwrap();
+        let fold_once = |sref: Arc<dyn Storage>| async move {
+            let (m1, v1) = lsm::read_manifest(sref.as_ref(), "ns").await.unwrap();
+            let frags = lsm::read_uncompacted_fragments(sref.as_ref(), "ns", &m1)
+                .await
+                .unwrap();
+            let tail = fold_tail(&frags).unwrap();
+            let folded_through = m1.uncompacted().map(|f| f.seq).max().unwrap();
+            let records = tail.chunks.len() as u64;
+            lsm::append_segment(
+                sref.as_ref(),
+                "ns",
+                &v1,
+                &m1,
+                Bytes::from(encode_segment_v2(&tail).unwrap()),
+                records,
+                folded_through,
+            )
+            .await
+            .unwrap();
+            tail
+        };
+        let seg_a = fold_once(s.clone()).await;
+        assert!(seg_a.tombstones.is_empty());
+
+        // Newer tail: delete chunk 1; the delete finds nothing IN the tail so
+        // it must be carried as a cross-segment tombstone.
+        lsm::append_tombstone(s.as_ref(), "ns", &[1]).await.unwrap();
+        let seg_b = fold_once(s.clone()).await;
+        assert_eq!(
+            seg_b.tombstones,
+            vec![1],
+            "unmatched delete carried forward"
+        );
+
+        let r = mat(s.as_ref(), "ns").await;
+        assert!(!r.chunks.contains_key(&1), "older-segment chunk deleted");
+        assert!(r.chunks.contains_key(&2));
+        assert!(r.relations.is_empty(), "incident relation pruned");
+        assert_eq!(r.max_id, 2);
     }
 }

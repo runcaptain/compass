@@ -3586,18 +3586,59 @@ pub(crate) async fn compact_storage(
     storage: &dyn Storage,
     ns: &str,
 ) -> Result<u64, crate::storage::StorageError> {
+    /// Segments tolerated before a full merge. Tail folds are O(batch); only
+    /// the merge is O(live set), and it runs 1/K as often.
+    const MERGE_SEGMENTS: usize = 8;
     const MAX_RETRIES: u32 = 10;
+
+    // Phase 1: fold the WAL tail into an APPENDED segment (bounded work).
     for _ in 0..MAX_RETRIES {
         let (manifest, version) = crate::storage::lsm::read_manifest(storage, ns).await?;
-        if manifest.segments.is_empty() && manifest.fragments.is_empty() {
-            return Ok(0);
+        let tail: Vec<_> = manifest.uncompacted().cloned().collect();
+        if tail.is_empty() {
+            break;
+        }
+        let folded_through = tail.iter().map(|f| f.seq).max().unwrap();
+        let frags = crate::storage::lsm::read_uncompacted_fragments(storage, ns, &manifest).await?;
+        let segment = cloud::fold_tail(&frags)?;
+        let records = segment.chunks.len() as u64;
+        let bytes = cloud::encode_segment_v2(&segment)?;
+        match crate::storage::lsm::append_segment(
+            storage,
+            ns,
+            &version,
+            &manifest,
+            bytes::Bytes::from(bytes),
+            records,
+            folded_through,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "Compacted '{}': folded WAL tail through seq {} ({} live records)",
+                    ns,
+                    folded_through,
+                    records
+                );
+                break;
+            }
+            Err(crate::storage::StorageError::VersionConflict { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Phase 2: merge segments when they pile up (the only O(live-set) step).
+    for _ in 0..MAX_RETRIES {
+        let (manifest, version) = crate::storage::lsm::read_manifest(storage, ns).await?;
+        if manifest.segments.len() <= MERGE_SEGMENTS {
+            return Ok(manifest.segments.iter().map(|s| s.records).sum());
         }
         let materialized = cloud::materialize(storage, ns, &manifest).await?;
         let chunks: Vec<DocumentChunk> = materialized.chunks.values().cloned().collect();
         let relations: Vec<ChunkRelation> = materialized.relations.values().cloned().collect();
         let records = chunks.len() as u64;
         let segment_bytes = cloud::encode_segment(&chunks, &relations, materialized.max_id)?;
-
         match crate::storage::lsm::replace_with_single_segment(
             storage,
             ns,
@@ -3609,11 +3650,7 @@ pub(crate) async fn compact_storage(
         .await
         {
             Ok(()) => {
-                tracing::info!(
-                    "Compacted '{}': {} live records in one segment",
-                    ns,
-                    records
-                );
+                tracing::info!("Merged '{}' segments: {} live records", ns, records);
                 return Ok(records);
             }
             Err(crate::storage::StorageError::VersionConflict { .. }) => continue,
@@ -4985,18 +5022,17 @@ mod cloud_ingest_tests {
         let live = m.compact_collection("comp").await.unwrap();
         assert_eq!(live, 2, "2 live records (0 and 2) after dropping deleted 1");
 
-        // After: one segment, no fragments.
+        // After: the WAL tail folded into an appended segment, no live fragments.
         let (after, _) = read_manifest(storage.as_ref(), "comp").await.unwrap();
         assert_eq!(after.segments.len(), 1);
-        assert!(after.fragments.is_empty());
+        assert!(after.uncompacted().count() == 0);
 
-        // The compacted segment contains only live chunks (0, 2) — deleted 1 gone.
-        let seg =
-            crate::storage::lsm::read_segment(storage.as_ref(), "comp", &after.segments[0].id)
-                .await
-                .unwrap();
-        let segment: cloud::Segment = serde_json::from_slice(&seg).unwrap();
-        let ids: std::collections::HashSet<u64> = segment.chunks.iter().map(|c| c.id).collect();
+        // Durable truth via materialize (exercises the v2 binary codec):
+        // live chunks 0 and 2 survive, deleted 1 is gone.
+        let mat = cloud::materialize(storage.as_ref(), "comp", &after)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<u64> = mat.chunks.keys().copied().collect();
         assert!(ids.contains(&0) && ids.contains(&2));
         assert!(
             !ids.contains(&1),
@@ -5221,13 +5257,23 @@ mod cloud_ingest_tests {
         // The old WAL fragment object is staged (still present this cycle).
         assert_eq!(man1.pending_deletes.len(), 1);
 
-        // Compact twice more (each cycle GCs the PRIOR cycle's staged objects,
-        // deferred one cycle for in-flight readers). After enough cycles, S1 is
-        // physically gone — the key point is it's GC'd, not leaked forever.
-        for i in 2..5u32 {
+        // Drive enough tail-fold cycles to cross the merge threshold (8
+        // segments) so a full merge runs; the merge (plus deferred GC) must
+        // physically delete S1 — the key point is it's GC'd, not leaked.
+        for i in 2..14u32 {
             m.ingest("gc", vec![ingest_chunk(i)], &embed).await.unwrap();
             m.compact_collection("gc").await.unwrap();
         }
+        // One more cycle so the merge's staged deletes are GC'd (deferred one
+        // cycle for in-flight readers).
+        m.ingest("gc", vec![ingest_chunk(99)], &embed)
+            .await
+            .unwrap();
+        m.compact_collection("gc").await.unwrap();
+        m.ingest("gc", vec![ingest_chunk(100)], &embed)
+            .await
+            .unwrap();
+        m.compact_collection("gc").await.unwrap();
         let (man2, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "gc")
             .await
             .unwrap();
@@ -5241,10 +5287,11 @@ mod cloud_ingest_tests {
         // Object count stays BOUNDED across many compaction cycles — proving no
         // unbounded leak (the F1 bug would grow this without limit).
         let all = storage.list("gc/").await.unwrap();
-        // Fixed per-namespace objects: manifest, live segment, collection.json,
-        // id-alloc, plus at most a couple of this-cycle staged fragments.
+        // Fixed per-namespace objects (manifest, collection.json, id-alloc)
+        // plus up to MERGE_SEGMENTS(8) tail segments and this-cycle staged
+        // objects — bounded, never growing with cycle count.
         assert!(
-            all.len() <= 7,
+            all.len() <= 16,
             "object count must stay bounded across cycles, got {}",
             all.len()
         );
@@ -5252,7 +5299,7 @@ mod cloud_ingest_tests {
         let mat = cloud::materialize(storage.as_ref(), "gc", &man2)
             .await
             .unwrap();
-        assert_eq!(mat.chunks.len(), 5);
+        assert_eq!(mat.chunks.len(), 16);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

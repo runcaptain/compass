@@ -456,6 +456,64 @@ pub async fn list_namespaces(storage: &dyn Storage) -> Result<Vec<String>, Stora
     Ok(names)
 }
 
+/// Partitioned compaction commit: APPEND a segment folding only the WAL tail
+/// (fragments with seq <= `folded_through`) and advance the watermark. Old
+/// segments stay; the folded fragments are staged for next-cycle GC and the
+/// PRIOR cycle's staged keys are deleted now. On CAS conflict the just-written
+/// orphan segment is removed. Bounded work: O(tail), never O(collection).
+pub async fn append_segment(
+    storage: &dyn Storage,
+    ns: &str,
+    expected: &Option<Version>,
+    prior: &Manifest,
+    segment_bytes: Bytes,
+    records: u64,
+    folded_through: u64,
+) -> Result<(), StorageError> {
+    let segment_id = uuid::Uuid::new_v4().to_string();
+    let new_segment_key = segment_key(ns, &segment_id);
+    storage.put_large(&new_segment_key, segment_bytes).await?;
+
+    let folded: Vec<String> = prior
+        .fragments
+        .iter()
+        .filter(|f| f.seq <= folded_through)
+        .map(|f| fragment_key(ns, &f.id))
+        .collect();
+    let mut segments = prior.segments.clone();
+    segments.push(SegmentRef {
+        id: segment_id,
+        records,
+    });
+    let new_manifest = Manifest {
+        fragments: prior
+            .fragments
+            .iter()
+            .filter(|f| f.seq > folded_through)
+            .cloned()
+            .collect(),
+        segments,
+        next_seq: prior.next_seq,
+        compaction_watermark: Some(
+            prior
+                .compaction_watermark
+                .map(|w| w.max(folded_through))
+                .unwrap_or(folded_through),
+        ),
+        pending_deletes: folded,
+    };
+    match commit_manifest(storage, ns, &new_manifest, expected).await {
+        Ok(_) => {
+            gc_keys(storage, &prior.pending_deletes).await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = storage.delete(&new_segment_key).await;
+            Err(e)
+        }
+    }
+}
+
 /// Full compaction: replace the ENTIRE manifest state (all segments + all
 /// uncompacted fragments) with a single new segment containing `segment_bytes`
 /// (the fully-materialized live set, deletes already applied). This is the
@@ -486,7 +544,7 @@ pub async fn replace_with_single_segment(
 ) -> Result<(), StorageError> {
     let segment_id = uuid::Uuid::new_v4().to_string();
     let new_segment_key = segment_key(ns, &segment_id);
-    storage.put(&new_segment_key, segment_bytes).await?;
+    storage.put_large(&new_segment_key, segment_bytes).await?;
 
     // Objects we're folding away THIS cycle (old segments + all fragments) — stage
     // for deletion NEXT cycle.
