@@ -62,15 +62,6 @@ jobs:
   # failure here still blocks review attention.
   test-cloud:
     runs-on: ubuntu-24.04
-    services:
-      minio:
-        image: bitnami/minio:2025.4.22
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: compass-data
-        ports:
-          - 9000:9000
     env:
       COMPASS_TEST_S3_BUCKET: compass-data
       COMPASS_S3_ENDPOINT: http://localhost:9000
@@ -85,6 +76,19 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev
+      # MinIO as a plain container (service containers can't override the
+      # image command, and minio/minio needs `server /data`). Same images as
+      # docker-compose.minio.yml.
+      - run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c \
+            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb -p local/compass-data"
       # The s3_integration tests skip silently without the env; guard against
       # env-name drift turning this job into a green no-op.
       - run: |
