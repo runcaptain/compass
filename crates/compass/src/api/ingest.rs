@@ -22,7 +22,7 @@ pub async fn ingest_chunks(
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
     let start = std::time::Instant::now();
 
-    let (count, id_map) = state
+    let (count, id_map, seq) = state
         .manager
         .ingest(&name, req.chunks, &state.embed_state)
         .await
@@ -34,5 +34,6 @@ pub async fn ingest_chunks(
         indexed: count,
         id_map,
         took_ms,
+        seq,
     }))
 }

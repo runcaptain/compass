@@ -137,6 +137,14 @@ pub struct Collection {
     pub next_id: u64,
     #[serde(default)]
     pub config: CollectionConfig,
+    /// Cloud mode: count of contiguously-applied manifest seqs (the local
+    /// indexes reflect fragments 0..applied_seq). Persisted so a
+    /// persistent-disk restart knows how fresh its local state is and the
+    /// refresher can catch up the delta instead of a full rebuild. May LAG
+    /// the true applied state (relation applies don't force a save); replay
+    /// of already-applied fragments is idempotent.
+    #[serde(default)]
+    pub applied_seq: u64,
 }
 
 fn default_dims() -> usize {
@@ -262,6 +270,11 @@ pub struct SearchRequest {
     /// Which edges to include per hit when `include_relations` is set.
     #[serde(default)]
     pub relation_direction: RelationDirection,
+    /// Cloud mode read-your-writes: only serve once fragments up to this seq
+    /// (returned by a write) are applied locally, refreshing if needed
+    /// (bounded wait). Ignored in local mode.
+    #[serde(default)]
+    pub min_seq: Option<u64>,
 }
 
 // ── Chunk Relations ───────────────────────────────────────────────────────
@@ -351,6 +364,10 @@ pub struct DeleteRequest {
 pub struct DeleteResponse {
     /// Number of chunks newly soft-deleted (excludes already-deleted/missing).
     pub deleted: usize,
+    /// Cloud mode: manifest seq of the durable tombstone fragment (for
+    /// read-your-writes via `min_seq`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 fn default_search_mode() -> String {
@@ -614,6 +631,10 @@ pub struct IngestResponse {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub id_map: HashMap<String, u64>,
     pub took_ms: u64,
+    /// Cloud mode: manifest seq of the durable WAL fragment for this batch.
+    /// Pass as `min_seq` on a later search for read-your-writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

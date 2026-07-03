@@ -35,7 +35,7 @@ pub async fn delete_chunk(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, u64)>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
-    let deleted = state
+    let (deleted, seq) = state
         .manager
         .delete_chunks(&name, &[id])
         .await
@@ -47,7 +47,7 @@ pub async fn delete_chunk(
             format!("chunk {id} not found or already deleted"),
         ));
     }
-    Ok(Json(DeleteResponse { deleted }))
+    Ok(Json(DeleteResponse { deleted, seq }))
 }
 
 /// POST /collections/:name/compact — fold S3 segments + WAL into one segment,
@@ -78,18 +78,24 @@ pub async fn delete_by_query(
     }
 
     let mut deleted = 0usize;
+    let mut seq: Option<u64> = None;
     if !req.ids.is_empty() {
-        deleted += state
+        let (n, s) = state
             .manager
             .delete_chunks(&name, &req.ids)
             .await
             .map_err(map_err)?;
+        deleted += n;
+        seq = s.or(seq);
     }
     if !req.filters.is_empty() {
         // If the filter-delete fails after an ids-delete succeeded, report the
         // partial progress — deletes already applied are not undone.
         match state.manager.delete_by_filter(&name, &req.filters).await {
-            Ok(n) => deleted += n,
+            Ok((n, s)) => {
+                deleted += n;
+                seq = s.or(seq);
+            }
             Err(e) => {
                 let (code, msg) = map_err(e);
                 return Err((
@@ -101,5 +107,5 @@ pub async fn delete_by_query(
             }
         }
     }
-    Ok(Json(DeleteResponse { deleted }))
+    Ok(Json(DeleteResponse { deleted, seq }))
 }

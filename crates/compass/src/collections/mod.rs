@@ -55,8 +55,49 @@ pub(crate) fn validate_name_segment(
 }
 
 /// A loaded collection with all its search indices in memory.
+/// Which manifest seqs this node has applied to its local indexes.
+///
+/// `contiguous` is the count of contiguously-applied seqs (fragments
+/// `0..contiguous` are reflected locally); `out_of_band` holds seqs this node
+/// applied AHEAD of the contiguous frontier — its own appends land locally at
+/// commit time while earlier REMOTE fragments may still be unapplied, so a
+/// single watermark would silently skip those remote fragments forever. The
+/// refresher advances `contiguous` in seq order, draining `out_of_band`.
+#[derive(Debug, Default, Clone)]
+struct SeqTracker {
+    contiguous: u64,
+    out_of_band: std::collections::BTreeSet<u64>,
+}
+
+impl SeqTracker {
+    fn starting_at(contiguous: u64) -> Self {
+        Self {
+            contiguous,
+            ..Default::default()
+        }
+    }
+
+    /// Has this seq been applied locally (either side of the frontier)?
+    fn covers(&self, seq: u64) -> bool {
+        seq < self.contiguous || self.out_of_band.contains(&seq)
+    }
+
+    /// Record a locally-applied seq and advance the contiguous frontier.
+    fn mark(&mut self, seq: u64) {
+        if seq < self.contiguous {
+            return;
+        }
+        self.out_of_band.insert(seq);
+        while self.out_of_band.remove(&self.contiguous) {
+            self.contiguous += 1;
+        }
+    }
+}
+
 struct LoadedCollection {
     metadata: Collection,
+    /// Manifest seqs applied to this node's local indexes (see [`SeqTracker`]).
+    applied: SeqTracker,
     /// Cloud-mode id pool: ranges CAS-leased from `{ns}/id-alloc`. In cloud
     /// mode ids are ONLY taken from here (never from `next_id`, which becomes
     /// a diagnostic high-water mark) so attached nodes and stateless writers
@@ -247,6 +288,27 @@ impl CollectionManager {
             }
         }
 
+        // Background manifest refresher: keeps this node's local indexes
+        // converged with fragments written by OTHER nodes (stateless writers,
+        // other serving nodes). COMPASS_REFRESH_INTERVAL seconds, default 5,
+        // 0 disables. Holds only a Weak — the task dies with the manager.
+        if cloud_mode {
+            let interval_secs: u64 = std::env::var("COMPASS_REFRESH_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5);
+            if interval_secs > 0 {
+                let weak = Arc::downgrade(&manager);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                        let Some(m) = weak.upgrade() else { break };
+                        m.refresh_all().await;
+                    }
+                });
+            }
+        }
+
         Ok(manager)
     }
 
@@ -344,6 +406,10 @@ impl CollectionManager {
         let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            // Persistent-disk restart: local indexes reflect fragments
+            // 0..applied_seq (persisted on every apply); the refresher applies
+            // the delta instead of a full rebuild.
+            applied: SeqTracker::starting_at(metadata.applied_seq),
             next_id,
             metadata,
             fts,
@@ -415,6 +481,7 @@ impl CollectionManager {
                 chunk_count: 0,
                 next_id: 0,
                 config: config.unwrap_or_default(),
+                applied_seq: 0,
             };
 
             store::save_metadata(&self.data_dir, &collection)?;
@@ -450,6 +517,7 @@ impl CollectionManager {
 
             let loaded = LoadedCollection {
                 id_pool: Default::default(),
+                applied: SeqTracker::default(),
                 metadata: collection.clone(),
                 fts,
                 vector_spaces: vs_map,
@@ -889,11 +957,12 @@ impl CollectionManager {
         collection_name: &str,
         ingest_chunks: Vec<IngestChunk>,
         embed_state: &EmbedState,
-    ) -> Result<(usize, HashMap<String, u64>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, HashMap<String, u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>
+    {
         validate_name_segment(collection_name, "Collection")?;
         let count = ingest_chunks.len();
         if count == 0 {
-            return Ok((0, HashMap::new()));
+            return Ok((0, HashMap::new(), None));
         }
         let cfg = self.bucket_config(collection_name, false).await?;
 
@@ -1044,7 +1113,7 @@ impl CollectionManager {
             records,
             collection_name
         );
-        Ok((count, client_id_map))
+        Ok((count, client_id_map, Some(seq)))
     }
 
     pub async fn ingest(
@@ -1052,7 +1121,8 @@ impl CollectionManager {
         collection_name: &str,
         ingest_chunks: Vec<IngestChunk>,
         embed_state: &EmbedState,
-    ) -> Result<(usize, HashMap<String, u64>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, HashMap<String, u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>
+    {
         // Writer role: durable-append-only ingest, no local state required.
         if self.role == NodeRole::Writer {
             return self
@@ -1219,6 +1289,7 @@ impl CollectionManager {
 
         // Phase 3a (cloud): DURABLE S3 WAL append FIRST, before any local commit
         // (fixes F14 split-brain — a failed append leaves nothing local, clean retry).
+        let mut appended_seq: Option<u64> = None;
         if self.cloud_mode {
             let payload = serde_json::to_vec(&chunks)?;
             let records = chunks.len() as u64;
@@ -1230,6 +1301,7 @@ impl CollectionManager {
             )
             .await
             .map_err(|e| format!("cloud WAL append failed, ingest not applied: {e}"))?;
+            appended_seq = Some(seq);
             tracing::info!(
                 "Cloud ingest: WAL fragment seq={} ({} chunks) durable for '{}'",
                 seq,
@@ -1272,11 +1344,30 @@ impl CollectionManager {
                 return Err(format!("Collection '{}' not found", collection_name).into());
             }
         };
+        // Double-apply guard: between our S3 append and this reacquire, the
+        // manifest refresher may have polled and applied OUR fragment. The
+        // tracker is the single source of truth for "already reflected
+        // locally" — skip the local apply if it covers our seq.
+        if let Some(seq) = appended_seq {
+            if loaded.applied.covers(seq) {
+                tracing::debug!(
+                    "ingest seq={} for '{}' already applied by refresher; skipping local apply",
+                    seq,
+                    collection_name
+                );
+                return Ok((count, client_id_map, appended_seq));
+            }
+        }
+
         // Apply all local state (chunks map, redb, FTS, HNSW, metadata, filter
         // index) in one fallible step. On ANY failure in cloud mode we've already
         // written a durable S3 fragment for these ids, so we compensate with a
         // tombstone (below) — otherwise a partial local commit + orphan S3
         // fragment would resurrect/duplicate the batch on a cold restart (F2).
+        if let Some(seq) = appended_seq {
+            loaded.applied.mark(seq);
+            loaded.metadata.applied_seq = loaded.applied.contiguous;
+        }
         let commit_result = Self::apply_ingest_commit(
             &self.data_dir,
             collection_name,
@@ -1339,7 +1430,7 @@ impl CollectionManager {
 
         tracing::info!("Ingested {} chunks into '{}'", count, collection_name);
 
-        Ok((count, client_id_map))
+        Ok((count, client_id_map, appended_seq))
     }
 
     /// Apply an ingest batch's local state (chunk map, redb, FTS, HNSW, metadata,
@@ -1538,6 +1629,42 @@ impl CollectionManager {
     > {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
+        }
+
+        // Read-your-writes: wait (bounded) until fragments up to `min_seq` are
+        // applied locally, refreshing on demand. A `min_seq` beyond the
+        // manifest is rejected rather than waited on forever.
+        if let Some(min_seq) = req.min_seq {
+            if self.cloud_mode {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let covered = {
+                        let collections = self.collections.read().await;
+                        let loaded = collections
+                            .get(collection_name)
+                            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+                        loaded.applied.covers(min_seq)
+                    };
+                    if covered {
+                        break;
+                    }
+                    let next_seq = self.refresh_collection(collection_name).await?;
+                    if min_seq >= next_seq {
+                        return Err(format!(
+                            "min_seq {} is beyond the collection's write history ({})",
+                            min_seq, next_seq
+                        )
+                        .into());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out waiting for min_seq {min_seq} to be applied"
+                        )
+                        .into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
         let start = std::time::Instant::now();
         let collections = self.collections.read().await;
@@ -1922,10 +2049,11 @@ impl CollectionManager {
         } // read lock released before S3 I/O.
 
         // Phase 2 (NO lock): durable S3 relation-upsert FIRST (S3-first ordering).
+        let mut appended_seq: Option<u64> = None;
         if self.cloud_mode && !built.is_empty() {
             let payload = serde_json::to_vec(&built)?;
             let records = built.len() as u64;
-            crate::storage::lsm::append_relation_upsert(
+            let seq = crate::storage::lsm::append_relation_upsert(
                 self.storage.as_ref(),
                 collection_name,
                 bytes::Bytes::from(payload),
@@ -1933,6 +2061,7 @@ impl CollectionManager {
             )
             .await
             .map_err(|e| format!("cloud relation-upsert append failed: {e}"))?;
+            appended_seq = Some(seq);
         }
 
         // Phase 3 (read lock): apply locally (durable S3 record already written).
@@ -1941,9 +2070,21 @@ impl CollectionManager {
         // ids, so the durable upsert fragment can't resurrect orphan edges on a
         // later materialize (the same discipline ingest applies to chunks).
         let apply_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = {
-            let collections = self.collections.read().await;
-            match collections.get(collection_name) {
-                Some(loaded) => loaded.relation_store.insert_batch(&built),
+            let mut collections = self.collections.write().await;
+            match collections.get_mut(collection_name) {
+                Some(loaded) => {
+                    // Double-apply guard vs the manifest refresher; replay of a
+                    // relation upsert is idempotent anyway (same relation_ids).
+                    if appended_seq.map(|s| loaded.applied.covers(s)) == Some(true) {
+                        Ok(())
+                    } else {
+                        if let Some(seq) = appended_seq {
+                            loaded.applied.mark(seq);
+                            loaded.metadata.applied_seq = loaded.applied.contiguous;
+                        }
+                        loaded.relation_store.insert_batch(&built)
+                    }
+                }
                 None => Err(format!("Collection '{}' not found", collection_name).into()),
             }
         };
@@ -1998,21 +2139,30 @@ impl CollectionManager {
         // Cloud mode: durable S3 relation-delete FIRST — NO lock held across the
         // S3 round-trip (#4). Replay drops the id; deleting an absent id is an
         // idempotent no-op on materialize.
+        let mut appended_seq: Option<u64> = None;
         if self.cloud_mode {
-            crate::storage::lsm::append_relation_delete(
+            let seq = crate::storage::lsm::append_relation_delete(
                 self.storage.as_ref(),
                 collection_name,
                 std::slice::from_ref(&relation_id.to_string()),
             )
             .await
             .map_err(|e| format!("cloud relation-delete append failed: {e}"))?;
+            appended_seq = Some(seq);
         }
 
-        // Apply locally.
-        let collections = self.collections.read().await;
+        // Apply locally (write lock: the seq tracker needs &mut).
+        let mut collections = self.collections.write().await;
         let loaded = collections
-            .get(collection_name)
+            .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        if appended_seq.map(|s| loaded.applied.covers(s)) == Some(true) {
+            return Ok(true); // refresher already applied our delete
+        }
+        if let Some(seq) = appended_seq {
+            loaded.applied.mark(seq);
+            loaded.metadata.applied_seq = loaded.applied.contiguous;
+        }
         loaded.relation_store.delete(relation_id)
     }
 
@@ -2055,11 +2205,245 @@ impl CollectionManager {
     /// fragment so the deletion is durably S3-native. The vectors physically
     /// remain in the HNSW/FTS indexes until the next rebuild/compaction; search
     /// filters them out in the meantime. Returns the number newly deleted.
+    /// Local tombstone apply — shared by the delete path and fragment replay.
+    /// Idempotent: already-deleted / absent ids are filtered by the caller (or
+    /// harmlessly re-tombstoned in redb).
+    fn apply_tombstones_locally(
+        data_dir: &Path,
+        loaded: &mut LoadedCollection,
+        apply: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loaded.chunk_store.tombstone_batch(apply)?;
+        for id in apply {
+            loaded.tombstones.insert(*id);
+        }
+        // Persist the corrected live count IMMEDIATELY after the tombstones —
+        // before the fallible relation pruning — so a pruning error can't leave
+        // chunk_count permanently overstated.
+        let removed = apply.len() as u64;
+        loaded.metadata.chunk_count = loaded.metadata.chunk_count.saturating_sub(removed);
+        store::save_metadata(data_dir, &loaded.metadata)?;
+        // Keep the filter index in step with the tombstones so `eligible` /
+        // selectivity don't count deleted chunks (which would underfill top-k
+        // on deleted-heavy collections).
+        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+        // Prune relations incident on the deleted chunks (F6: propagate errors;
+        // on failure the edges are orphaned but target_status reports their
+        // endpoints as missing, and cloud replay prunes them independently).
+        for &id in apply {
+            let edges = loaded
+                .relation_store
+                .for_chunk(id, RelationDirection::Both, None)?;
+            for e in edges {
+                loaded.relation_store.delete(&e.relation_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay one WAL fragment into the local indexes (the refresher's apply
+    /// path — mirrors `cloud::materialize`'s kind dispatch exactly). MUST be
+    /// idempotent: fragments may race the originating node's own local apply.
+    fn apply_fragment_locally(
+        data_dir: &Path,
+        collection_name: &str,
+        loaded: &mut LoadedCollection,
+        kind: crate::storage::lsm::FragmentKind,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::storage::lsm::FragmentKind;
+        match kind {
+            FragmentKind::Data => {
+                let chunks: Vec<DocumentChunk> = serde_json::from_slice(payload)?;
+                // Defensive dims validation: a foreign writer's stale config
+                // could have let a wrong-length vector into a durable fragment;
+                // appending it would corrupt the mmap file for every vector
+                // after it. Quarantine (skip + loud error), never apply.
+                let mut fresh: Vec<DocumentChunk> = Vec::with_capacity(chunks.len());
+                'chunk: for c in chunks {
+                    // Idempotent replay: skip ids already present so
+                    // chunk_count can't double-count.
+                    if loaded.chunks.contains_key(&c.id) {
+                        continue;
+                    }
+                    for (space, emb) in &c.embeddings {
+                        let expected = loaded
+                            .metadata
+                            .vector_spaces
+                            .get(space)
+                            .map(|v| v.dims)
+                            .unwrap_or(loaded.metadata.embedding_dims);
+                        if emb.len() != expected {
+                            tracing::error!(
+                                "replay: chunk {} in '{}' has {}-dim embedding for space '{}' \
+                                 (expected {}); quarantined",
+                                c.id,
+                                collection_name,
+                                emb.len(),
+                                space,
+                                expected
+                            );
+                            continue 'chunk;
+                        }
+                    }
+                    fresh.push(c);
+                }
+                if fresh.is_empty() {
+                    return Ok(());
+                }
+                let rel_adds: Vec<(u64, Option<u64>, Option<String>)> = fresh
+                    .iter()
+                    .map(|c| (c.id, c.parent_id, c.group_id.clone()))
+                    .collect();
+                let mut space_vectors: HashMap<String, Vec<(u64, Vec<f32>)>> = HashMap::new();
+                for c in &fresh {
+                    for (space, emb) in &c.embeddings {
+                        space_vectors
+                            .entry(space.clone())
+                            .or_default()
+                            .push((c.id, emb.clone()));
+                    }
+                }
+                let count = fresh.len();
+                Self::apply_ingest_commit(
+                    data_dir,
+                    collection_name,
+                    loaded,
+                    rel_adds,
+                    &fresh,
+                    space_vectors,
+                    count,
+                )
+            }
+            FragmentKind::Tombstone => {
+                let ids: Vec<u64> = serde_json::from_slice(payload)?;
+                let apply: Vec<u64> = ids
+                    .into_iter()
+                    .filter(|id| loaded.chunks.contains_key(id) && !loaded.tombstones.contains(id))
+                    .collect();
+                if apply.is_empty() {
+                    return Ok(());
+                }
+                Self::apply_tombstones_locally(data_dir, loaded, &apply)
+            }
+            FragmentKind::RelationUpsert => {
+                let rels: Vec<ChunkRelation> = serde_json::from_slice(payload)?;
+                loaded.relation_store.insert_batch(&rels)
+            }
+            FragmentKind::RelationDelete => {
+                let ids: Vec<String> = serde_json::from_slice(payload)?;
+                for id in &ids {
+                    loaded.relation_store.delete(id)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Converge this node's local indexes with the bucket manifest: apply
+    /// fragments this node hasn't seen (a remote writer's, or another serving
+    /// node's), in seq order, idempotently. Returns the manifest's `next_seq`.
+    ///
+    /// Two-branch compaction rule: if the compaction watermark has passed our
+    /// contiguous frontier, fragments we NEVER applied were folded into the
+    /// segment — the only correct recovery is a full re-attach. Otherwise the
+    /// folded fragments are ones we already applied, and only the live tail
+    /// needs replay.
+    pub async fn refresh_collection(
+        &self,
+        collection_name: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.cloud_mode {
+            return Ok(0);
+        }
+        let (manifest, _) =
+            crate::storage::lsm::read_manifest(self.storage.as_ref(), collection_name).await?;
+        let next_seq = manifest.next_seq;
+
+        let contiguous = {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            loaded.applied.contiguous
+        };
+
+        if let Some(wm) = manifest.compaction_watermark {
+            if wm + 1 > contiguous {
+                // Fragments we never applied were compacted away — full re-attach.
+                tracing::info!(
+                    "refresh '{}': compaction passed local frontier ({} > {}); re-attaching",
+                    collection_name,
+                    wm + 1,
+                    contiguous
+                );
+                self.rebuild_collection_from_storage(collection_name)
+                    .await?;
+                return Ok(next_seq);
+            }
+        }
+
+        // Fetch pending fragment payloads WITHOUT any lock held.
+        let frags = crate::storage::lsm::read_uncompacted_fragments(
+            self.storage.as_ref(),
+            collection_name,
+            &manifest,
+        )
+        .await?;
+        let pending: Vec<_> = frags
+            .into_iter()
+            .filter(|(r, _)| r.seq >= contiguous)
+            .collect();
+        if pending.is_empty() {
+            return Ok(next_seq);
+        }
+
+        // Apply in seq order under the write lock, skipping anything the node
+        // applied out-of-band (its own recent appends).
+        let mut collections = self.collections.write().await;
+        let loaded = collections
+            .get_mut(collection_name)
+            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let mut applied_any = false;
+        for (fref, bytes) in pending {
+            if loaded.applied.covers(fref.seq) {
+                continue;
+            }
+            Self::apply_fragment_locally(
+                &self.data_dir,
+                collection_name,
+                loaded,
+                fref.kind,
+                &bytes,
+            )?;
+            loaded.applied.mark(fref.seq);
+            applied_any = true;
+        }
+        if applied_any {
+            loaded.metadata.applied_seq = loaded.applied.contiguous;
+            store::save_metadata(&self.data_dir, &loaded.metadata)?;
+        }
+        Ok(next_seq)
+    }
+
+    /// Refresh every attached collection (the background refresher's tick).
+    pub async fn refresh_all(&self) {
+        let names: Vec<String> = {
+            let collections = self.collections.read().await;
+            collections.keys().cloned().collect()
+        };
+        for name in names {
+            if let Err(e) = self.refresh_collection(&name).await {
+                tracing::warn!("refresh of '{}' failed: {}", name, e);
+            }
+        }
+    }
+
     pub async fn delete_chunks(
         &self,
         collection_name: &str,
         ids: &[u64],
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
         // Writer role: durable tombstone only. Without local indexes we can't
         // filter to ids-that-exist; a tombstone for an absent id is an
         // idempotent no-op on replay, so append the deduped set as-is.
@@ -2067,17 +2451,21 @@ impl CollectionManager {
             let mut seen = std::collections::HashSet::new();
             let newly: Vec<u64> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
             if newly.is_empty() {
-                return Ok(0);
+                return Ok((0, None));
             }
-            crate::storage::lsm::append_tombstone(self.storage.as_ref(), collection_name, &newly)
-                .await
-                .map_err(|e| format!("LSM tombstone append failed: {e}"))?;
+            let seq = crate::storage::lsm::append_tombstone(
+                self.storage.as_ref(),
+                collection_name,
+                &newly,
+            )
+            .await
+            .map_err(|e| format!("LSM tombstone append failed: {e}"))?;
             maybe_auto_compact(
                 self.storage.clone(),
                 collection_name.to_string(),
                 self.compacting.clone(),
             );
-            return Ok(newly.len());
+            return Ok((newly.len(), Some(seq)));
         }
 
         // Phase 1 (read lock): determine which ids are actually deletable.
@@ -2099,7 +2487,7 @@ impl CollectionManager {
                 .collect()
         }; // read lock released here.
         if newly.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
 
         // Phase 2 (NO lock held): DURABLE S3 tombstone FIRST. This is the S3
@@ -2107,10 +2495,16 @@ impl CollectionManager {
         // S3 call no longer stalls every other collection's reads/writes (#2).
         // S3-first also fixes the F5 split-brain: on failure nothing local is
         // committed, so the caller retries cleanly.
+        let mut appended_seq: Option<u64> = None;
         if self.cloud_mode {
-            crate::storage::lsm::append_tombstone(self.storage.as_ref(), collection_name, &newly)
-                .await
-                .map_err(|e| format!("LSM tombstone append failed (delete not applied): {e}"))?;
+            let seq = crate::storage::lsm::append_tombstone(
+                self.storage.as_ref(),
+                collection_name,
+                &newly,
+            )
+            .await
+            .map_err(|e| format!("LSM tombstone append failed (delete not applied): {e}"))?;
+            appended_seq = Some(seq);
             maybe_auto_compact(
                 self.storage.clone(),
                 collection_name.to_string(),
@@ -2126,40 +2520,25 @@ impl CollectionManager {
         let loaded = collections
             .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        // Double-apply guard: the refresher may have applied OUR tombstone
+        // fragment between the append and this reacquire.
+        if let Some(seq) = appended_seq {
+            if loaded.applied.covers(seq) {
+                return Ok((newly.len(), appended_seq));
+            }
+            loaded.applied.mark(seq);
+            loaded.metadata.applied_seq = loaded.applied.contiguous;
+        }
         let apply: Vec<u64> = newly
             .iter()
             .copied()
             .filter(|id| loaded.chunks.contains_key(id) && !loaded.tombstones.contains(id))
             .collect();
         if apply.is_empty() {
-            return Ok(0);
+            return Ok((0, appended_seq));
         }
 
-        loaded.chunk_store.tombstone_batch(&apply)?;
-        for id in &apply {
-            loaded.tombstones.insert(*id);
-        }
-        // Persist the corrected live count IMMEDIATELY after the tombstones —
-        // before the fallible relation pruning — so a pruning error can't leave
-        // chunk_count permanently overstated.
-        let removed = apply.len() as u64;
-        loaded.metadata.chunk_count = loaded.metadata.chunk_count.saturating_sub(removed);
-        store::save_metadata(&self.data_dir, &loaded.metadata)?;
-        // Keep the filter index in step with the tombstones so `eligible` /
-        // selectivity don't count deleted chunks (which would underfill top-k
-        // on deleted-heavy collections).
-        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
-        // Prune relations incident on the deleted chunks (F6: propagate errors;
-        // on failure the edges are orphaned but target_status reports their
-        // endpoints as missing, and cloud replay prunes them independently).
-        for &id in &apply {
-            let edges = loaded
-                .relation_store
-                .for_chunk(id, RelationDirection::Both, None)?;
-            for e in edges {
-                loaded.relation_store.delete(&e.relation_id)?;
-            }
-        }
+        Self::apply_tombstones_locally(&self.data_dir, loaded, &apply)?;
 
         tracing::info!(
             "Deleted {} chunk(s) from '{}' (tombstoned{})",
@@ -2171,7 +2550,7 @@ impl CollectionManager {
                 ""
             }
         );
-        Ok(apply.len())
+        Ok((apply.len(), appended_seq))
     }
 
     /// Soft-delete every chunk matching a metadata filter (e.g. all chunks of a
@@ -2181,7 +2560,7 @@ impl CollectionManager {
         &self,
         collection_name: &str,
         filters: &HashMap<String, FilterValue>,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
         if self.role == NodeRole::Writer {
             return Err(
                 "delete-by-filter needs a serving node's indexes; this node runs in writer role \
@@ -2204,7 +2583,7 @@ impl CollectionManager {
                 .collect()
         };
         if ids.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
         self.delete_chunks(collection_name, &ids).await
     }
@@ -2322,6 +2701,7 @@ impl CollectionManager {
             chunk_count: live_count as u64,
             next_id,
             config: coll_config,
+            applied_seq: manifest.next_seq,
         };
         store::save_metadata(&self.data_dir, &metadata)?;
         // Organic migration: back-fill the bucket config for pre-v0.4
@@ -2406,6 +2786,8 @@ impl CollectionManager {
 
         let loaded = LoadedCollection {
             id_pool: Default::default(),
+            // A rebuild materialized EVERYTHING in the manifest it read.
+            applied: SeqTracker::starting_at(manifest.next_seq),
             metadata,
             fts,
             vector_spaces: vs_map,
@@ -3143,7 +3525,7 @@ mod persistence_tests {
                 make_ingest_chunk("f2", "second chunk"),
                 make_ingest_chunk("f3", "third chunk"),
             ];
-            let (ingested, _) = manager
+            let (ingested, _, _) = manager
                 .ingest("persist-test", to_ingest, &embed)
                 .await
                 .unwrap();
@@ -3410,6 +3792,7 @@ mod filter_aware_search_tests {
             include_relations: false,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
         let (hits, total, _took_us, explain) =
             manager.search("filter-search", &req, &embed).await.unwrap();
@@ -3475,6 +3858,7 @@ mod filter_aware_search_tests {
             include_relations: false,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
         let (_hits, _total, _took, explain) =
             manager.search("no-explain", &req, &embed).await.unwrap();
@@ -3589,6 +3973,7 @@ mod filter_aware_search_tests {
             include_relations: include,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
 
         // Without include_relations -> hits carry None.
@@ -3641,10 +4026,10 @@ mod filter_aware_search_tests {
             manager.ingest("del", chunks, &embed).await.unwrap();
 
             // Delete chunk id 3 by id.
-            let n = manager.delete_chunks("del", &[3]).await.unwrap();
+            let (n, _) = manager.delete_chunks("del", &[3]).await.unwrap();
             assert_eq!(n, 1);
             // Re-deleting is a no-op.
-            assert_eq!(manager.delete_chunks("del", &[3]).await.unwrap(), 0);
+            assert_eq!(manager.delete_chunks("del", &[3]).await.unwrap().0, 0);
 
             // A search must never return the deleted id.
             let req = SearchRequest {
@@ -3664,6 +4049,7 @@ mod filter_aware_search_tests {
                 include_relations: false,
                 relation_types: None,
                 relation_direction: RelationDirection::Outgoing,
+                min_seq: None,
             };
             let (hits, _, _, _) = manager.search("del", &req, &embed).await.unwrap();
             assert!(
@@ -3686,7 +4072,7 @@ mod filter_aware_search_tests {
             );
             let deleted = manager.delete_by_filter("del", &org_filter).await.unwrap();
             // 10 ingested - 1 already deleted (id 3) = 9 remaining deleted now.
-            assert_eq!(deleted, 9);
+            assert_eq!(deleted.0, 9);
             let _ = filters;
         }
 
@@ -3710,6 +4096,7 @@ mod filter_aware_search_tests {
                 include_relations: false,
                 relation_types: None,
                 relation_direction: RelationDirection::Outgoing,
+                min_seq: None,
             };
             let (hits, _, _, _) = manager.search("del", &req, &embed).await.unwrap();
             assert!(
@@ -3826,6 +4213,7 @@ mod filter_aware_search_tests {
             include_relations: false,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
         let (hits, _, _, _) = manager.search("reing", &req, &embed).await.unwrap();
         assert_eq!(hits.len(), 1, "the re-ingested chunk must be searchable");
@@ -4003,7 +4391,7 @@ mod cloud_ingest_tests {
             .unwrap();
 
         // Delete chunk 1 -> a tombstone WAL fragment lands in object storage.
-        let n = manager.delete_chunks("delcloud", &[1]).await.unwrap();
+        let (n, _) = manager.delete_chunks("delcloud", &[1]).await.unwrap();
         assert_eq!(n, 1);
 
         let (manifest, _) = read_manifest(storage.as_ref(), "delcloud").await.unwrap();
@@ -4090,6 +4478,7 @@ mod cloud_ingest_tests {
             include_relations: false,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
         let (hits, _, _, _) = m2.search("survive", &req, &embed).await.unwrap();
         let ids: std::collections::HashSet<u64> = hits.iter().map(|(c, _, _, _, _)| c.id).collect();
@@ -4615,7 +5004,7 @@ mod cloud_ingest_tests {
             .unwrap();
             // Writes the redb tombstone + RAM tombstone + S3 tombstone — the
             // same three places the ingest-compensation path writes.
-            assert_eq!(m.delete_chunks("pdisk", &[1]).await.unwrap(), 1);
+            assert_eq!(m.delete_chunks("pdisk", &[1]).await.unwrap().0, 1);
         }
 
         // Restart with the SAME data_dir (persistent disk — NOT wiped). This
@@ -4645,6 +5034,7 @@ mod cloud_ingest_tests {
             include_relations: false,
             relation_types: None,
             relation_direction: RelationDirection::Outgoing,
+            min_seq: None,
         };
         let (hits, _, _, _) = m2.search("pdisk", &req, &embed).await.unwrap();
         let hit_ids: std::collections::HashSet<u64> =
@@ -4797,7 +5187,7 @@ mod cloud_ingest_tests {
             CollectionManager::new_with_storage_role(&dir_writer, storage_writer, NodeRole::Writer)
                 .await
                 .unwrap();
-        let (n, _) = m_writer
+        let (n, _, _) = m_writer
             .ingest("wns", vec![ingest_chunk(2), ingest_chunk(3)], &embed)
             .await
             .unwrap();
@@ -4890,5 +5280,265 @@ mod cloud_ingest_tests {
             "first migrated id is one past the high-water"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ── Warm-serverless: manifest refresh + read-your-writes ─────────────
+
+    fn cloud_search_req(min_seq: Option<u64>) -> SearchRequest {
+        SearchRequest {
+            query: "chunk".to_string(),
+            mode: "semantic".to_string(),
+            vector_space: None,
+            top_k: 20,
+            query_vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
+            filters: HashMap::new(),
+            score_weights: None,
+            recency: None,
+            recency_preset: None,
+            recency_field: None,
+            boosts: Vec::new(),
+            relationship_boost: None,
+            explain: false,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
+            min_seq,
+        }
+    }
+
+    // Two serving nodes on one bucket: writes on A become visible on B via
+    // refresh_collection — chunks, deletes, and relations all converge.
+    #[tokio::test]
+    async fn two_nodes_converge_via_refresh() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("conv", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("conv", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+
+        // B boots AFTER the first write (rebuilds to seq frontier).
+        let b = CollectionManager::new_with_storage(&dir_b, sb)
+            .await
+            .unwrap();
+        let (hits, _, _, _) = b
+            .search("conv", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "B rebuilt A's first write at boot");
+
+        // A writes more: a new chunk, a relation, and a delete of chunk id 0.
+        a.ingest("conv", vec![ingest_chunk(1), ingest_chunk(2)], &embed)
+            .await
+            .unwrap();
+        let a_ids: Vec<u64> = {
+            let (hits, _, _, _) = a
+                .search("conv", &cloud_search_req(None), &embed)
+                .await
+                .unwrap();
+            hits.iter().map(|(c, _, _, _, _)| c.id).collect()
+        };
+        assert_eq!(a_ids.len(), 3);
+        let first_id = *a_ids.iter().min().unwrap();
+        let others: Vec<u64> = a_ids.iter().copied().filter(|i| *i != first_id).collect();
+        a.create_relations(
+            "conv",
+            vec![CreateRelation {
+                source_chunk_id: others[0],
+                target_chunk_id: others[1],
+                target_document_id: None,
+                relation_type: "cites".into(),
+                metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+        a.delete_chunks("conv", &[first_id]).await.unwrap();
+
+        // B converges via refresh (no restart, no rebuild).
+        b.refresh_collection("conv").await.unwrap();
+        let (hits, _, _, _) = b
+            .search("conv", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        let b_ids: std::collections::HashSet<u64> =
+            hits.iter().map(|(c, _, _, _, _)| c.id).collect();
+        assert!(!b_ids.contains(&first_id), "A's delete visible on B");
+        assert_eq!(b_ids.len(), 2, "A's later chunks visible on B");
+        let rels = b
+            .get_chunk_relations("conv", others[0], RelationDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(rels.len(), 1, "A's relation visible on B");
+        assert_eq!(rels[0].relation_type, "cites");
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // The refresher must never double-apply a node's OWN fragments (the seq
+    // tracker covers them out-of-band).
+    #[tokio::test]
+    async fn refresh_never_double_applies_own_writes() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let st: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&dir, st).await.unwrap();
+        m.create_collection("own", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest("own", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+        m.delete_chunks("own", &[0]).await.unwrap();
+
+        // Refresh repeatedly: state (incl. chunk_count) must not change.
+        let before = m.get_collection("own").await.unwrap().chunk_count;
+        for _ in 0..3 {
+            m.refresh_collection("own").await.unwrap();
+        }
+        let after = m.get_collection("own").await.unwrap().chunk_count;
+        assert_eq!(before, after, "replay of own fragments must be a no-op");
+        assert_eq!(after, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Compaction two-branch rule: a node that saw everything skips segments;
+    // a node whose frontier is BEHIND the watermark re-attaches fully.
+    #[tokio::test]
+    async fn refresh_survives_remote_compaction() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("rc2", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("rc2", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+
+        // B attaches at frontier 1 (one fragment applied).
+        let b = CollectionManager::new_with_storage(&dir_b, sb)
+            .await
+            .unwrap();
+
+        // Branch 1: A ingests + compacts; B's frontier is BEHIND the watermark
+        // (never saw seq 1) → refresh must full re-attach, not skip.
+        a.ingest("rc2", vec![ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+        a.compact_collection("rc2").await.unwrap();
+        b.refresh_collection("rc2").await.unwrap();
+        let (hits, _, _, _) = b
+            .search("rc2", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "stale node re-attaches across compaction");
+
+        // Branch 2: B now has everything; another compaction (A side) must be
+        // a cheap no-op on refresh (no re-attach needed) and lose nothing.
+        a.ingest("rc2", vec![ingest_chunk(2)], &embed)
+            .await
+            .unwrap();
+        b.refresh_collection("rc2").await.unwrap(); // B applies seq tail first
+        a.compact_collection("rc2").await.unwrap();
+        b.refresh_collection("rc2").await.unwrap(); // wm <= frontier → skip
+        let (hits, _, _, _) = b
+            .search("rc2", &cloud_search_req(None), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // Read-your-writes across nodes: a write on A returns a seq; a search on B
+    // with min_seq=seq refreshes and serves the write.
+    #[tokio::test]
+    async fn min_seq_gives_read_your_writes_across_nodes() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let dir_a = unique_data_dir();
+        let dir_b = unique_data_dir();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let sa: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let sb: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let a = CollectionManager::new_with_storage(&dir_a, sa)
+            .await
+            .unwrap();
+        a.create_collection("ryw", None, Some(4), None)
+            .await
+            .unwrap();
+        a.ingest("ryw", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        let b = CollectionManager::new_with_storage(&dir_b, sb)
+            .await
+            .unwrap();
+
+        // A writes; B searches with min_seq — must see it without manual refresh.
+        let (_, _, seq) = a
+            .ingest("ryw", vec![ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+        let seq = seq.expect("cloud ingest returns a seq");
+        let (hits, _, _, _) = b
+            .search("ryw", &cloud_search_req(Some(seq)), &embed)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "min_seq forces convergence before serving");
+
+        // A min_seq beyond the write history is rejected, not waited on.
+        assert!(b
+            .search("ryw", &cloud_search_req(Some(9_999)), &embed)
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }
