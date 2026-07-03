@@ -19,6 +19,7 @@
 //! Nothing routes through this trait yet — it is introduced standalone and
 //! wired into the engine incrementally in later steps.
 
+pub mod id_alloc;
 pub mod local;
 pub mod lsm;
 #[cfg(feature = "object-storage")]

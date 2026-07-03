@@ -57,6 +57,11 @@ pub(crate) fn validate_name_segment(
 /// A loaded collection with all its search indices in memory.
 struct LoadedCollection {
     metadata: Collection,
+    /// Cloud-mode id pool: ranges CAS-leased from `{ns}/id-alloc`. In cloud
+    /// mode ids are ONLY taken from here (never from `next_id`, which becomes
+    /// a diagnostic high-water mark) so attached nodes and stateless writers
+    /// can never mint colliding ids.
+    id_pool: std::collections::VecDeque<std::ops::Range<u64>>,
     fts: FtsState,
     /// Named vector spaces, each with its own USearch HNSW index.
     /// Arc-wrapped so search can clone cheaply and run in spawn_blocking.
@@ -104,6 +109,33 @@ pub struct CollectionManager {
     /// background compaction so concurrent triggers don't each write (and, on
     /// CAS loss, leak) a full segment.
     compacting: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Node role (COMPASS_ROLE). Writer = durable-append-only ingest with no
+    /// local indexes; Full = today's behavior. Cloud mode only.
+    role: NodeRole,
+    /// Stateless-writer id pools, keyed by namespace (attached collections
+    /// pool on `LoadedCollection.id_pool` instead).
+    writer_pools:
+        tokio::sync::Mutex<HashMap<String, std::collections::VecDeque<std::ops::Range<u64>>>>,
+    /// Cache of bucket collection configs for stateless-writer validation.
+    bucket_configs: tokio::sync::RwLock<HashMap<String, cloud::BucketConfig>>,
+}
+
+/// What this node does. Parsed from `COMPASS_ROLE` (default `full`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRole {
+    /// Serve reads and writes with full local indexes (default).
+    Full,
+    /// Durable-append-only writes; no local indexes, no read serving.
+    Writer,
+}
+
+impl NodeRole {
+    fn from_env() -> Self {
+        match std::env::var("COMPASS_ROLE").as_deref() {
+            Ok("writer") => NodeRole::Writer,
+            _ => NodeRole::Full,
+        }
+    }
 }
 
 impl CollectionManager {
@@ -123,12 +155,29 @@ impl CollectionManager {
         data_dir: &Path,
         storage: Arc<dyn Storage>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let role = NodeRole::from_env();
+        Self::new_with_storage_role(data_dir, storage, role).await
+    }
+
+    /// Like [`new_with_storage`] with an explicit node role (used by tests;
+    /// `new_with_storage` parses `COMPASS_ROLE`).
+    pub async fn new_with_storage_role(
+        data_dir: &Path,
+        storage: Arc<dyn Storage>,
+        role: NodeRole,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(data_dir)?;
 
         // Clean up any stale rebuild directories from crashes
         rebuild::cleanup_stale_rebuilds(data_dir);
 
         let cloud_mode = storage.backend_name() != "local-disk";
+        // The writer role is meaningless without a shared bucket; force Full
+        // in local mode so a stray COMPASS_ROLE can't disable local serving.
+        let role = if cloud_mode { role } else { NodeRole::Full };
+        if role == NodeRole::Writer {
+            tracing::info!("Node role: writer (durable-append-only; no read serving)");
+        }
         let manager = Arc::new(Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
@@ -136,7 +185,17 @@ impl CollectionManager {
             storage,
             cloud_mode,
             compacting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            role,
+            writer_pools: tokio::sync::Mutex::new(HashMap::new()),
+            bucket_configs: tokio::sync::RwLock::new(HashMap::new()),
         });
+
+        // Writer role: no local collections, no recovery — the node serves
+        // durable appends only, validated against bucket configs. Boot is
+        // instant regardless of how much data lives in the bucket.
+        if manager.role == NodeRole::Writer {
+            return Ok(manager);
+        }
 
         // Load existing collections from local disk.
         let names = store::list_collection_names(data_dir)?;
@@ -284,6 +343,7 @@ impl CollectionManager {
         let relations_db = store::relations_db_path(&self.data_dir, name);
         let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
+            id_pool: Default::default(),
             next_id,
             metadata,
             fts,
@@ -389,6 +449,7 @@ impl CollectionManager {
             let relation_store = RelationStore::open(&relations_db)?;
 
             let loaded = LoadedCollection {
+                id_pool: Default::default(),
                 metadata: collection.clone(),
                 fts,
                 vector_spaces: vs_map,
@@ -432,7 +493,18 @@ impl CollectionManager {
                 }
             }
             match crate::storage::lsm::init_namespace(self.storage.as_ref(), name).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Fresh namespace: seed the id allocator at 0 so every
+                    // ingest path (attached or stateless) can claim blocks.
+                    if let Err(e) =
+                        crate::storage::id_alloc::seed(self.storage.as_ref(), name, 0).await
+                    {
+                        let _ = crate::storage::lsm::delete_namespace(self.storage.as_ref(), name)
+                            .await;
+                        rollback_local().await;
+                        return Err(format!("id allocator seed failed: {e}").into());
+                    }
+                }
                 Err(crate::storage::StorageError::AlreadyExists(_)) => {
                     // Data exists in the bucket without a config (pre-v0.4
                     // namespace): this create collides with real data. Remove
@@ -713,27 +785,319 @@ impl CollectionManager {
     // ── Ingest ───────────────────────────────────────────────────────────
 
     /// Ingest chunks with batch parent resolution, named embeddings, and relationships.
+    /// Claim an id block, migrating a pre-v0.4 namespace on first use: if the
+    /// allocator object is absent, seed it from the bucket-derived high-water
+    /// mark (create-only, race-safe — no new ids can be minted while the
+    /// allocator is absent because every cloud ingest path requires it).
+    async fn claim_ids_or_migrate(
+        &self,
+        ns: &str,
+        count: u64,
+    ) -> Result<std::ops::Range<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::storage::id_alloc;
+        match id_alloc::claim(self.storage.as_ref(), ns, count).await {
+            Ok(r) => Ok(r),
+            Err(crate::storage::StorageError::NotFound(_)) => {
+                let (manifest, _) =
+                    crate::storage::lsm::read_manifest(self.storage.as_ref(), ns).await?;
+                let mat = cloud::materialize(self.storage.as_ref(), ns, &manifest).await?;
+                let start = if mat.max_id > 0 || !mat.chunks.is_empty() {
+                    mat.max_id + 1
+                } else {
+                    0
+                };
+                id_alloc::seed(self.storage.as_ref(), ns, start).await?;
+                Ok(id_alloc::claim(self.storage.as_ref(), ns, count).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Take `count` ids for an ATTACHED collection from its pooled blocks,
+    /// refilling via CAS with the collections lock RELEASED (never hold the
+    /// global lock across an S3 round-trip). Racing refills both push their
+    /// ranges — nothing leaks, no extra mutex.
+    async fn take_ids_cloud(
+        &self,
+        collection_name: &str,
+        count: usize,
+    ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            {
+                let mut collections = self.collections.write().await;
+                let loaded = collections
+                    .get_mut(collection_name)
+                    .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+                let available: u64 = loaded.id_pool.iter().map(|r| r.end - r.start).sum();
+                if available >= count as u64 {
+                    let mut ids = Vec::with_capacity(count);
+                    while ids.len() < count {
+                        let front = loaded
+                            .id_pool
+                            .front_mut()
+                            .expect("available >= count guarantees a range");
+                        ids.push(front.start);
+                        front.start += 1;
+                        if front.start == front.end {
+                            loaded.id_pool.pop_front();
+                        }
+                    }
+                    return Ok(ids);
+                }
+            } // lock released before the S3 round-trip below.
+            let range = self
+                .claim_ids_or_migrate(collection_name, count as u64)
+                .await?;
+            let mut collections = self.collections.write().await;
+            match collections.get_mut(collection_name) {
+                Some(loaded) => loaded.id_pool.push_back(range),
+                // Collection deleted mid-claim: the block leaks (gaps are fine).
+                None => return Err(format!("Collection '{}' not found", collection_name).into()),
+            }
+        }
+    }
+
+    /// Bucket collection config, cached. `refresh` forces a re-fetch (used
+    /// once on validation failure, so a just-added vector space is seen
+    /// without restarting the writer).
+    async fn bucket_config(
+        &self,
+        ns: &str,
+        refresh: bool,
+    ) -> Result<cloud::BucketConfig, Box<dyn std::error::Error + Send + Sync>> {
+        if !refresh {
+            if let Some(cfg) = self.bucket_configs.read().await.get(ns) {
+                return Ok(cfg.clone());
+            }
+        }
+        let cfg = cloud::read_bucket_config(self.storage.as_ref(), ns)
+            .await?
+            .ok_or_else(|| format!("Collection '{}' not found in object storage", ns))?;
+        self.bucket_configs
+            .write()
+            .await
+            .insert(ns.to_string(), cfg.clone());
+        Ok(cfg)
+    }
+
+    /// Writer-role ingest: validate against the bucket config, claim ids from
+    /// the shared allocator, append ONE durable WAL fragment, return. No
+    /// collections lock, no local indexes — the batch becomes searchable on
+    /// serving nodes after their manifest refresh (or attach).
+    async fn ingest_stateless(
+        &self,
+        collection_name: &str,
+        ingest_chunks: Vec<IngestChunk>,
+        embed_state: &EmbedState,
+    ) -> Result<(usize, HashMap<String, u64>), Box<dyn std::error::Error + Send + Sync>> {
+        validate_name_segment(collection_name, "Collection")?;
+        let count = ingest_chunks.len();
+        if count == 0 {
+            return Ok((0, HashMap::new()));
+        }
+        let cfg = self.bucket_config(collection_name, false).await?;
+
+        // Ids from the writer-side pool (same allocator as attached nodes).
+        // The pool mutex is NEVER held across the S3 claim: drain what's
+        // available, release, claim, push, repeat. Ids already drained are
+        // kept across iterations (a failed later claim leaks them — fine).
+        let mut ids: Vec<u64> = Vec::with_capacity(count);
+        loop {
+            {
+                let mut pools = self.writer_pools.lock().await;
+                let pool = pools.entry(collection_name.to_string()).or_default();
+                while ids.len() < count {
+                    let Some(front) = pool.front_mut() else { break };
+                    if front.start < front.end {
+                        ids.push(front.start);
+                        front.start += 1;
+                    }
+                    if front.start >= front.end {
+                        pool.pop_front();
+                    }
+                }
+                if ids.len() == count {
+                    break;
+                }
+            } // pool mutex released before the S3 round-trip.
+            let need = (count - ids.len()) as u64;
+            let range = self.claim_ids_or_migrate(collection_name, need).await?;
+            let mut pools = self.writer_pools.lock().await;
+            pools
+                .entry(collection_name.to_string())
+                .or_default()
+                .push_back(range);
+        }
+
+        // Build chunks with the same embedding rules as the attached path,
+        // validating dims against the bucket config. On a validation failure,
+        // refresh the config once (a space may have just been added) before
+        // rejecting — a stale cache must never poison a durable fragment.
+        let build = |cfg: &cloud::BucketConfig| -> Result<
+            (Vec<DocumentChunk>, HashMap<String, u64>),
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let default_space = cfg
+                .default_vector_space
+                .clone()
+                .unwrap_or_else(|| "default".into());
+            let mut client_id_map: HashMap<String, u64> = HashMap::new();
+            for (ic, &id) in ingest_chunks.iter().zip(ids.iter()) {
+                if let Some(ref cid) = ic.client_id {
+                    client_id_map.insert(cid.clone(), id);
+                }
+            }
+            let parent_ids: Vec<Option<u64>> =
+                ingest_chunks.iter().map(|ic| ic.parent_id).collect();
+            let parent_refs: Vec<Option<String>> = ingest_chunks
+                .iter()
+                .map(|ic| ic.parent_ref.clone())
+                .collect();
+            let group_ids: Vec<Option<String>> =
+                ingest_chunks.iter().map(|ic| ic.group_id.clone()).collect();
+            let resolved = RelationshipStore::resolve_batch_refs(
+                &client_id_map,
+                &parent_ids,
+                &parent_refs,
+                &group_ids,
+            );
+
+            let mut chunks: Vec<DocumentChunk> = Vec::with_capacity(count);
+            for (i, ic) in ingest_chunks.iter().enumerate() {
+                let id = ids[i];
+                let (parent_id, group_id) = resolved[i].clone();
+                let mut embeddings = ic.embeddings.clone();
+                if let Some(emb) = ic.embedding.clone() {
+                    embeddings.entry(default_space.clone()).or_insert(emb);
+                }
+                if embeddings.is_empty() {
+                    if let Ok(emb) = embed_state.embed_query(&ic.text) {
+                        let expected = cfg
+                            .vector_spaces
+                            .get(&default_space)
+                            .map(|c| c.dims)
+                            .unwrap_or(cfg.embedding_dims);
+                        if emb.len() == expected {
+                            embeddings.insert(default_space.clone(), emb);
+                        }
+                    }
+                }
+                for (space_name, vec) in &embeddings {
+                    let expected = cfg
+                        .vector_spaces
+                        .get(space_name)
+                        .map(|c| c.dims)
+                        .unwrap_or(cfg.embedding_dims);
+                    if vec.len() != expected {
+                        return Err(format!(
+                            "chunk {i}: embedding for vector space '{space_name}' has {} dims, \
+                             expected {expected}",
+                            vec.len()
+                        )
+                        .into());
+                    }
+                }
+                chunks.push(DocumentChunk {
+                    id,
+                    collection: collection_name.to_string(),
+                    file_id: ic.file_id.clone(),
+                    chunk_index: ic.chunk_index,
+                    page: ic.page,
+                    text: ic.text.clone(),
+                    metadata: ic.metadata.clone(),
+                    doc_type: ic.doc_type.clone(),
+                    parent_id,
+                    group_id,
+                    embeddings,
+                    embedding: None,
+                });
+            }
+            Ok((chunks, client_id_map))
+        };
+        let (chunks, client_id_map) = match build(&cfg) {
+            Ok(out) => out,
+            Err(first_err) => {
+                let fresh = self.bucket_config(collection_name, true).await?;
+                build(&fresh).map_err(|_| first_err)?
+            }
+        };
+
+        // ONE durable append; searchable on serving nodes after refresh.
+        let payload = serde_json::to_vec(&chunks)?;
+        let records = chunks.len() as u64;
+        let seq = crate::storage::lsm::append_fragment(
+            self.storage.as_ref(),
+            collection_name,
+            bytes::Bytes::from(payload),
+            records,
+        )
+        .await
+        .map_err(|e| format!("cloud WAL append failed: {e}"))?;
+        maybe_auto_compact(
+            self.storage.clone(),
+            collection_name.to_string(),
+            self.compacting.clone(),
+        );
+        tracing::info!(
+            "Writer ingest: WAL fragment seq={} ({} chunks) durable for '{}'",
+            seq,
+            records,
+            collection_name
+        );
+        Ok((count, client_id_map))
+    }
+
     pub async fn ingest(
         &self,
         collection_name: &str,
         ingest_chunks: Vec<IngestChunk>,
         embed_state: &EmbedState,
     ) -> Result<(usize, HashMap<String, u64>), Box<dyn std::error::Error + Send + Sync>> {
+        // Writer role: durable-append-only ingest, no local state required.
+        if self.role == NodeRole::Writer {
+            return self
+                .ingest_stateless(collection_name, ingest_chunks, embed_state)
+                .await;
+        }
+
+        let count = ingest_chunks.len();
+
+        // Cloud mode: ids come from CAS-leased blocks (storage/id_alloc.rs) so
+        // they can NEVER collide with a stateless writer's ids. This happens
+        // BEFORE taking the write lock (its refill path does S3 round-trips).
+        // A failed ingest after this point leaks the taken ids — gaps are fine;
+        // the invariant is no-reuse, not density.
+        let cloud_ids: Option<Vec<u64>> = if self.cloud_mode && count > 0 {
+            Some(self.take_ids_cloud(collection_name, count).await?)
+        } else {
+            None
+        };
+
         let mut collections = self.collections.write().await;
         let loaded = collections
             .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
 
-        let count = ingest_chunks.len();
-
         // Phase 1: Assign IDs and build client_id -> chunk_id map
         let mut client_id_map: HashMap<String, u64> = HashMap::new();
-        let mut assigned_ids: Vec<u64> = Vec::with_capacity(count);
-
-        for ic in &ingest_chunks {
-            let id = loaded.next_id;
-            loaded.next_id += 1;
-            assigned_ids.push(id);
+        let assigned_ids: Vec<u64> = match cloud_ids {
+            Some(ids) => {
+                // Keep the local counter as a diagnostic high-water mark only.
+                if let Some(&max) = ids.iter().max() {
+                    loaded.next_id = loaded.next_id.max(max + 1);
+                }
+                ids
+            }
+            None => {
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ids.push(loaded.next_id);
+                    loaded.next_id += 1;
+                }
+                ids
+            }
+        };
+        for (ic, &id) in ingest_chunks.iter().zip(assigned_ids.iter()) {
             if let Some(ref cid) = ic.client_id {
                 client_id_map.insert(cid.clone(), id);
             }
@@ -1172,6 +1536,9 @@ impl CollectionManager {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        if self.role == NodeRole::Writer {
+            return Err("this node runs in writer role and does not serve queries".into());
+        }
         let start = std::time::Instant::now();
         let collections = self.collections.read().await;
         let loaded = collections
@@ -1487,6 +1854,41 @@ impl CollectionManager {
         collection_name: &str,
         new: Vec<CreateRelation>,
     ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        // Writer role: build the edges without local state — target_status is
+        // stored as "missing" and re-resolved against the live chunk set at
+        // every read on serving nodes — and append ONE durable fragment.
+        if self.role == NodeRole::Writer {
+            let now = Utc::now();
+            let mut built: Vec<ChunkRelation> = Vec::with_capacity(new.len());
+            for r in new {
+                if r.source_chunk_id == r.target_chunk_id {
+                    return Err("A relation's source and target chunk must differ".into());
+                }
+                built.push(ChunkRelation {
+                    relation_id: uuid::Uuid::new_v4().to_string(),
+                    source_chunk_id: r.source_chunk_id,
+                    target_chunk_id: r.target_chunk_id,
+                    target_document_id: r.target_document_id,
+                    relation_type: r.relation_type,
+                    target_status: "missing".to_string(),
+                    metadata: r.metadata,
+                    created_at: now,
+                });
+            }
+            if !built.is_empty() {
+                let payload = serde_json::to_vec(&built)?;
+                let records = built.len() as u64;
+                crate::storage::lsm::append_relation_upsert(
+                    self.storage.as_ref(),
+                    collection_name,
+                    bytes::Bytes::from(payload),
+                    records,
+                )
+                .await
+                .map_err(|e| format!("cloud relation-upsert append failed: {e}"))?;
+            }
+            return Ok(built);
+        }
         // Phase 1 (read lock): build the edges, resolving target_status against
         // the chunk map. Then release the lock BEFORE the S3 round-trip (#2/#4).
         let now = Utc::now();
@@ -1574,6 +1976,17 @@ impl CollectionManager {
         collection_name: &str,
         relation_id: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Writer role: durable relation-delete only (idempotent on replay).
+        if self.role == NodeRole::Writer {
+            crate::storage::lsm::append_relation_delete(
+                self.storage.as_ref(),
+                collection_name,
+                std::slice::from_ref(&relation_id.to_string()),
+            )
+            .await
+            .map_err(|e| format!("cloud relation-delete append failed: {e}"))?;
+            return Ok(true);
+        }
         // Existence check under a short read lock, then release before S3 I/O.
         {
             let collections = self.collections.read().await;
@@ -1612,6 +2025,9 @@ impl CollectionManager {
         direction: RelationDirection,
         types: Option<&[String]>,
     ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.role == NodeRole::Writer {
+            return Err("this node runs in writer role and does not serve queries".into());
+        }
         let collections = self.collections.read().await;
         let loaded = collections
             .get(collection_name)
@@ -1644,6 +2060,26 @@ impl CollectionManager {
         collection_name: &str,
         ids: &[u64],
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // Writer role: durable tombstone only. Without local indexes we can't
+        // filter to ids-that-exist; a tombstone for an absent id is an
+        // idempotent no-op on replay, so append the deduped set as-is.
+        if self.role == NodeRole::Writer {
+            let mut seen = std::collections::HashSet::new();
+            let newly: Vec<u64> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+            if newly.is_empty() {
+                return Ok(0);
+            }
+            crate::storage::lsm::append_tombstone(self.storage.as_ref(), collection_name, &newly)
+                .await
+                .map_err(|e| format!("LSM tombstone append failed: {e}"))?;
+            maybe_auto_compact(
+                self.storage.clone(),
+                collection_name.to_string(),
+                self.compacting.clone(),
+            );
+            return Ok(newly.len());
+        }
+
         // Phase 1 (read lock): determine which ids are actually deletable.
         // DEDUP the input — `{"ids":[5,5,5]}` must count (and decrement
         // chunk_count by) ONE delete, not three.
@@ -1746,6 +2182,13 @@ impl CollectionManager {
         collection_name: &str,
         filters: &HashMap<String, FilterValue>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if self.role == NodeRole::Writer {
+            return Err(
+                "delete-by-filter needs a serving node's indexes; this node runs in writer role \
+                 (delete by explicit ids instead)"
+                    .into(),
+            );
+        }
         // Collect matching, not-yet-deleted ids under a read lock first.
         let ids: Vec<u64> = {
             let collections = self.collections.read().await;
@@ -1962,6 +2405,7 @@ impl CollectionManager {
         }
 
         let loaded = LoadedCollection {
+            id_pool: Default::default(),
             metadata,
             fts,
             vector_spaces: vs_map,
@@ -1988,6 +2432,9 @@ impl CollectionManager {
         (HashMap<String, HashMap<String, u64>>, u64),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        if self.role == NodeRole::Writer {
+            return Err("this node runs in writer role and does not serve queries".into());
+        }
         let collections = self.collections.read().await;
         let loaded = collections
             .get(collection_name)
@@ -3946,8 +4393,10 @@ mod cloud_ingest_tests {
         // Object count stays BOUNDED across many compaction cycles — proving no
         // unbounded leak (the F1 bug would grow this without limit).
         let all = storage.list("gc/").await.unwrap();
+        // Fixed per-namespace objects: manifest, live segment, collection.json,
+        // id-alloc, plus at most a couple of this-cycle staged fragments.
         assert!(
-            all.len() <= 5,
+            all.len() <= 7,
             "object count must stay bounded across cycles, got {}",
             all.len()
         );
@@ -4116,9 +4565,14 @@ mod cloud_ingest_tests {
         let mat = cloud::materialize(storage.as_ref(), "idreuse", &man)
             .await
             .unwrap();
-        assert!(
-            mat.chunks.contains_key(&4),
-            "new chunk must take id 4 (one past the pre-compaction high-water), got ids {:?}",
+        // Under block allocation the exact new id is an allocator detail (a
+        // fresh node claims a fresh block); the INVARIANT is that no previously
+        // assigned id — live or deleted — is ever reused.
+        let new_ids: Vec<u64> = mat.chunks.keys().copied().filter(|id| *id > 3).collect();
+        assert_eq!(
+            new_ids.len(),
+            1,
+            "exactly one new chunk with a never-before-assigned id, got {:?}",
             mat.chunks.keys().collect::<Vec<_>>()
         );
         assert!(
@@ -4205,6 +4659,236 @@ mod cloud_ingest_tests {
             hit_ids
         );
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ── Warm-serverless: bucket config + id allocator + writer role ──────
+
+    // The bucket collection.json is the source of truth on recovery: specs,
+    // created_at, and CollectionConfig must survive a cold rebuild instead of
+    // being re-inferred as model:"recovered" / defaults.
+    #[tokio::test]
+    async fn cold_rebuild_recovers_real_collection_config() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        let created;
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            let mut spaces = HashMap::new();
+            spaces.insert(
+                "custom".to_string(),
+                VectorSpaceConfig {
+                    dims: 4,
+                    model: "my-real-model".to_string(),
+                    status: "active".to_string(),
+                },
+            );
+            created = m
+                .create_collection("cfg", Some(spaces), None, None)
+                .await
+                .unwrap();
+            m.ingest("cfg", vec![ingest_chunk(0)], &embed)
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage)
+            .await
+            .unwrap();
+        let recovered = m2.get_collection("cfg").await.unwrap();
+        let space = recovered.vector_spaces.get("custom").unwrap();
+        assert_eq!(
+            space.model, "my-real-model",
+            "specs must not be re-inferred"
+        );
+        assert_eq!(recovered.created_at, created.created_at);
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // A zero-ingest collection must be discoverable from a fresh disk (the
+    // create-only empty manifest + bucket config make the namespace exist).
+    #[tokio::test]
+    async fn empty_collection_survives_node_loss() {
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            m.create_collection("emptyns", None, Some(4), None)
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage)
+            .await
+            .unwrap();
+        assert!(
+            m2.get_collection("emptyns").await.is_some(),
+            "zero-ingest collection must be rediscovered from the bucket"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // Writer role end-to-end: a node with NO local collection state ingests;
+    // a fresh serving node sees the data. Ids from writer and attached node
+    // never collide (both allocate from {ns}/id-alloc).
+    #[tokio::test]
+    async fn writer_role_ingest_is_stateless_and_ids_disjoint() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+
+        // Full node creates the collection and ingests two chunks.
+        let dir_full = unique_data_dir();
+        std::fs::create_dir_all(&dir_full).unwrap();
+        let storage_full: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m_full =
+            CollectionManager::new_with_storage_role(&dir_full, storage_full, NodeRole::Full)
+                .await
+                .unwrap();
+        m_full
+            .create_collection("wns", None, Some(4), None)
+            .await
+            .unwrap();
+        m_full
+            .ingest("wns", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+
+        // Writer node: EMPTY data dir, writer role. Ingest must succeed with
+        // zero local collection state and never create local index files.
+        let dir_writer = unique_data_dir();
+        std::fs::create_dir_all(&dir_writer).unwrap();
+        let storage_writer: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m_writer =
+            CollectionManager::new_with_storage_role(&dir_writer, storage_writer, NodeRole::Writer)
+                .await
+                .unwrap();
+        let (n, _) = m_writer
+            .ingest("wns", vec![ingest_chunk(2), ingest_chunk(3)], &embed)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(
+            !dir_writer.join("wns").exists(),
+            "writer role must not create local collection state"
+        );
+        // Reads are refused on the writer.
+        assert!(m_writer.get_facets("wns", "", &[]).await.is_err());
+
+        // A fresh serving node materializes ALL four chunks with unique ids.
+        let dir_read = unique_data_dir();
+        std::fs::create_dir_all(&dir_read).unwrap();
+        let storage_read: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m_read = CollectionManager::new_with_storage(&dir_read, storage_read.clone())
+            .await
+            .unwrap();
+        let (man, _) = crate::storage::lsm::read_manifest(storage_read.as_ref(), "wns")
+            .await
+            .unwrap();
+        let mat = cloud::materialize(storage_read.as_ref(), "wns", &man)
+            .await
+            .unwrap();
+        assert_eq!(mat.chunks.len(), 4, "all chunks durable");
+        let ids: std::collections::HashSet<u64> = mat.chunks.keys().copied().collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "no id collisions between writer and full node"
+        );
+        assert!(m_read.get_collection("wns").await.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir_full);
+        let _ = std::fs::remove_dir_all(&dir_writer);
+        let _ = std::fs::remove_dir_all(&dir_read);
+    }
+
+    // Pre-v0.4 migration: a namespace with data but NO id-alloc object seeds
+    // the allocator from the bucket-derived high-water mark — new ids never
+    // collide with existing ones.
+    #[tokio::test]
+    async fn id_alloc_migration_seeds_past_existing_ids() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("mig", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest(
+            "mig",
+            vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+            &embed,
+        )
+        .await
+        .unwrap();
+        // Simulate a pre-v0.4 namespace: remove the allocator object.
+        storage.delete("mig/id-alloc").await.unwrap();
+        // Drain the local pool by restarting the manager (pool is in-RAM).
+        drop(m);
+        let m2 = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m2.ingest("mig", vec![ingest_chunk(9)], &embed)
+            .await
+            .unwrap();
+
+        let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "mig")
+            .await
+            .unwrap();
+        let mat = cloud::materialize(storage.as_ref(), "mig", &man)
+            .await
+            .unwrap();
+        assert_eq!(mat.chunks.len(), 4);
+        let ids: std::collections::HashSet<u64> = mat.chunks.keys().copied().collect();
+        assert_eq!(ids.len(), 4, "migrated allocator must not reuse ids 0-2");
+        assert!(
+            ids.contains(&3),
+            "first migrated id is one past the high-water"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
