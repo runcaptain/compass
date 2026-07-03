@@ -384,7 +384,7 @@ impl CollectionManager {
         let vectors_dir = store::vectors_dir(&self.data_dir, name);
 
         // Open the Tantivy FTS index
-        let fts = if tantivy_dir.join("meta.json").exists() {
+        let mut fts = if tantivy_dir.join("meta.json").exists() {
             tantivy_fts::open_index(&tantivy_dir)?
         } else {
             tantivy_fts::build_index(&tantivy_dir, &[], 0)?
@@ -443,6 +443,7 @@ impl CollectionManager {
         let mut filter_index = FilterIndex::new();
         let tombstones_vec = chunk_store.load_tombstones()?;
         let tombstones: std::collections::HashSet<u64> = tombstones_vec.into_iter().collect();
+        let mut facet_rebuild = tantivy_fts::FacetBitsets::default();
         chunk_store.for_each(|id, chunk| {
             if id >= max_seen_id {
                 max_seen_id = id;
@@ -450,9 +451,13 @@ impl CollectionManager {
             rehydrated_count += 1;
             if !tombstones.contains(&id) {
                 filter_index.insert(id, &filter_meta(&chunk));
+                // Facets were EMPTY after every restart (open_index returns
+                // none and nothing rebuilt them) — rebuild here, same pass.
+                facet_rebuild.insert_chunk(&chunk);
             }
         })?;
         filter_index.finalize();
+        fts.facet_bitsets = facet_rebuild;
         // next_id is a MONOTONIC high-water mark that must never regress or reuse
         // an id. Take the max of: the persisted metadata.next_id (survives even
         // when the local chunk store is empty on a cold restart), and one past
@@ -1653,9 +1658,14 @@ impl CollectionManager {
             chunks.iter().map(|c| (c.id, c.clone())).collect();
         loaded.chunk_store.insert_batch(&to_persist)?;
 
-        // Phase 4: Update Tantivy FTS index
+        // Phase 4: Update Tantivy FTS index. build_index returns facet state
+        // for THIS batch only — absorb the prior batches' facets (replacing
+        // them wholesale was the latent since-v0.2 facet bug).
         let tantivy_dir = store::tantivy_dir(data_dir, collection_name);
-        loaded.fts = tantivy_fts::build_index(&tantivy_dir, chunks, loaded.metadata.chunk_count)?;
+        let mut new_fts =
+            tantivy_fts::build_index(&tantivy_dir, chunks, loaded.metadata.chunk_count)?;
+        new_fts.facet_bitsets.absorb(&loaded.fts.facet_bitsets);
+        loaded.fts = new_fts;
 
         // Phase 5: Update each vector space's HNSW index
         let vectors_dir = store::vectors_dir(data_dir, collection_name);
@@ -3357,7 +3367,7 @@ impl CollectionManager {
         loaded
             .last_used
             .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
-        tantivy_fts::get_facets(&loaded.fts, query, fields)
+        tantivy_fts::get_facets(&loaded.fts, query, fields, loaded.filter_index.universe())
     }
 
     /// Get all chunk texts and IDs for rebuild jobs.
@@ -4123,6 +4133,90 @@ mod persistence_tests {
             embeddings: HashMap::new(),
             embedding: None,
         }
+    }
+
+    // Regression for the three facet bugs the live E2E harness caught:
+    // (1) a second ingest batch replaced facet state instead of accumulating
+    //     (latent since v0.2 — build_index returned new-batch-only bitsets);
+    // (2) facets came back empty after a restart (open_index returns empty
+    //     state and nothing rebuilt it);
+    // (3) deleted chunks kept inflating counts (facets never saw tombstones).
+    #[tokio::test]
+    async fn facets_accumulate_survive_restart_and_exclude_deleted() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = empty_embed_state();
+        let tagged = |file: &str, text: &str, kind: &str| {
+            let mut c = make_ingest_chunk(file, text);
+            c.metadata.insert(
+                "kind".to_string(),
+                crate::models::MetadataValue::String(kind.to_string()),
+            );
+            c
+        };
+        let field = ["kind".to_string()];
+
+        {
+            let manager = CollectionManager::new(&data_dir).await.unwrap();
+            manager
+                .create_collection("facet-test", None, None, None)
+                .await
+                .unwrap();
+            manager
+                .ingest(
+                    "facet-test",
+                    vec![
+                        tagged("a", "alpha doc", "report"),
+                        tagged("b", "beta doc", "memo"),
+                    ],
+                    &embed,
+                )
+                .await
+                .unwrap();
+            // Bug 1: this second batch must ADD to the first, not replace it.
+            manager
+                .ingest(
+                    "facet-test",
+                    vec![tagged("c", "gamma doc", "report")],
+                    &embed,
+                )
+                .await
+                .unwrap();
+            let (facets, _) = manager.get_facets("facet-test", "", &field).await.unwrap();
+            let kind = facets.get("kind").expect("facets survive a second batch");
+            assert_eq!(kind.get("report"), Some(&2));
+            assert_eq!(kind.get("memo"), Some(&1));
+        }
+
+        // Bug 2: facets must be rebuilt from the chunk store on restart.
+        let manager2 = CollectionManager::new(&data_dir).await.unwrap();
+        let (facets, _) = manager2.get_facets("facet-test", "", &field).await.unwrap();
+        let kind = facets.get("kind").expect("facets survive a restart");
+        assert_eq!(kind.get("report"), Some(&2));
+        assert_eq!(kind.get("memo"), Some(&1));
+
+        // Bug 3: deleting a chunk must drop it from counts immediately.
+        let (_, ids) = manager2.get_all_chunk_data("facet-test").await.unwrap();
+        let (texts, _) = manager2.get_all_chunk_data("facet-test").await.unwrap();
+        let memo_id = ids
+            .iter()
+            .zip(texts.iter())
+            .find(|(_, t)| t.contains("beta"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        manager2
+            .delete_chunks("facet-test", &[memo_id])
+            .await
+            .unwrap();
+        let (facets, _) = manager2.get_facets("facet-test", "", &field).await.unwrap();
+        let kind = facets.get("kind").unwrap();
+        assert_eq!(kind.get("report"), Some(&2));
+        assert!(
+            kind.get("memo").is_none() || kind.get("memo") == Some(&0),
+            "deleted chunk still counted in facets: {kind:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]

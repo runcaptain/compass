@@ -92,6 +92,12 @@ impl FilterIndex {
         self.universe.is_empty()
     }
 
+    /// The live-id universe (treemap) — shared with facet counting so deleted
+    /// chunks never inflate counts.
+    pub fn universe(&self) -> &RoaringTreemap {
+        &self.universe
+    }
+
     /// Is this id live (inserted and not removed)? The universe excludes
     /// tombstoned ids on every maintenance path, so this doubles as the
     /// existence check now that chunks are not held in RAM.

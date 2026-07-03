@@ -107,12 +107,47 @@ impl BitSet {
 // Built once at index time, reused for every facet query.
 // Structure: { "department" => { "Legal" => BitSet, "Eng" => BitSet }, ... }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FacetBitsets {
-    /// Nested map: field_name -> { value -> bitset of matching doc positions }
-    pub groups: HashMap<String, HashMap<String, BitSet>>,
-    /// Total number of documents (needed to create "all" bitsets for unfiltered queries)
-    pub total_docs: usize,
+    /// Nested map: field_name -> { value -> treemap of matching CHUNK IDS }.
+    /// Keyed by chunk id (not doc position): ids are u64 and non-dense once
+    /// block-allocated, and the query side has always intersected on the
+    /// stored id — position-keyed dense bitsets silently misaligned.
+    pub groups: HashMap<String, HashMap<String, roaring::RoaringTreemap>>,
+}
+
+impl FacetBitsets {
+    /// Union another (older) facet map into this one. Appending a batch used
+    /// to REPLACE the facet state with new-batch-only bitsets — facets went
+    /// wrong after the second ingest batch, latent since v0.2.
+    pub fn absorb(&mut self, older: &FacetBitsets) {
+        for (field, vals) in &older.groups {
+            let dst = self.groups.entry(field.clone()).or_default();
+            for (value, tm) in vals {
+                *dst.entry(value.clone()).or_default() |= tm;
+            }
+        }
+    }
+
+    /// Record one chunk's facet values (used by streaming rebuilds at load).
+    pub fn insert_chunk(&mut self, chunk: &DocumentChunk) {
+        insert_facets_for(&mut self.groups, chunk);
+    }
+}
+
+fn insert_facets_for(
+    groups: &mut HashMap<String, HashMap<String, roaring::RoaringTreemap>>,
+    chunk: &DocumentChunk,
+) {
+    for (field, value) in &chunk.metadata {
+        let repr = metadata_value_repr(value);
+        groups
+            .entry(field.clone())
+            .or_default()
+            .entry(repr)
+            .or_default()
+            .insert(chunk.id);
+    }
 }
 
 // ── FtsState ─────────────────────────────────────────────────────────────────
@@ -249,8 +284,8 @@ pub fn build_index(
     // We need ALL chunks in the collection (existing + new) to build accurate bitsets.
     // For now, we rebuild bitsets from the chunks we have. On reload from disk,
     // the collection manager will call rebuild_facets() with all chunks.
-    let total_docs = (existing_count as usize) + chunks.len();
-    let facet_bitsets = build_facet_bitsets(chunks, existing_count as usize, total_docs);
+    let _ = existing_count; // no longer used: facets key on chunk ids
+    let facet_bitsets = build_facet_bitsets(chunks);
 
     // Create a reader once, reuse for all queries
     let reader = index
@@ -291,11 +326,9 @@ pub fn open_index(dir: &Path) -> Result<FtsState, Box<dyn std::error::Error + Se
         .reload_policy(ReloadPolicy::OnCommitWithDelay)
         .try_into()?;
 
-    // Start with empty facet bitsets — caller must call rebuild_facets() after loading all chunks
-    let facet_bitsets = FacetBitsets {
-        groups: HashMap::new(),
-        total_docs: 0,
-    };
+    // Start with empty facets — the collection manager rebuilds them in its
+    // load-time chunk scan (streaming, chunk-id keyed).
+    let facet_bitsets = FacetBitsets::default();
 
     Ok(FtsState {
         index,
@@ -313,29 +346,16 @@ pub fn open_index(dir: &Path) -> Result<FtsState, Box<dyn std::error::Error + Se
 
 /// Build facet bitsets from a batch of chunks.
 /// `offset` is the starting bit position (for appending to existing indices).
-fn build_facet_bitsets(chunks: &[DocumentChunk], offset: usize, total_docs: usize) -> FacetBitsets {
-    let mut groups: HashMap<String, HashMap<String, BitSet>> = HashMap::new();
-
-    // Scan all chunks and set bits for each metadata key-value pair.
-    // MetadataValue is converted to a string for facet grouping (e.g. Float(9.5) -> "9.5").
-    for (i, chunk) in chunks.iter().enumerate() {
-        let bit_pos = offset + i;
-        for (key, value) in &chunk.metadata {
-            let value_str = metadata_to_facet_string(value);
-            groups
-                .entry(key.clone())
-                .or_default()
-                .entry(value_str)
-                .or_insert_with(|| BitSet::new(total_docs))
-                .set(bit_pos);
-        }
+fn build_facet_bitsets(chunks: &[DocumentChunk]) -> FacetBitsets {
+    let mut fb = FacetBitsets::default();
+    for chunk in chunks {
+        fb.insert_chunk(chunk);
     }
-
-    FacetBitsets { groups, total_docs }
+    fb
 }
 
 /// Convert a MetadataValue to a string for facet grouping.
-fn metadata_to_facet_string(val: &MetadataValue) -> String {
+fn metadata_value_repr(val: &MetadataValue) -> String {
     match val {
         MetadataValue::String(s) => s.clone(),
         MetadataValue::Int(i) => i.to_string(),
@@ -423,60 +443,54 @@ pub fn get_facets(
     state: &FtsState,
     query_str: &str,
     requested_fields: &[String],
+    live: &roaring::RoaringTreemap,
 ) -> Result<(HashMap<String, HashMap<String, u64>>, u64), Box<dyn std::error::Error + Send + Sync>>
 {
     let start = std::time::Instant::now();
     let bs = &state.facet_bitsets;
 
-    // For unfiltered queries, every document matches — use "all ones" bitset
-    let query_bitset = if query_str.is_empty() || query_str == "*" {
-        None // fast path: skip query execution entirely
+    // Text-filtered queries build a treemap of matching CHUNK IDS; unfiltered
+    // queries skip query execution entirely. Counts always intersect with the
+    // LIVE universe, so soft-deleted chunks never inflate facets.
+    let query_ids: Option<roaring::RoaringTreemap> = if query_str.is_empty() || query_str == "*" {
+        None
     } else {
-        // Execute the text query and build a bitset from matching doc IDs
         let searcher = state.reader.searcher();
         let query_parser = QueryParser::for_index(&state.index, vec![state.text_field]);
-
         let query: Box<dyn tantivy::query::Query> = match query_parser.parse_query(query_str) {
             Ok(q) => q,
             Err(_) => Box::new(tantivy::query::AllQuery),
         };
-
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(bs.total_docs))?;
-
-        let mut result_bits = BitSet::new(bs.total_docs);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(usize::MAX >> 32))?;
+        let mut ids = roaring::RoaringTreemap::new();
         for (_score, doc_address) in &top_docs {
             let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
             if let Some(tantivy::schema::OwnedValue::U64(id)) = doc.get_first(state.id_field) {
-                result_bits.set(*id as usize);
+                ids.insert(*id);
             }
         }
-        Some(result_bits)
+        Some(ids)
     };
 
-    // THE HOT PATH: bitset AND + popcount for each facet value
-    let mut facets: HashMap<String, HashMap<String, u64>> = HashMap::new();
-
-    for (group_name, value_bitsets) in &bs.groups {
-        // If specific fields were requested, skip fields not in the list
-        if !requested_fields.is_empty() && !requested_fields.contains(group_name) {
+    let mut out: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for (field, values) in &bs.groups {
+        if !requested_fields.is_empty() && !requested_fields.contains(field) {
             continue;
         }
-
         let mut counts: HashMap<String, u64> = HashMap::new();
-        for (value, value_bits) in value_bitsets {
-            let count = match &query_bitset {
-                // Unfiltered: just popcount the precomputed bitset directly
-                None => value_bits.popcount(),
-                // Filtered: AND with query results, then popcount the intersection
-                Some(qb) => qb.and(value_bits).popcount(),
-            };
-            if count > 0 {
-                counts.insert(value.clone(), count);
+        for (value, tm) in values {
+            let mut hit = tm & live;
+            if let Some(q) = &query_ids {
+                hit &= q;
+            }
+            let n = hit.len();
+            if n > 0 {
+                counts.insert(value.clone(), n);
             }
         }
-        facets.insert(group_name.clone(), counts);
+        if !counts.is_empty() {
+            out.insert(field.clone(), counts);
+        }
     }
-
-    let took_us = start.elapsed().as_micros() as u64;
-    Ok((facets, took_us))
+    Ok((out, start.elapsed().as_micros() as u64))
 }
