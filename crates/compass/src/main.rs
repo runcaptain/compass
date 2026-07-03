@@ -36,6 +36,12 @@ mod filter;
 mod models;
 mod scoring;
 mod search;
+// Storage abstraction (Storage trait + LocalDiskStorage + object-storage backend
+// + LSM). main() selects and verifies the backend at startup; full engine
+// persistence through it is the follow-on. `allow(dead_code)` covers the parts
+// (LSM, chunk cache, filter-index serde) not yet on the hot path.
+#[allow(dead_code)]
+mod storage;
 mod telemetry;
 
 use api::{AppState, AuthConfig};
@@ -56,11 +62,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Compass v{} starting...", env!("CARGO_PKG_VERSION"));
     tracing::info!("Data directory: {}", data_dir.display());
 
+    // Select the storage backend from COMPASS_STORAGE (local disk by default, or
+    // your own cloud object storage — see .env.example) and verify connectivity
+    // at boot so mis-configured credentials fail loudly here, not on first write.
+    let storage = match storage::from_config(&data_dir) {
+        Ok(store) => match storage::verify(store.as_ref()).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Storage backend '{}' verified (read/write/delete OK)",
+                    store.backend_name()
+                );
+                store
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Storage backend '{}' failed connectivity check: {e}",
+                    store.backend_name()
+                );
+                return Err(e.into());
+            }
+        },
+        Err(e) => {
+            tracing::error!("Storage backend configuration error: {e}");
+            return Err(e.into());
+        }
+    };
+
     // Initialize embedding models (BGE-small via Candle + distilled M2V fallback)
     let embed_state = Arc::new(embed::init_embedders(&data_dir));
 
-    // Load existing collections from disk (indices, relationships, vector spaces)
-    let manager = collections::CollectionManager::new(&data_dir).await?;
+    // Load existing collections. In object-storage mode the manager mirrors
+    // ingests into the LSM (WAL + manifest) on the configured backend.
+    let manager = collections::CollectionManager::new_with_storage(&data_dir, storage).await?;
 
     let app_state = Arc::new(AppState {
         manager,

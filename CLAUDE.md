@@ -40,6 +40,9 @@ crates/
 - Metadata filtering: exact match, numeric range (gte/lte), array contains, set membership
 - Recency presets: aggressive (3d), recent (7d), mild (30d), archive (90d)
 - Parent-child document hierarchy (TAMS-compatible: source/flow/segment)
+- Typed many-to-many chunk relations (redb-backed, disk-served)
+- Soft deletes (tombstones) + compaction
+- Optional object-storage persistence (`--features object-storage`, `COMPASS_STORAGE=s3://…|gs://…|az://…`): LSM of WAL fragments + CAS manifest; bucket is the source of truth, local indexes rebuild from it on boot
 
 ## Key Modules
 
@@ -61,6 +64,8 @@ crates/
 │   └── distilled/          # Distilled Model2Vec lookup table
 ├── {collection-name}/
 │   ├── collection.json     # Collection metadata
+│   ├── chunks.redb         # Chunk metadata + tombstones (redb)
+│   ├── relations.redb      # Typed relations + endpoint indexes (redb)
 │   ├── relationships.bin   # Parent-child + sibling edges
 │   ├── tantivy/            # Tantivy FTS index files
 │   └── vectors/
@@ -79,6 +84,14 @@ DELETE /collections/:name                              Delete collection + data
 POST   /collections/:name/ingest                       Bulk ingest chunks
 POST   /collections/:name/search                       Search (fts|semantic|hybrid)
 GET    /collections/:name/facets                       Facet counts
+
+DELETE /collections/:name/chunks/:id                   Soft-delete one chunk
+POST   /collections/:name/delete                       Soft-delete by ids and/or filters
+POST   /collections/:name/compact                      Compact (object-storage mode)
+
+POST   /collections/:name/relations                    Create typed chunk relations
+DELETE /collections/:name/relations/:relation_id       Delete a relation
+GET    /collections/:name/chunks/:id/relations         List a chunk's relations
 
 POST   /collections/:name/vector-spaces                Add a vector space
 GET    /collections/:name/vector-spaces                List vector spaces

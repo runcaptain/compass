@@ -7,7 +7,7 @@
 //     distilled Model2Vec fallback (~100μs)
 //   - For datasets under 1000 docs, we skip HNSW and use brute-force cosine similarity
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use std::path::Path;
 use usearch::Index;
 use usearch::IndexOptions;
@@ -140,8 +140,11 @@ pub fn build_vector_index(
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let index_path_str = index_path
+        .to_str()
+        .ok_or("USearch index path is not valid UTF-8")?;
     index
-        .save(index_path.to_str().unwrap())
+        .save(index_path_str)
         .map_err(|e| format!("Failed to save USearch index: {}", e))?;
 
     // Save the key-to-chunk-id mapping alongside the index
@@ -165,7 +168,20 @@ pub fn load_vector_index(
 ) -> Result<VectorState, Box<dyn std::error::Error + Send + Sync>> {
     // Load vectors via mmap (zero-copy, no RAM allocation for vector data)
     let mmap = if vectors_path.exists() {
-        Some(super::mmap_vectors::MmapVectors::open(vectors_path)?)
+        let m = super::mmap_vectors::MmapVectors::open(vectors_path)?;
+        // The file's own dims are authoritative; a mismatch with the collection
+        // config would make every dot-product silently zip-truncate to the
+        // shorter length and return garbage scores. Fail loudly instead.
+        if m.dims() != dims && !m.is_empty() {
+            return Err(format!(
+                "vector file {} has {} dims but the vector space is configured for {}",
+                vectors_path.display(),
+                m.dims(),
+                dims
+            )
+            .into());
+        }
+        Some(m)
     } else {
         // Fall back to legacy binary format
         let vecs = load_vectors(vectors_path, dims)?;
@@ -198,8 +214,11 @@ pub fn load_vector_index(
     // Load the HNSW index via mmap (near-instant regardless of index size)
     if index_path.exists() {
         let index = create_index(dims, 0)?;
+        let index_path_str = index_path
+            .to_str()
+            .ok_or("USearch index path is not valid UTF-8")?;
         index
-            .view(index_path.to_str().unwrap())
+            .view(index_path_str)
             .map_err(|e| format!("Failed to mmap USearch index: {}", e))?;
 
         Ok(VectorState {
@@ -251,7 +270,7 @@ pub fn search_vectors_filtered(
     query_vec: &[f32],
     state: &VectorState,
     top_k: usize,
-    eligible: &RoaringBitmap,
+    eligible: &RoaringTreemap,
 ) -> (Vec<VectorResult>, FilteredSearchExplain) {
     let universe = state.key_to_chunk_id.len() as u64;
     let eligible_count = eligible.len();
@@ -279,11 +298,9 @@ pub fn search_vectors_filtered(
                 .get(key as usize)
                 .copied()
                 .unwrap_or(key);
-            // FilterIndex keys are u32; out-of-range chunk IDs are treated as
-            // ineligible.
-            u32::try_from(chunk_id)
-                .map(|k| eligible.contains(k))
-                .unwrap_or(false)
+            // FilterIndex is keyed by the full u64 chunk id (RoaringTreemap),
+            // so the eligibility check is a direct membership test.
+            eligible.contains(chunk_id)
         });
         explain.used_hnsw = true;
         explain.candidates_inspected = inspected.get();
@@ -320,9 +337,7 @@ pub fn search_vectors_filtered(
     let mut scores: Vec<(usize, f32)> = if let Some(ref mmap) = state.mmap_vectors {
         (0..mmap.len())
             .filter(|i| match state.key_to_chunk_id.get(*i).copied() {
-                Some(chunk_id) => u32::try_from(chunk_id)
-                    .map(|k| eligible.contains(k))
-                    .unwrap_or(false),
+                Some(chunk_id) => eligible.contains(chunk_id),
                 None => false,
             })
             .map(|i| {
@@ -337,9 +352,7 @@ pub fn search_vectors_filtered(
             .iter()
             .enumerate()
             .filter(|(i, _)| match state.key_to_chunk_id.get(*i).copied() {
-                Some(chunk_id) => u32::try_from(chunk_id)
-                    .map(|k| eligible.contains(k))
-                    .unwrap_or(false),
+                Some(chunk_id) => eligible.contains(chunk_id),
                 None => false,
             })
             .map(|(i, v)| {

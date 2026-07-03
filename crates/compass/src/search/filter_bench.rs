@@ -74,7 +74,7 @@ fn build_corpus(n: u32) -> (VectorState, FilterIndex) {
             "bucket01".to_string(),
             MetadataValue::String(bucket01.to_string()),
         );
-        filter_index.insert(i, &metadata);
+        filter_index.insert(i as u64, &metadata);
     }
     filter_index.finalize();
     let state = VectorState {
@@ -91,7 +91,7 @@ fn build_corpus(n: u32) -> (VectorState, FilterIndex) {
 fn ground_truth(
     query: &[f32],
     state: &VectorState,
-    eligible_keys: &[u32],
+    eligible_keys: &[u64],
     top_k: usize,
 ) -> Vec<u64> {
     let mut scored: Vec<(u64, f32)> = eligible_keys
@@ -99,7 +99,7 @@ fn ground_truth(
         .map(|&k| {
             let v = &state.vectors[k as usize];
             let score: f32 = query.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-            (k as u64, score)
+            (k, score)
         })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -137,7 +137,7 @@ fn run_case(
     let eligible = idx.eligible(&expr);
     let eligible_count = eligible.len();
     let selectivity_val = selectivity(&eligible, idx.len());
-    let eligible_keys: Vec<u32> = eligible.iter().collect();
+    let eligible_keys: Vec<u64> = eligible.iter().collect();
 
     for q_seed in 0..queries {
         let query = pseudo_vec(900_000 + q_seed as u64, DIMS);
@@ -190,13 +190,13 @@ fn filter_aware_ann_recall_10k_smoke() {
     let expr = FilterExpr::compile(&filters);
     let eligible = idx.eligible(&expr);
     assert_eq!(eligible.len(), 100, "1% of 10k -> 100 eligible chunks");
-    let eligible_keys: Vec<u32> = eligible.iter().collect();
+    let eligible_keys: Vec<u64> = eligible.iter().collect();
     let query = pseudo_vec(424242, DIMS);
     let (hits, explain) = search_vectors_filtered(&query, &state, 10, &eligible);
     assert_eq!(hits.len(), 10);
     for hit in &hits {
         assert!(
-            eligible.contains(hit.chunk_id as u32),
+            eligible.contains(hit.chunk_id),
             "hit {} must be eligible",
             hit.chunk_id
         );

@@ -38,6 +38,12 @@ pub fn chunks_db_path(data_dir: &Path, name: &str) -> PathBuf {
     collection_dir(data_dir, name).join("chunks.redb")
 }
 
+/// Get the path to a collection's chunk-relation redb database. Disk source of
+/// truth for typed many-to-many chunk relations; read on demand at search time.
+pub fn relations_db_path(data_dir: &Path, name: &str) -> PathBuf {
+    collection_dir(data_dir, name).join("relations.redb")
+}
+
 /// Save collection metadata to disk as JSON.
 pub fn save_metadata(
     data_dir: &Path,

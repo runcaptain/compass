@@ -8,6 +8,8 @@
 #[allow(dead_code)]
 pub mod backend;
 #[allow(dead_code)]
+pub mod chunk_cache;
+#[allow(dead_code)]
 pub mod chunk_store;
 // Filter-aware ANN modules . Not yet wired into the API
 // surface; `search_vectors_filtered` below is the prototype call site.

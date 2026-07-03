@@ -12,6 +12,24 @@ services:
       PORT: 4001
       DATA_DIR: /app/data
       RUST_LOG: compass=info
+      # ── Storage backend ──────────────────────────────────────────────────
+      # Default is local disk (redb under DATA_DIR). To use your own cloud
+      # object storage instead, set COMPASS_STORAGE and the matching creds.
+      # Values come from a `.env` file (see .env.example). A cloud backend
+      # needs an image built with `--features object-storage`.
+      COMPASS_STORAGE: ${COMPASS_STORAGE:-local}
+      # AWS S3 / MinIO / R2 (used when COMPASS_STORAGE=s3://…)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      COMPASS_S3_ENDPOINT: ${COMPASS_S3_ENDPOINT:-}
+      COMPASS_S3_ALLOW_HTTP: ${COMPASS_S3_ALLOW_HTTP:-}
+      # Google Cloud Storage (COMPASS_STORAGE=gs://…)
+      GOOGLE_SERVICE_ACCOUNT: ${GOOGLE_SERVICE_ACCOUNT:-}
+      # Azure Blob (COMPASS_STORAGE=az://…)
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME:-}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY:-}
     volumes:
       - compass_data:/app/data
     healthcheck:

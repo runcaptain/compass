@@ -46,4 +46,19 @@ ignore = [
     # `quinn-proto` 0.11.14 — sibling advisory to RUSTSEC-2026-0185, same
     # code path. Same rationale. Drop when the dep updates.
     "RUSTSEC-2026-0186",
+
+    # `quick-xml` 0.40.1 — quadratic runtime checking duplicate attribute
+    # names in a start tag (DoS via crafted XML). Pulled in via
+    # object_store 0.13 (S3 list/error response parsing), which pins
+    # `^0.39`; the fixed 0.41.0 is not semver-reachable at ANY current
+    # object_store release (0.14 pins ^0.40.1). The XML parsed
+    # here comes from the operator's OWN configured storage endpoint
+    # (AWS/GCS/Azure/MinIO), not from untrusted callers. Drop when
+    # object_store bumps to quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+
+    # `quick-xml` 0.40.1 — sibling advisory: unbounded namespace-declaration
+    # allocation in NsReader (memory-exhaustion DoS). Same code path, same
+    # trust boundary, same rationale as RUSTSEC-2026-0194. Drop together.
+    "RUSTSEC-2026-0195",
 ]

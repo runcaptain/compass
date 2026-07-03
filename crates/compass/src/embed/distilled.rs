@@ -111,7 +111,7 @@ pub fn init_distilled(model_dir: &Path) -> Option<ThreadSafeDistilledEmbedder> {
     let load_start = std::time::Instant::now();
 
     // Load tokenizer
-    let tokenizer = Tokenizer::from_file(tokenizer_path.to_str().unwrap()).ok()?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path.to_str()?).ok()?;
 
     // Load embedding matrix from safetensors (stored as FP16, we convert to FP32)
     let safetensors_data = std::fs::read(&safetensors_path).ok()?;

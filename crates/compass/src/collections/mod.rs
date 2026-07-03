@@ -9,7 +9,9 @@
 // The manager handles: create, load on startup, ingest with batch parent resolution,
 // search with full scoring pipeline, vector space CRUD, background rebuild jobs.
 
+pub mod cloud;
 pub mod rebuild;
+pub mod relation_store;
 pub mod relationships;
 pub mod store;
 
@@ -23,8 +25,10 @@ use crate::search::hybrid;
 use crate::search::tantivy_fts::{self, FtsState};
 use crate::search::vector::{self, hnsw_ef_search_default, VectorState};
 use crate::search::SearchMode;
+use crate::storage::Storage;
 use chrono::Utc;
 use rebuild::RebuildTracker;
+use relation_store::RelationStore;
 use relationships::RelationshipStore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +70,14 @@ struct LoadedCollection {
     /// Disk-backed chunk metadata. Every ingest writes through to this redb
     /// database so chunks survive process restarts and crashes.
     chunk_store: ChunkStore,
+    /// Disk-backed typed many-to-many chunk relations. Source of truth on disk;
+    /// read on demand at search time (never rehydrated into RAM).
+    relation_store: RelationStore,
+    /// Soft-delete tombstones: chunk ids marked deleted. In-RAM `HashSet` for
+    /// O(1) filtering at search time, rehydrated on startup from the chunk
+    /// store's tombstone table. HNSW/FTS still physically contain these ids;
+    /// search filters them out. Physical removal happens on rebuild/compaction.
+    tombstones: std::collections::HashSet<u64>,
     /// Next auto-increment ID for new chunks
     next_id: u64,
     /// Roaring-bitmap filter index over `chunks`. Rebuilt alongside the FTS
@@ -81,34 +93,99 @@ pub struct CollectionManager {
     data_dir: PathBuf,
     collections: RwLock<HashMap<String, LoadedCollection>>,
     pub rebuild_tracker: RebuildTracker,
+    /// Source-of-truth storage backend. Local disk (redb/mmap, the default) or
+    /// object storage. In object-storage mode, ingest also mirrors each batch
+    /// into the LSM (WAL fragments + CAS manifest) so data is S3-native.
+    storage: Arc<dyn Storage>,
+    /// True when `storage` is a cloud object-storage backend (not local disk).
+    /// Gates the LSM write path so local deployments are unaffected.
+    cloud_mode: bool,
+    /// Namespaces with an auto-compaction currently in flight. Single-flights
+    /// background compaction so concurrent triggers don't each write (and, on
+    /// CAS loss, leak) a full segment.
+    compacting: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl CollectionManager {
-    /// Create a new manager and load existing collections from disk.
+    /// Create a manager with local-disk storage (the default embedded mode).
+    /// Convenience wrapper used by tests and local-only callers.
     pub async fn new(
         data_dir: &Path,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::local::LocalDiskStorage::new(data_dir)?);
+        Self::new_with_storage(data_dir, storage).await
+    }
+
+    /// Create a manager with an explicit storage backend and load existing
+    /// collections. `main.rs` passes the backend selected by `COMPASS_STORAGE`.
+    pub async fn new_with_storage(
+        data_dir: &Path,
+        storage: Arc<dyn Storage>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(data_dir)?;
 
         // Clean up any stale rebuild directories from crashes
         rebuild::cleanup_stale_rebuilds(data_dir);
 
+        let cloud_mode = storage.backend_name() != "local-disk";
         let manager = Arc::new(Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
             rebuild_tracker: rebuild::new_tracker(),
+            storage,
+            cloud_mode,
+            compacting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         });
 
-        // Load existing collections from disk
+        // Load existing collections from local disk.
         let names = store::list_collection_names(data_dir)?;
         for name in &names {
             if let Err(e) = manager.load_collection(name).await {
                 tracing::error!("Failed to load collection '{}': {}", name, e);
             }
         }
-
         if !names.is_empty() {
             tracing::info!("Loaded {} collection(s) from disk", names.len());
+        }
+
+        // Cloud mode: object storage is the source of truth. Discover any
+        // collections that exist in S3 but not on local disk (e.g. an ephemeral
+        // node with a fresh disk after a restart) and rebuild their local
+        // indexes from the manifest. This is what makes cloud mode actually
+        // durable-without-local-state.
+        if cloud_mode {
+            match crate::storage::lsm::list_namespaces(manager.storage.as_ref()).await {
+                Ok(cloud_names) => {
+                    let mut recovered = 0usize;
+                    for ns in &cloud_names {
+                        let already = {
+                            let c = manager.collections.read().await;
+                            c.contains_key(ns)
+                        };
+                        if already {
+                            continue;
+                        }
+                        match manager.rebuild_collection_from_storage(ns).await {
+                            Ok(n) => {
+                                recovered += 1;
+                                tracing::info!(
+                                    "Recovered collection '{}' from object storage ({} chunks)",
+                                    ns,
+                                    n
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to recover '{}' from storage: {}", ns, e)
+                            }
+                        }
+                    }
+                    if recovered > 0 {
+                        tracing::info!("Recovered {} collection(s) from object storage", recovered);
+                    }
+                }
+                Err(e) => tracing::error!("Could not list collections from object storage: {}", e),
+            }
         }
 
         Ok(manager)
@@ -187,17 +264,25 @@ impl CollectionManager {
             chunks.insert(id, chunk);
         })?;
         let rehydrated_count = chunks.len();
-        // next_id is max(seen) + 1 if any chunks exist, otherwise resume from
-        // the metadata's chunk_count. The +1 guards against deleted-id gaps
-        // (no delete-chunk API today, but cheap insurance).
-        let next_id = if rehydrated_count > 0 {
+        // next_id is a MONOTONIC high-water mark that must never regress or reuse
+        // an id. Take the max of: the persisted metadata.next_id (survives even
+        // when the local chunk store is empty on a cold restart), and one past
+        // the highest id actually seen on disk. Using chunk_count here would be a
+        // bug: soft-delete makes chunk_count a *live* count, so it can be far
+        // below the highest assigned id → id reuse → overwriting existing chunks.
+        let from_disk = if rehydrated_count > 0 {
             max_seen_id + 1
         } else {
-            metadata.chunk_count
+            0
         };
+        let next_id = metadata.next_id.max(from_disk).max(metadata.chunk_count);
 
         let chunk_count = metadata.chunk_count;
-        let filter_index = build_filter_index_from_chunks(&chunks);
+        let tombstones: std::collections::HashSet<u64> =
+            chunk_store.load_tombstones()?.into_iter().collect();
+        let filter_index = build_filter_index_from_chunks(&chunks, &tombstones);
+        let relations_db = store::relations_db_path(&self.data_dir, name);
+        let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
             next_id,
             metadata,
@@ -206,6 +291,8 @@ impl CollectionManager {
             relationships,
             chunks,
             chunk_store,
+            relation_store,
+            tombstones,
             filter_index,
         };
 
@@ -265,6 +352,7 @@ impl CollectionManager {
             default_vector_space: default_space,
             embedding_dims: dims,
             chunk_count: 0,
+            next_id: 0,
             config: config.unwrap_or_default(),
         };
 
@@ -296,6 +384,8 @@ impl CollectionManager {
             std::fs::create_dir_all(parent)?;
         }
         let chunk_store = ChunkStore::open(&chunks_db)?;
+        let relations_db = store::relations_db_path(&self.data_dir, name);
+        let relation_store = RelationStore::open(&relations_db)?;
 
         let loaded = LoadedCollection {
             metadata: collection.clone(),
@@ -304,6 +394,8 @@ impl CollectionManager {
             relationships: RelationshipStore::new(),
             chunks: HashMap::new(),
             chunk_store,
+            relation_store,
+            tombstones: std::collections::HashSet::new(),
             next_id: 0,
             filter_index: FilterIndex::new(),
         };
@@ -332,6 +424,14 @@ impl CollectionManager {
             return Err(format!("Collection '{}' not found", name).into());
         }
         store::delete_collection_data(&self.data_dir, name)?;
+        // Cloud mode: also purge the collection's objects from storage, so it
+        // can't be resurrected from S3 on a later cold start (and so a racing
+        // ingest's orphan fragment doesn't bring a "deleted" collection back).
+        if self.cloud_mode {
+            crate::storage::lsm::delete_namespace(self.storage.as_ref(), name)
+                .await
+                .map_err(|e| format!("failed to purge '{name}' from object storage: {e}"))?;
+        }
         tracing::info!("Deleted collection '{}'", name);
         Ok(())
     }
@@ -535,6 +635,9 @@ impl CollectionManager {
         let mut chunks: Vec<DocumentChunk> = Vec::with_capacity(count);
         // space_name -> Vec<(chunk_id, embedding)>
         let mut space_vectors: HashMap<String, Vec<(u64, Vec<f32>)>> = HashMap::new();
+        // Deferred relationship additions (applied after the S3 append, so we can
+        // release the collections lock during network I/O).
+        let mut rel_adds: Vec<(u64, Option<u64>, Option<String>)> = Vec::with_capacity(count);
 
         for (i, ic) in ingest_chunks.into_iter().enumerate() {
             let id = assigned_ids[i];
@@ -548,10 +651,42 @@ impl CollectionManager {
                     embeddings.insert(default_space.clone(), emb);
                 }
             }
-            // If no embeddings provided at all, compute using built-in embedder for default space
+            // If no embeddings provided at all, compute using the built-in
+            // embedder — but ONLY if its output matches the default space's
+            // dims (a 384-dim BGE vector in a 4-dim space would corrupt the
+            // vector file). Chunks without a usable embedding stay FTS-only.
             if embeddings.is_empty() {
                 if let Ok(emb) = embed_state.embed_query(&ic.text) {
-                    embeddings.insert(default_space.clone(), emb);
+                    let expected = loaded
+                        .metadata
+                        .vector_spaces
+                        .get(&default_space)
+                        .map(|c| c.dims)
+                        .unwrap_or(loaded.metadata.embedding_dims);
+                    if emb.len() == expected {
+                        embeddings.insert(default_space.clone(), emb);
+                    }
+                }
+            }
+
+            // Validate USER-provided embedding lengths against each space's
+            // configured dims BEFORE anything is written. One wrong-length
+            // vector would silently corrupt the mmap vector file in release
+            // builds (offsets shift for every vector after it).
+            for (space_name, vec) in &embeddings {
+                let expected = loaded
+                    .metadata
+                    .vector_spaces
+                    .get(space_name)
+                    .map(|c| c.dims)
+                    .unwrap_or(loaded.metadata.embedding_dims);
+                if vec.len() != expected {
+                    return Err(format!(
+                        "chunk {i}: embedding for vector space '{space_name}' has {} dims, \
+                         expected {expected}",
+                        vec.len()
+                    )
+                    .into());
                 }
             }
 
@@ -578,11 +713,162 @@ impl CollectionManager {
                 embedding: None, // v2 uses named embeddings
             };
 
-            // Add relationship
-            loaded.relationships.add(id, parent_id, group_id);
-
-            loaded.chunks.insert(id, chunk.clone());
+            // Defer applying relationships / chunk map to `loaded` until AFTER
+            // the S3 append (so we can drop the lock during network I/O, #2).
+            rel_adds.push((id, parent_id, group_id));
             chunks.push(chunk);
+        }
+
+        // Release the collections write lock BEFORE the S3 network round-trip, so
+        // a slow S3 call doesn't stall every other collection (#2). Nothing local
+        // has been mutated yet (chunks/relationships were deferred into local Vecs
+        // above), so there is no state to roll back if the append fails.
+        drop(collections);
+
+        // Phase 3a (cloud): DURABLE S3 WAL append FIRST, before any local commit
+        // (fixes F14 split-brain — a failed append leaves nothing local, clean retry).
+        if self.cloud_mode {
+            let payload = serde_json::to_vec(&chunks)?;
+            let records = chunks.len() as u64;
+            let seq = crate::storage::lsm::append_fragment(
+                self.storage.as_ref(),
+                collection_name,
+                bytes::Bytes::from(payload),
+                records,
+            )
+            .await
+            .map_err(|e| format!("cloud WAL append failed, ingest not applied: {e}"))?;
+            tracing::info!(
+                "Cloud ingest: WAL fragment seq={} ({} chunks) durable for '{}'",
+                seq,
+                records,
+                collection_name
+            );
+            maybe_auto_compact(
+                self.storage.clone(),
+                collection_name.to_string(),
+                self.compacting.clone(),
+            );
+        }
+
+        // Re-acquire the write lock and apply local state (durable S3 record, if
+        // any, already written). Ids were pre-assigned from a monotonic counter,
+        // so no concurrent ingest can collide; applying by id is order-independent.
+        let mut collections = self.collections.write().await;
+        let loaded = match collections.get_mut(collection_name) {
+            Some(l) => l,
+            None => {
+                // Collection was deleted in the lock gap. `delete_collection`
+                // purges S3, but our fragment may have landed after that purge —
+                // append a tombstone so a re-materialize (which would recreate a
+                // manifest referencing only our orphan fragment) yields nothing.
+                if self.cloud_mode {
+                    if let Err(te) = crate::storage::lsm::append_tombstone(
+                        self.storage.as_ref(),
+                        collection_name,
+                        &assigned_ids,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "compensation (deleted-in-gap): S3 tombstone for '{}' failed: {}",
+                            collection_name,
+                            te
+                        );
+                    }
+                }
+                return Err(format!("Collection '{}' not found", collection_name).into());
+            }
+        };
+        // Apply all local state (chunks map, redb, FTS, HNSW, metadata, filter
+        // index) in one fallible step. On ANY failure in cloud mode we've already
+        // written a durable S3 fragment for these ids, so we compensate with a
+        // tombstone (below) — otherwise a partial local commit + orphan S3
+        // fragment would resurrect/duplicate the batch on a cold restart (F2).
+        let commit_result = Self::apply_ingest_commit(
+            &self.data_dir,
+            collection_name,
+            loaded,
+            rel_adds,
+            &chunks,
+            space_vectors,
+            count,
+        );
+        if let Err(e) = commit_result {
+            if self.cloud_mode {
+                // Compensate for the durable S3 fragment whose local commit
+                // failed. Tombstone the ids in THREE places so they can never
+                // resurface, on any restart path:
+                //   1. local redb tombstones table — survives `load_collection`
+                //      rehydrating from redb on a persistent-disk node (the
+                //      normal deployment). Without this, the chunk sits in redb
+                //      (insert_batch may have succeeded before FTS/HNSW failed)
+                //      and would be pulled back into RAM on restart.
+                //   2. the in-RAM tombstone set — masks it at query time now.
+                //   3. an S3 tombstone — so a fresh-disk rebuild-from-manifest
+                //      also drops it.
+                if let Err(te) = loaded.chunk_store.tombstone_batch(&assigned_ids) {
+                    tracing::error!(
+                        "compensation: failed to write local tombstones for '{}': {} \
+                         (chunk may need manual delete)",
+                        collection_name,
+                        te
+                    );
+                }
+                for id in &assigned_ids {
+                    loaded.tombstones.insert(*id);
+                    loaded.chunks.remove(id);
+                }
+                loaded.filter_index =
+                    build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+                drop(collections);
+                if let Err(te) = crate::storage::lsm::append_tombstone(
+                    self.storage.as_ref(),
+                    collection_name,
+                    &assigned_ids,
+                )
+                .await
+                {
+                    // Flaky S3: the orphan fragment now has no S3 tombstone. Local
+                    // tombstones (redb + RAM) still mask it on THIS node; surface
+                    // loudly so a fresh-disk rebuild risk is visible to operators.
+                    tracing::error!(
+                        "compensation: durable S3 tombstone for '{}' FAILED: {} — \
+                         orphan fragment may resurrect on a fresh-disk rebuild; \
+                         run POST /collections/{}/compact once S3 is healthy",
+                        collection_name,
+                        te,
+                        collection_name
+                    );
+                }
+            }
+            return Err(e);
+        }
+
+        tracing::info!("Ingested {} chunks into '{}'", count, collection_name);
+
+        Ok((count, client_id_map))
+    }
+
+    /// Apply an ingest batch's local state (chunk map, redb, FTS, HNSW, metadata,
+    /// relationships, filter index). All-or-caller-compensates: any `?` failure
+    /// leaves partial local state, which the caller undoes + tombstones in cloud
+    /// mode. Synchronous (no `.await`) — the S3 write already happened.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_ingest_commit(
+        data_dir: &Path,
+        collection_name: &str,
+        loaded: &mut LoadedCollection,
+        rel_adds: Vec<(u64, Option<u64>, Option<String>)>,
+        chunks: &[DocumentChunk],
+        space_vectors: HashMap<String, Vec<(u64, Vec<f32>)>>,
+        count: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for (id, parent_id, group_id) in rel_adds {
+            loaded.relationships.add(id, parent_id, group_id);
+        }
+        for chunk in chunks {
+            loaded.chunks.insert(chunk.id, chunk.clone());
         }
 
         // Phase 3b: Persist chunks to the disk-backed store BEFORE updating
@@ -594,18 +880,20 @@ impl CollectionManager {
         loaded.chunk_store.insert_batch(&to_persist)?;
 
         // Phase 4: Update Tantivy FTS index
-        let tantivy_dir = store::tantivy_dir(&self.data_dir, collection_name);
-        loaded.fts = tantivy_fts::build_index(&tantivy_dir, &chunks, loaded.metadata.chunk_count)?;
+        let tantivy_dir = store::tantivy_dir(data_dir, collection_name);
+        loaded.fts = tantivy_fts::build_index(&tantivy_dir, chunks, loaded.metadata.chunk_count)?;
 
         // Phase 5: Update each vector space's HNSW index
-        let vectors_dir = store::vectors_dir(&self.data_dir, collection_name);
+        let vectors_dir = store::vectors_dir(data_dir, collection_name);
         for (space_name, new_vecs) in space_vectors {
+            // Same fallback the ingest-time validation uses, so a space unknown
+            // to metadata can't validate against one dims and build with another.
             let dims = loaded
                 .metadata
                 .vector_spaces
                 .get(&space_name)
                 .map(|c| c.dims)
-                .unwrap_or(384);
+                .unwrap_or(loaded.metadata.embedding_dims);
 
             let index_path = vectors_dir.join(format!("{}.index", space_name));
             let vecs_path = vectors_dir.join(format!("{}.bin", space_name));
@@ -642,25 +930,37 @@ impl CollectionManager {
                     continue;
                 };
 
-                // Append new vectors to mmap file
-                if let Some(ref mut mmap) = vs.mmap_vectors {
-                    mmap.append(&new_vecs)?;
-                }
+                // Run the fallible updates in a closure so the space is ALWAYS
+                // re-inserted into `vector_spaces` afterward — an early `?` here
+                // used to drop the unwrapped space entirely, silently disabling
+                // semantic search on it until restart.
+                let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    // Append new vectors to mmap file
+                    if let Some(ref mut mmap) = vs.mmap_vectors {
+                        mmap.append(&new_vecs)?;
+                    }
 
-                // Extend key mapping
-                let base_key = vs.key_to_chunk_id.len();
-                for (cid, _) in &new_vecs {
-                    vs.key_to_chunk_id.push(*cid);
-                }
+                    // Extend the key mapping and persist it IMMEDIATELY after
+                    // the mmap append, before any HNSW work — so the two files
+                    // never desync on disk (a stale keymap makes search fabricate
+                    // chunk ids from raw key indexes after restart).
+                    let base_key = vs.key_to_chunk_id.len();
+                    for (cid, _) in &new_vecs {
+                        vs.key_to_chunk_id.push(*cid);
+                    }
+                    let map_path = index_path.with_extension("keymap");
+                    vector::save_key_map(&map_path, &vs.key_to_chunk_id)?;
 
-                // Add to HNSW index (use load() for mutability, not view())
-                let total = vs.key_to_chunk_id.len();
-                if total >= 1000 {
-                    if vs.index.is_none() || index_path.exists() {
+                    // Add to HNSW index (use load() for mutability, not view())
+                    let total = vs.key_to_chunk_id.len();
+                    if total >= 1000 && (vs.index.is_none() || index_path.exists()) {
+                        let index_path_str = index_path
+                            .to_str()
+                            .ok_or("USearch index path is not valid UTF-8")?;
                         let index = vector::create_index(dims, total)?;
                         if index_path.exists() {
                             index
-                                .load(index_path.to_str().unwrap())
+                                .load(index_path_str)
                                 .map_err(|e| format!("Failed to load USearch index: {}", e))?;
                         }
                         // Reserve for new vectors
@@ -675,17 +975,17 @@ impl CollectionManager {
                                 .map_err(|e| format!("Failed to add vector: {}", e))?;
                         }
                         index
-                            .save(index_path.to_str().unwrap())
+                            .save(index_path_str)
                             .map_err(|e| format!("Failed to save index: {}", e))?;
                         vs.index = Some(index);
                     }
-                }
-
-                // Save updated keymap
-                let map_path = index_path.with_extension("keymap");
-                vector::save_key_map(&map_path, &vs.key_to_chunk_id)?;
-
+                    Ok(())
+                })();
+                // Space goes back in whatever happened; a partial update is
+                // recoverable (caller compensates the batch), a vanished space
+                // is a silent outage.
                 loaded.vector_spaces.insert(space_name, Arc::new(vs));
+                result?;
             } else {
                 // Full rebuild path (first ingest or legacy data)
                 let mut all_ids: Vec<u64> = existing
@@ -705,22 +1005,16 @@ impl CollectionManager {
             }
         }
 
-        // Phase 6: Save metadata + relationships, then rebuild the filter index
+        // Phase 6: Save metadata + relationships, then rebuild the filter index.
+        // Persist the advanced next_id high-water mark so ids are never reused
+        // even if the local chunk store is later empty on restart.
         loaded.metadata.chunk_count += count as u64;
-        store::save_metadata(&self.data_dir, &loaded.metadata)?;
-        let rel_path =
-            store::collection_dir(&self.data_dir, collection_name).join("relationships.bin");
+        loaded.metadata.next_id = loaded.next_id;
+        store::save_metadata(data_dir, &loaded.metadata)?;
+        let rel_path = store::collection_dir(data_dir, collection_name).join("relationships.bin");
         loaded.relationships.save(&rel_path)?;
-        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks);
-
-        tracing::info!(
-            "Ingested {} chunks into '{}' ({} relationships tracked)",
-            count,
-            collection_name,
-            loaded.relationships.len()
-        );
-
-        Ok((count, client_id_map))
+        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+        Ok(())
     }
 
     // ── Search ───────────────────────────────────────────────────────────
@@ -742,6 +1036,7 @@ impl CollectionManager {
                 f32,
                 String,
                 Option<HashMap<String, MetadataValue>>,
+                Option<Vec<ChunkRelation>>,
             )>,
             usize,
             u64,
@@ -788,11 +1083,7 @@ impl CollectionManager {
             // the filter exactly the same way the semantic path does.
             if filter_active {
                 raw.into_iter()
-                    .filter(|(id, _)| {
-                        u32::try_from(*id)
-                            .map(|k| eligible.contains(k))
-                            .unwrap_or(false)
-                    })
+                    .filter(|(id, _)| eligible.contains(*id))
                     .collect()
             } else {
                 raw
@@ -910,14 +1201,17 @@ impl CollectionManager {
         // `retain`. Kept as an assertion in debug builds to catch invariant
         // drift if a new retrieval path bypasses the eligibility check.
         debug_assert!(
-            !filter_active
-                || candidates.iter().all(|c| {
-                    u32::try_from(c.chunk_id)
-                        .map(|k| eligible.contains(k))
-                        .unwrap_or(false)
-                }),
+            !filter_active || candidates.iter().all(|c| eligible.contains(c.chunk_id)),
             "filter-aware retrieval produced a candidate outside the eligible bitmap"
         );
+
+        // ── Step 3b: Drop soft-deleted (tombstoned) chunks ──────────────
+        // The HNSW/FTS indexes still physically contain deleted ids until the
+        // next rebuild/compaction, so we filter them out here. Cheap O(1) set
+        // membership per candidate.
+        if !loaded.tombstones.is_empty() {
+            candidates.retain(|c| !loaded.tombstones.contains(&c.chunk_id));
+        }
 
         // ── Step 4: Apply scoring pipeline ──────────────────────────────
         // Resolve recency preset into a full config (explicit `recency` wins)
@@ -971,21 +1265,61 @@ impl CollectionManager {
         let candidate_chunk_ids: Vec<u64> = candidates.iter().map(|c| c.chunk_id).collect();
         let parent_meta_cache = build_parent_metadata_cache(&candidate_chunk_ids, &loaded.chunks);
 
+        // ── Step 5b: Relation enrichment (opt-in) ───────────────────────
+        // When include_relations is set, fetch each hit's edges in ONE batched,
+        // on-demand read from the disk-backed relation store (never resident in
+        // RAM). target_status is resolved against the in-memory chunk cache:
+        // "found" if the target chunk exists locally, else "missing".
+        let mut relations_by_chunk: HashMap<u64, Vec<ChunkRelation>> = HashMap::new();
+        if req.include_relations {
+            let types = req.relation_types.as_deref();
+            relations_by_chunk = loaded.relation_store.for_chunks(
+                &candidate_chunk_ids,
+                req.relation_direction,
+                types,
+            )?;
+            for edges in relations_by_chunk.values_mut() {
+                for edge in edges.iter_mut() {
+                    edge.target_status = if loaded.chunks.contains_key(&edge.target_chunk_id)
+                        && !loaded.tombstones.contains(&edge.target_chunk_id)
+                    {
+                        "found".to_string()
+                    } else {
+                        "missing".to_string()
+                    };
+                }
+            }
+        }
+
         let hits: Vec<(
             DocumentChunk,
             f32,
             String,
             Option<HashMap<String, MetadataValue>>,
+            Option<Vec<ChunkRelation>>,
         )> = candidates
             .iter()
             .filter_map(|c| {
                 loaded.chunks.get(&c.chunk_id).map(|chunk| {
                     let parent_metadata = parent_metadata_for(chunk, &parent_meta_cache);
+                    // Some(vec) when requested (possibly empty), None when not —
+                    // mirrors the parent_metadata Option discipline.
+                    let relations = if req.include_relations {
+                        Some(
+                            relations_by_chunk
+                                .get(&c.chunk_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        None
+                    };
                     (
                         chunk.clone(),
                         c.final_score,
                         c.source.clone(),
                         parent_metadata,
+                        relations,
                     )
                 })
             })
@@ -1012,6 +1346,464 @@ impl CollectionManager {
         };
 
         Ok((hits, total, took_us, explain_plan))
+    }
+
+    // ── Chunk Relations ──────────────────────────────────────────────────
+
+    /// Create a batch of chunk relations. The server mints a UUIDv4
+    /// `relation_id` and stamps `created_at` for each. Self-relations
+    /// (`source == target`) are rejected. Returns the created edges with their
+    /// assigned ids.
+    pub async fn create_relations(
+        &self,
+        collection_name: &str,
+        new: Vec<CreateRelation>,
+    ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 1 (read lock): build the edges, resolving target_status against
+        // the chunk map. Then release the lock BEFORE the S3 round-trip (#2/#4).
+        let now = Utc::now();
+        let mut built: Vec<ChunkRelation> = Vec::with_capacity(new.len());
+        {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            for r in new {
+                if r.source_chunk_id == r.target_chunk_id {
+                    return Err("A relation's source and target chunk must differ".into());
+                }
+                built.push(ChunkRelation {
+                    relation_id: uuid::Uuid::new_v4().to_string(),
+                    source_chunk_id: r.source_chunk_id,
+                    target_chunk_id: r.target_chunk_id,
+                    target_document_id: r.target_document_id,
+                    relation_type: r.relation_type,
+                    target_status: if loaded.chunks.contains_key(&r.target_chunk_id)
+                        && !loaded.tombstones.contains(&r.target_chunk_id)
+                    {
+                        "found".to_string()
+                    } else {
+                        "missing".to_string()
+                    },
+                    metadata: r.metadata,
+                    created_at: now,
+                });
+            }
+        } // read lock released before S3 I/O.
+
+        // Phase 2 (NO lock): durable S3 relation-upsert FIRST (S3-first ordering).
+        if self.cloud_mode && !built.is_empty() {
+            let payload = serde_json::to_vec(&built)?;
+            let records = built.len() as u64;
+            crate::storage::lsm::append_relation_upsert(
+                self.storage.as_ref(),
+                collection_name,
+                bytes::Bytes::from(payload),
+                records,
+            )
+            .await
+            .map_err(|e| format!("cloud relation-upsert append failed: {e}"))?;
+        }
+
+        // Phase 3 (read lock): apply locally (durable S3 record already written).
+        // On EITHER failure mode — collection deleted in the lock gap, or a
+        // local insert error — compensate with a RelationDelete for the minted
+        // ids, so the durable upsert fragment can't resurrect orphan edges on a
+        // later materialize (the same discipline ingest applies to chunks).
+        let apply_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = {
+            let collections = self.collections.read().await;
+            match collections.get(collection_name) {
+                Some(loaded) => loaded.relation_store.insert_batch(&built),
+                None => Err(format!("Collection '{}' not found", collection_name).into()),
+            }
+        };
+        if let Err(e) = apply_result {
+            if self.cloud_mode && !built.is_empty() {
+                let ids: Vec<String> = built.iter().map(|r| r.relation_id.clone()).collect();
+                if let Err(te) = crate::storage::lsm::append_relation_delete(
+                    self.storage.as_ref(),
+                    collection_name,
+                    &ids,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "compensation: relation-delete for '{}' failed: {} — orphan \
+                         relation fragment may resurrect on rebuild",
+                        collection_name,
+                        te
+                    );
+                }
+            }
+            return Err(e);
+        }
+        Ok(built)
+    }
+
+    /// Delete a relation by id. Returns true if it existed.
+    pub async fn delete_relation(
+        &self,
+        collection_name: &str,
+        relation_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Existence check under a short read lock, then release before S3 I/O.
+        {
+            let collections = self.collections.read().await;
+            if !collections.contains_key(collection_name) {
+                return Err(format!("Collection '{}' not found", collection_name).into());
+            }
+        }
+
+        // Cloud mode: durable S3 relation-delete FIRST — NO lock held across the
+        // S3 round-trip (#4). Replay drops the id; deleting an absent id is an
+        // idempotent no-op on materialize.
+        if self.cloud_mode {
+            crate::storage::lsm::append_relation_delete(
+                self.storage.as_ref(),
+                collection_name,
+                std::slice::from_ref(&relation_id.to_string()),
+            )
+            .await
+            .map_err(|e| format!("cloud relation-delete append failed: {e}"))?;
+        }
+
+        // Apply locally.
+        let collections = self.collections.read().await;
+        let loaded = collections
+            .get(collection_name)
+            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        loaded.relation_store.delete(relation_id)
+    }
+
+    /// List a single chunk's relations, with `target_status` resolved against
+    /// the current chunk set.
+    pub async fn get_chunk_relations(
+        &self,
+        collection_name: &str,
+        chunk_id: u64,
+        direction: RelationDirection,
+        types: Option<&[String]>,
+    ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        let collections = self.collections.read().await;
+        let loaded = collections
+            .get(collection_name)
+            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let mut edges = loaded
+            .relation_store
+            .for_chunk(chunk_id, direction, types)?;
+        for edge in edges.iter_mut() {
+            edge.target_status = if loaded.chunks.contains_key(&edge.target_chunk_id)
+                && !loaded.tombstones.contains(&edge.target_chunk_id)
+            {
+                "found".to_string()
+            } else {
+                "missing".to_string()
+            };
+        }
+        Ok(edges)
+    }
+
+    // ── Delete (soft-delete via tombstones) ──────────────────────────────
+
+    /// Soft-delete a set of chunk ids. Tombstones them (so they immediately
+    /// vanish from search results), persists the tombstones, prunes incident
+    /// relations, and — in object-storage mode — appends a tombstone WAL
+    /// fragment so the deletion is durably S3-native. The vectors physically
+    /// remain in the HNSW/FTS indexes until the next rebuild/compaction; search
+    /// filters them out in the meantime. Returns the number newly deleted.
+    pub async fn delete_chunks(
+        &self,
+        collection_name: &str,
+        ids: &[u64],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 1 (read lock): determine which ids are actually deletable.
+        // DEDUP the input — `{"ids":[5,5,5]}` must count (and decrement
+        // chunk_count by) ONE delete, not three.
+        let newly: Vec<u64> = {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let mut seen = std::collections::HashSet::new();
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    seen.insert(*id)
+                        && loaded.chunks.contains_key(id)
+                        && !loaded.tombstones.contains(id)
+                })
+                .collect()
+        }; // read lock released here.
+        if newly.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2 (NO lock held): DURABLE S3 tombstone FIRST. This is the S3
+        // network round-trip; doing it without the collections lock means a slow
+        // S3 call no longer stalls every other collection's reads/writes (#2).
+        // S3-first also fixes the F5 split-brain: on failure nothing local is
+        // committed, so the caller retries cleanly.
+        if self.cloud_mode {
+            crate::storage::lsm::append_tombstone(self.storage.as_ref(), collection_name, &newly)
+                .await
+                .map_err(|e| format!("LSM tombstone append failed (delete not applied): {e}"))?;
+            maybe_auto_compact(
+                self.storage.clone(),
+                collection_name.to_string(),
+                self.compacting.clone(),
+            );
+        }
+
+        // Phase 3 (write lock): apply local state. Re-check membership under the
+        // lock (a concurrent delete could have tombstoned some ids meanwhile);
+        // a redundant S3 tombstone for an already-deleted id is a harmless
+        // idempotent no-op on replay.
+        let mut collections = self.collections.write().await;
+        let loaded = collections
+            .get_mut(collection_name)
+            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let apply: Vec<u64> = newly
+            .iter()
+            .copied()
+            .filter(|id| loaded.chunks.contains_key(id) && !loaded.tombstones.contains(id))
+            .collect();
+        if apply.is_empty() {
+            return Ok(0);
+        }
+
+        loaded.chunk_store.tombstone_batch(&apply)?;
+        for id in &apply {
+            loaded.tombstones.insert(*id);
+        }
+        // Persist the corrected live count IMMEDIATELY after the tombstones —
+        // before the fallible relation pruning — so a pruning error can't leave
+        // chunk_count permanently overstated.
+        let removed = apply.len() as u64;
+        loaded.metadata.chunk_count = loaded.metadata.chunk_count.saturating_sub(removed);
+        store::save_metadata(&self.data_dir, &loaded.metadata)?;
+        // Keep the filter index in step with the tombstones so `eligible` /
+        // selectivity don't count deleted chunks (which would underfill top-k
+        // on deleted-heavy collections).
+        loaded.filter_index = build_filter_index_from_chunks(&loaded.chunks, &loaded.tombstones);
+        // Prune relations incident on the deleted chunks (F6: propagate errors;
+        // on failure the edges are orphaned but target_status reports their
+        // endpoints as missing, and cloud replay prunes them independently).
+        for &id in &apply {
+            let edges = loaded
+                .relation_store
+                .for_chunk(id, RelationDirection::Both, None)?;
+            for e in edges {
+                loaded.relation_store.delete(&e.relation_id)?;
+            }
+        }
+
+        tracing::info!(
+            "Deleted {} chunk(s) from '{}' (tombstoned{})",
+            apply.len(),
+            collection_name,
+            if self.cloud_mode {
+                " + WAL tombstone"
+            } else {
+                ""
+            }
+        );
+        Ok(apply.len())
+    }
+
+    /// Soft-delete every chunk matching a metadata filter (e.g. all chunks of a
+    /// file_id, or a metadata predicate). Resolves matching ids, then delegates
+    /// to `delete_chunks`.
+    pub async fn delete_by_filter(
+        &self,
+        collection_name: &str,
+        filters: &HashMap<String, FilterValue>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // Collect matching, not-yet-deleted ids under a read lock first.
+        let ids: Vec<u64> = {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            loaded
+                .chunks
+                .values()
+                .filter(|c| !loaded.tombstones.contains(&c.id))
+                .filter(|c| crate::filter::matches_filters(c, filters))
+                .map(|c| c.id)
+                .collect()
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.delete_chunks(collection_name, &ids).await
+    }
+
+    // ── Cloud compaction (object-storage mode) ───────────────────────────
+
+    /// Compact a collection's S3 LSM: fold all segments + WAL fragments into a
+    /// single new segment (applying deletes), then rewrite the manifest to
+    /// reference only it. Reclaims space for tombstoned data. No-op in local
+    /// mode. Returns the number of live records in the resulting segment.
+    ///
+    /// This CAS-retries against concurrent appends: if the manifest changed
+    /// under us, we re-materialize the fresh state and try again.
+    pub async fn compact_collection(
+        &self,
+        collection_name: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.cloud_mode {
+            return Ok(0);
+        }
+        // Verify the collection exists (under a short read lock).
+        {
+            let collections = self.collections.read().await;
+            if !collections.contains_key(collection_name) {
+                return Err(format!("Collection '{}' not found", collection_name).into());
+            }
+        }
+
+        Ok(compact_storage(self.storage.as_ref(), collection_name).await?)
+    }
+
+    /// Rebuild a collection's LOCAL indexes from its object-storage manifest
+    /// (materialize segments + WAL fragments → chunks → local redb/Tantivy/HNSW/
+    /// filter index). This is cold-start recovery: an ephemeral node with an
+    /// empty local disk reconstructs the collection entirely from S3. Returns the
+    /// number of live chunks recovered. Cloud mode only.
+    pub async fn rebuild_collection_from_storage(
+        &self,
+        collection_name: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        validate_name_segment(collection_name, "Collection")?;
+        let (manifest, _) =
+            crate::storage::lsm::read_manifest(self.storage.as_ref(), collection_name).await?;
+        let materialized =
+            cloud::materialize(self.storage.as_ref(), collection_name, &manifest).await?;
+        let chunks: Vec<DocumentChunk> = materialized.chunks.values().cloned().collect();
+        let live_count = chunks.len();
+
+        // Infer vector-space config from the recovered chunks' embeddings.
+        let mut vector_spaces: HashMap<String, VectorSpaceConfig> = HashMap::new();
+        for c in &chunks {
+            for (space, emb) in &c.embeddings {
+                vector_spaces
+                    .entry(space.clone())
+                    .or_insert(VectorSpaceConfig {
+                        dims: emb.len(),
+                        model: "recovered".to_string(),
+                        status: "active".to_string(),
+                    });
+            }
+        }
+        if vector_spaces.is_empty() {
+            vector_spaces.insert(
+                "default".to_string(),
+                VectorSpaceConfig {
+                    dims: 384,
+                    model: "recovered".to_string(),
+                    status: "active".to_string(),
+                },
+            );
+        }
+        let default_space = vector_spaces.keys().next().cloned();
+        let dims = vector_spaces.values().next().map(|s| s.dims).unwrap_or(384);
+        // next_id must never regress or reuse an id: one past the high-water
+        // mark whenever ANY id was ever assigned (max_id covers tombstoned ids
+        // via the WAL and the segment's stored max_id). The old
+        // `+ if live_count > 0` form reused the highest id when every chunk was
+        // deleted.
+        let next_id = if materialized.max_id > 0 || live_count > 0 {
+            materialized.max_id + 1
+        } else {
+            0
+        };
+
+        let metadata = Collection {
+            name: collection_name.to_string(),
+            created_at: Utc::now(),
+            vector_spaces: vector_spaces.clone(),
+            default_vector_space: default_space.clone(),
+            embedding_dims: dims,
+            chunk_count: live_count as u64,
+            next_id,
+            config: CollectionConfig::default(),
+        };
+        store::save_metadata(&self.data_dir, &metadata)?;
+
+        // Build local stores from the materialized chunks. Start from a CLEAN
+        // chunk store: S3 is the source of truth on recovery, so any pre-existing
+        // local redb (e.g. a stale chunk left by a partially-committed ingest that
+        // was later compensated with a tombstone) must not survive. Wipe first.
+        let chunks_db = store::chunks_db_path(&self.data_dir, collection_name);
+        if let Some(parent) = chunks_db.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(&chunks_db);
+        let chunk_store = ChunkStore::open(&chunks_db)?;
+        let to_persist: Vec<(u64, DocumentChunk)> =
+            chunks.iter().map(|c| (c.id, c.clone())).collect();
+        chunk_store.insert_batch(&to_persist)?;
+
+        // FTS index.
+        let tantivy_dir = store::tantivy_dir(&self.data_dir, collection_name);
+        let fts = tantivy_fts::build_index(&tantivy_dir, &chunks, 0)?;
+
+        // Vector spaces (HNSW) from embeddings.
+        let vectors_dir = store::vectors_dir(&self.data_dir, collection_name);
+        let mut vs_map: HashMap<String, Arc<VectorState>> = HashMap::new();
+        for (space, cfg) in &vector_spaces {
+            let mut ids = Vec::new();
+            let mut vecs = Vec::new();
+            for c in &chunks {
+                if let Some(emb) = c.embeddings.get(space) {
+                    ids.push(c.id);
+                    vecs.push(emb.clone());
+                }
+            }
+            let index_path = vectors_dir.join(format!("{}.index", space));
+            let vecs_path = vectors_dir.join(format!("{}.bin", space));
+            let vs = vector::build_vector_index(&index_path, &vecs_path, &ids, &vecs, cfg.dims)?;
+            vs_map.insert(space.clone(), Arc::new(vs));
+        }
+
+        // Relationships + filter index from the recovered chunks.
+        let mut relationships = RelationshipStore::new();
+        for c in &chunks {
+            relationships.add(c.id, c.parent_id, c.group_id.clone());
+        }
+        let chunk_map: HashMap<u64, DocumentChunk> =
+            chunks.iter().map(|c| (c.id, c.clone())).collect();
+        // Materialized state is already live-only (tombstones applied on replay).
+        let filter_index =
+            build_filter_index_from_chunks(&chunk_map, &std::collections::HashSet::new());
+
+        // Reconstruct the typed-relation store from the materialized relations
+        // (recovered from the S3 WAL/segments) — so relations survive a cold
+        // restart, not just chunks.
+        let relations_db = store::relations_db_path(&self.data_dir, collection_name);
+        let _ = std::fs::remove_file(&relations_db); // start clean, then repopulate
+        let relation_store = RelationStore::open(&relations_db)?;
+        let recovered_relations: Vec<ChunkRelation> =
+            materialized.relations.values().cloned().collect();
+        if !recovered_relations.is_empty() {
+            relation_store.insert_batch(&recovered_relations)?;
+        }
+
+        let loaded = LoadedCollection {
+            metadata,
+            fts,
+            vector_spaces: vs_map,
+            relationships,
+            chunks: chunk_map,
+            chunk_store,
+            relation_store,
+            tombstones: std::collections::HashSet::new(),
+            next_id,
+            filter_index,
+        };
+        let mut collections = self.collections.write().await;
+        collections.insert(collection_name.to_string(), loaded);
+        Ok(live_count)
     }
 
     /// Get facet counts for a collection.
@@ -1075,6 +1867,7 @@ impl CollectionManager {
         let mut results: Vec<DocumentChunk> = loaded
             .chunks
             .values()
+            .filter(|c| !loaded.tombstones.contains(&c.id))
             .filter(|c| c.doc_type == "segment")
             .filter(|c| c.group_id.as_deref() == Some(asset))
             .filter(|c| segment_in_time_window(c, time_ms, time_start_ms, time_end_ms))
@@ -1326,16 +2119,110 @@ mod segments_at_tests {
 /// Called on collection load (over rehydrated chunks) and after every
 /// ingest batch (alongside FTS/HNSW rebuild). The index lives in-memory
 /// only for now; persistence lands when chunk metadata migrates off redb.
-pub(crate) fn build_filter_index_from_chunks(chunks: &HashMap<u64, DocumentChunk>) -> FilterIndex {
+/// Uncompacted-fragment count above which a cloud collection is auto-compacted.
+/// Keeps the WAL bounded and reclaims tombstoned data without operator action.
+pub(crate) const AUTO_COMPACT_FRAGMENT_THRESHOLD: usize = 32;
+
+/// Storage-only compaction (no local manager state touched): materialize the
+/// full live set from S3, write it as one new segment, and CAS-rewrite the
+/// manifest to reference only it. Runs the CAS-retry loop so it converges
+/// against concurrent appends. Safe to spawn detached — compaction never mutates
+/// the local indexes (they already hold the data).
+pub(crate) async fn compact_storage(
+    storage: &dyn Storage,
+    ns: &str,
+) -> Result<u64, crate::storage::StorageError> {
+    const MAX_RETRIES: u32 = 10;
+    for _ in 0..MAX_RETRIES {
+        let (manifest, version) = crate::storage::lsm::read_manifest(storage, ns).await?;
+        if manifest.segments.is_empty() && manifest.fragments.is_empty() {
+            return Ok(0);
+        }
+        let materialized = cloud::materialize(storage, ns, &manifest).await?;
+        let chunks: Vec<DocumentChunk> = materialized.chunks.values().cloned().collect();
+        let relations: Vec<ChunkRelation> = materialized.relations.values().cloned().collect();
+        let records = chunks.len() as u64;
+        let segment_bytes = cloud::encode_segment(&chunks, &relations, materialized.max_id)?;
+
+        match crate::storage::lsm::replace_with_single_segment(
+            storage,
+            ns,
+            &version,
+            &manifest,
+            bytes::Bytes::from(segment_bytes),
+            records,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "Compacted '{}': {} live records in one segment",
+                    ns,
+                    records
+                );
+                return Ok(records);
+            }
+            Err(crate::storage::StorageError::VersionConflict { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(crate::storage::StorageError::Io(
+        "compaction failed after max CAS retries (persistent contention)".into(),
+    ))
+}
+
+/// Spawn a detached background compaction if the cloud collection's uncompacted
+/// fragment count is over the threshold. Best-effort: logs and moves on. Called
+/// after cloud ingest/delete so deletes actually reclaim space over time.
+fn maybe_auto_compact(
+    storage: Arc<dyn Storage>,
+    ns: String,
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) {
+    // Single-flight: if a compaction for this ns is already running, skip. This
+    // stops concurrent triggers from each writing (and, on CAS loss, leaking) a
+    // full segment.
+    {
+        let mut set = inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(ns.clone()) {
+            return; // already compacting this ns
+        }
+    }
+    tokio::spawn(async move {
+        let result = async {
+            let (manifest, _) = crate::storage::lsm::read_manifest(storage.as_ref(), &ns).await?;
+            let uncompacted = manifest.uncompacted().count();
+            if uncompacted >= AUTO_COMPACT_FRAGMENT_THRESHOLD {
+                tracing::info!("Auto-compacting '{}' ({} fragments)", ns, uncompacted);
+                compact_storage(storage.as_ref(), &ns).await?;
+            }
+            Ok::<(), crate::storage::StorageError>(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("auto-compaction of '{}' failed: {}", ns, e);
+        }
+        // Clear the in-flight flag so a later trigger can run.
+        inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ns);
+    });
+}
+
+/// Build the filter index from the chunk map, EXCLUDING tombstoned ids — so
+/// `eligible`/selectivity agree with what search may actually return, on every
+/// load path (local load, ingest rebuild, cloud recovery). Freshly-deleted ids
+/// are additionally masked post-retrieval until the next rebuild.
+pub(crate) fn build_filter_index_from_chunks(
+    chunks: &HashMap<u64, DocumentChunk>,
+    tombstones: &std::collections::HashSet<u64>,
+) -> FilterIndex {
     let mut idx = FilterIndex::new();
     for (&chunk_id, chunk) in chunks {
-        let Ok(key) = u32::try_from(chunk_id) else {
-            tracing::warn!(
-                "Chunk id {} exceeds u32; skipping FilterIndex insert. a follow-up widens this to u64.",
-                chunk_id
-            );
+        if tombstones.contains(&chunk_id) {
             continue;
-        };
+        }
         let mut effective = chunk.metadata.clone();
         // doc_type is a struct field, not a metadata key, but the filter
         // language treats it as one. Mirror it here so the bitmap covers it.
@@ -1343,7 +2230,9 @@ pub(crate) fn build_filter_index_from_chunks(chunks: &HashMap<u64, DocumentChunk
             "doc_type".to_string(),
             MetadataValue::String(chunk.doc_type.clone()),
         );
-        idx.insert(key, &effective);
+        // chunk_id is the full u64; the treemap-backed FilterIndex indexes the
+        // whole id space, so no chunk is dropped regardless of id magnitude.
+        idx.insert(chunk_id, &effective);
     }
     idx.finalize();
     idx
@@ -1899,12 +2788,15 @@ mod filter_aware_search_tests {
             boosts: Vec::new(),
             relationship_boost: None,
             explain: true,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
         };
         let (hits, total, _took_us, explain) =
             manager.search("filter-search", &req, &embed).await.unwrap();
 
         assert!(!hits.is_empty(), "search returned no hits");
-        for (chunk, _, _, _) in &hits {
+        for (chunk, _, _, _, _) in &hits {
             assert_eq!(
                 chunk.metadata.get("org_id"),
                 Some(&MetadataValue::String("acme".into())),
@@ -1961,10 +2853,1185 @@ mod filter_aware_search_tests {
             boosts: Vec::new(),
             relationship_boost: None,
             explain: false,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
         };
         let (_hits, _total, _took, explain) =
             manager.search("no-explain", &req, &embed).await.unwrap();
         assert!(explain.is_none(), "explain must be None when not requested");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn relations_crud_and_search_enrichment() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let manager = CollectionManager::new(&data_dir).await.unwrap();
+        manager
+            .create_collection("rel-search", None, Some(4), None)
+            .await
+            .unwrap();
+
+        // Ingest 5 chunks -> ids 0..5 in order.
+        let chunks: Vec<_> = (0..5u32).map(|i| ingest_with("acme", i)).collect();
+        manager.ingest("rel-search", chunks, &embed).await.unwrap();
+
+        // Create relations: 0 --cites--> 1, 0 --cites--> 2, 3 --supersedes--> 0.
+        let created = manager
+            .create_relations(
+                "rel-search",
+                vec![
+                    CreateRelation {
+                        source_chunk_id: 0,
+                        target_chunk_id: 1,
+                        target_document_id: None,
+                        relation_type: "cites".into(),
+                        metadata: HashMap::new(),
+                    },
+                    CreateRelation {
+                        source_chunk_id: 0,
+                        target_chunk_id: 2,
+                        target_document_id: None,
+                        relation_type: "cites".into(),
+                        metadata: HashMap::new(),
+                    },
+                    CreateRelation {
+                        source_chunk_id: 3,
+                        target_chunk_id: 0,
+                        target_document_id: None,
+                        relation_type: "supersedes".into(),
+                        metadata: HashMap::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 3);
+        assert!(created.iter().all(|r| !r.relation_id.is_empty()));
+        assert!(created.iter().all(|r| r.target_status == "found"));
+
+        // Self-relation is rejected.
+        let bad = manager
+            .create_relations(
+                "rel-search",
+                vec![CreateRelation {
+                    source_chunk_id: 1,
+                    target_chunk_id: 1,
+                    target_document_id: None,
+                    relation_type: "cites".into(),
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+        assert!(bad.is_err());
+
+        // Direction filters.
+        let out = manager
+            .get_chunk_relations("rel-search", 0, RelationDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        let inc = manager
+            .get_chunk_relations("rel-search", 0, RelationDirection::Incoming, None)
+            .await
+            .unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].relation_type, "supersedes");
+
+        // Type filter.
+        let cites = manager
+            .get_chunk_relations(
+                "rel-search",
+                0,
+                RelationDirection::Both,
+                Some(&["cites".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cites.len(), 2);
+
+        let base_req = |include: bool| SearchRequest {
+            query: "chunk".to_string(),
+            mode: "semantic".to_string(),
+            vector_space: None,
+            top_k: 10,
+            query_vector: Some(pseudo_vec(7)),
+            filters: HashMap::new(),
+            score_weights: None,
+            recency: None,
+            recency_preset: None,
+            recency_field: None,
+            boosts: Vec::new(),
+            relationship_boost: None,
+            explain: false,
+            include_relations: include,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
+        };
+
+        // Without include_relations -> hits carry None.
+        let (hits_off, _, _, _) = manager
+            .search("rel-search", &base_req(false), &embed)
+            .await
+            .unwrap();
+        assert!(hits_off.iter().all(|(_, _, _, _, rels)| rels.is_none()));
+
+        // With include_relations -> chunk 0's hit carries its 2 outgoing cites.
+        let (hits_on, _, _, _) = manager
+            .search("rel-search", &base_req(true), &embed)
+            .await
+            .unwrap();
+        let chunk0 = hits_on
+            .iter()
+            .find(|(c, _, _, _, _)| c.id == 0)
+            .expect("chunk 0 in results");
+        let rels = chunk0.4.as_ref().expect("Some(relations) when requested");
+        assert_eq!(rels.len(), 2, "chunk 0 has 2 outgoing cites");
+        assert!(rels.iter().all(|r| r.relation_type == "cites"));
+        assert!(rels.iter().all(|r| r.target_status == "found"));
+
+        // Delete one relation; outgoing from 0 drops to 1.
+        let rid = &created[0].relation_id;
+        assert!(manager.delete_relation("rel-search", rid).await.unwrap());
+        let out2 = manager
+            .get_chunk_relations("rel-search", 0, RelationDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(out2.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_from_search_and_survives_restart() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+
+        {
+            let manager = CollectionManager::new(&data_dir).await.unwrap();
+            manager
+                .create_collection("del", None, Some(4), None)
+                .await
+                .unwrap();
+            // Ingest 10 chunks (ids 0..10), org=acme.
+            let chunks: Vec<_> = (0..10u32).map(|i| ingest_with("acme", i)).collect();
+            manager.ingest("del", chunks, &embed).await.unwrap();
+
+            // Delete chunk id 3 by id.
+            let n = manager.delete_chunks("del", &[3]).await.unwrap();
+            assert_eq!(n, 1);
+            // Re-deleting is a no-op.
+            assert_eq!(manager.delete_chunks("del", &[3]).await.unwrap(), 0);
+
+            // A search must never return the deleted id.
+            let req = SearchRequest {
+                query: "chunk".to_string(),
+                mode: "semantic".to_string(),
+                vector_space: None,
+                top_k: 20,
+                query_vector: Some(pseudo_vec(4)),
+                filters: HashMap::new(),
+                score_weights: None,
+                recency: None,
+                recency_preset: None,
+                recency_field: None,
+                boosts: Vec::new(),
+                relationship_boost: None,
+                explain: false,
+                include_relations: false,
+                relation_types: None,
+                relation_direction: RelationDirection::Outgoing,
+            };
+            let (hits, _, _, _) = manager.search("del", &req, &embed).await.unwrap();
+            assert!(
+                hits.iter().all(|(c, _, _, _, _)| c.id != 3),
+                "deleted chunk must not appear in results"
+            );
+
+            // Delete-by-filter: delete everything with file_id f5 (chunk 5).
+            let mut filters = HashMap::new();
+            filters.insert(
+                "file_id".to_string(),
+                FilterValue::Exact(MetadataValue::String("f5".into())),
+            );
+            // ingest_with doesn't set file_id in metadata, so use a metadata field.
+            // org_id=acme matches all remaining -> delete the rest via a scan.
+            let mut org_filter = HashMap::new();
+            org_filter.insert(
+                "org_id".to_string(),
+                FilterValue::Exact(MetadataValue::String("acme".into())),
+            );
+            let deleted = manager.delete_by_filter("del", &org_filter).await.unwrap();
+            // 10 ingested - 1 already deleted (id 3) = 9 remaining deleted now.
+            assert_eq!(deleted, 9);
+            let _ = filters;
+        }
+
+        // Restart: tombstones must persist. Reopen the manager over the same dir.
+        {
+            let manager = CollectionManager::new(&data_dir).await.unwrap();
+            let req = SearchRequest {
+                query: "chunk".to_string(),
+                mode: "semantic".to_string(),
+                vector_space: None,
+                top_k: 20,
+                query_vector: Some(pseudo_vec(4)),
+                filters: HashMap::new(),
+                score_weights: None,
+                recency: None,
+                recency_preset: None,
+                recency_field: None,
+                boosts: Vec::new(),
+                relationship_boost: None,
+                explain: false,
+                include_relations: false,
+                relation_types: None,
+                relation_direction: RelationDirection::Outgoing,
+            };
+            let (hits, _, _, _) = manager.search("del", &req, &embed).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "all chunks deleted; none should survive restart, got {}",
+                hits.len()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // F6 coverage: deleting a chunk that participates in relations must prune
+    // those edges (both endpoints), not leave dangling references.
+    #[tokio::test]
+    async fn delete_chunk_prunes_its_relations() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let manager = CollectionManager::new(&data_dir).await.unwrap();
+        manager
+            .create_collection("delrel", None, Some(4), None)
+            .await
+            .unwrap();
+        let chunks: Vec<_> = (0..3u32).map(|i| ingest_with("acme", i)).collect();
+        manager.ingest("delrel", chunks, &embed).await.unwrap();
+
+        // 0 -> 1, 2 -> 0 (chunk 0 is both a source and a target).
+        manager
+            .create_relations(
+                "delrel",
+                vec![
+                    CreateRelation {
+                        source_chunk_id: 0,
+                        target_chunk_id: 1,
+                        target_document_id: None,
+                        relation_type: "cites".into(),
+                        metadata: HashMap::new(),
+                    },
+                    CreateRelation {
+                        source_chunk_id: 2,
+                        target_chunk_id: 0,
+                        target_document_id: None,
+                        relation_type: "cites".into(),
+                        metadata: HashMap::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Delete chunk 0 — both edges (as source and as target) must be pruned.
+        manager.delete_chunks("delrel", &[0]).await.unwrap();
+
+        assert!(
+            manager
+                .get_chunk_relations("delrel", 0, RelationDirection::Both, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "deleted chunk's own edges gone"
+        );
+        // Chunk 2's outgoing edge (to deleted 0) must also be gone.
+        assert!(
+            manager
+                .get_chunk_relations("delrel", 2, RelationDirection::Outgoing, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "edge pointing AT the deleted chunk must be pruned"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A stale tombstone must not suppress a NEWLY-ingested chunk. Since next_id
+    // is a monotonic high-water mark, re-ingest gets a fresh id that was never
+    // tombstoned, so it's fully searchable.
+    #[tokio::test]
+    async fn delete_then_reingest_new_chunk_is_searchable() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let manager = CollectionManager::new(&data_dir).await.unwrap();
+        manager
+            .create_collection("reing", None, Some(4), None)
+            .await
+            .unwrap();
+        manager
+            .ingest("reing", vec![ingest_with("acme", 0)], &embed)
+            .await
+            .unwrap();
+        manager.delete_chunks("reing", &[0]).await.unwrap();
+
+        // Re-ingest: gets id 1 (next_id advanced), NOT the tombstoned id 0.
+        manager
+            .ingest("reing", vec![ingest_with("acme", 9)], &embed)
+            .await
+            .unwrap();
+
+        let req = SearchRequest {
+            query: "chunk".to_string(),
+            mode: "semantic".to_string(),
+            vector_space: None,
+            top_k: 10,
+            query_vector: Some(pseudo_vec(10)),
+            filters: HashMap::new(),
+            score_weights: None,
+            recency: None,
+            recency_preset: None,
+            recency_field: None,
+            boosts: Vec::new(),
+            relationship_boost: None,
+            explain: false,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
+        };
+        let (hits, _, _, _) = manager.search("reing", &req, &embed).await.unwrap();
+        assert_eq!(hits.len(), 1, "the re-ingested chunk must be searchable");
+        assert_eq!(hits[0].0.id, 1, "re-ingest got a fresh (untombstoned) id");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(all(test, feature = "object-storage"))]
+mod cloud_ingest_tests {
+    //! Verifies that in object-storage (cloud) mode, ingest mirrors the batch
+    //! into the LSM as a WAL fragment + CAS-committed manifest — the S3-native
+    //! path. Uses the in-memory object_store backend, which
+    //! exercises the identical `Storage`/`ObjectStoreBackend` code an S3 bucket
+    //! would, without needing real credentials.
+
+    use super::*;
+    use crate::embed::EmbedState;
+    use crate::storage::object_store_backend::ObjectStoreBackend;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_data_dir() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "compass-cloud-ingest-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn embed_state() -> EmbedState {
+        // No models needed: chunks carry precomputed embeddings.
+        EmbedState {
+            bge: None,
+            distilled: None,
+        }
+    }
+
+    fn ingest_chunk(idx: u32) -> IngestChunk {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "org_id".to_string(),
+            MetadataValue::String("acme".to_string()),
+        );
+        let mut embeddings = HashMap::new();
+        embeddings.insert("default".to_string(), vec![0.1, 0.2, 0.3, 0.4]);
+        IngestChunk {
+            client_id: None,
+            file_id: format!("f{idx}"),
+            chunk_index: 0,
+            page: None,
+            text: format!("chunk-{idx}"),
+            metadata,
+            doc_type: "chunk".to_string(),
+            parent_id: None,
+            parent_ref: None,
+            group_id: None,
+            embeddings,
+            embedding: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_writes_wal_fragment_and_manifest_to_object_storage() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+
+        // In-memory object storage backend (same code path as s3://).
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "object-store:memory",
+        ));
+        let manager = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        manager
+            .create_collection("cloudcoll", None, Some(4), None)
+            .await
+            .unwrap();
+
+        // Ingest two batches.
+        manager
+            .ingest("cloudcoll", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+        manager
+            .ingest("cloudcoll", vec![ingest_chunk(2)], &embed)
+            .await
+            .unwrap();
+
+        // The manifest exists and records two WAL fragments.
+        let (manifest, version) = crate::storage::lsm::read_manifest(storage.as_ref(), "cloudcoll")
+            .await
+            .unwrap();
+        assert!(version.is_some(), "manifest must exist in object storage");
+        assert_eq!(manifest.fragments.len(), 2, "one fragment per ingest batch");
+        assert_eq!(manifest.next_seq, 2);
+
+        // The WAL fragment objects exist and decode back to the ingested chunks.
+        let frags = crate::storage::lsm::read_uncompacted_fragments(
+            storage.as_ref(),
+            "cloudcoll",
+            &manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(frags.len(), 2);
+
+        let batch0: Vec<DocumentChunk> = serde_json::from_slice(&frags[0].1).unwrap();
+        assert_eq!(batch0.len(), 2);
+        assert_eq!(batch0[0].text, "chunk-0");
+        let batch1: Vec<DocumentChunk> = serde_json::from_slice(&frags[1].1).unwrap();
+        assert_eq!(batch1.len(), 1);
+        assert_eq!(batch1[0].text, "chunk-2");
+
+        // Total records across fragments == total chunks ingested.
+        let total: u64 = manifest.fragments.iter().map(|f| f.records).sum();
+        assert_eq!(total, 3);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn local_mode_writes_no_wal() {
+        // Sanity: a local-disk manager must NOT create any WAL/manifest objects.
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let manager = CollectionManager::new(&data_dir).await.unwrap();
+        manager
+            .create_collection("localcoll", None, Some(4), None)
+            .await
+            .unwrap();
+        manager
+            .ingest("localcoll", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+
+        // No manifest object should exist under the collection prefix.
+        let manifest_path = data_dir.join("localcoll").join("manifest");
+        assert!(
+            !manifest_path.exists(),
+            "local mode must not write an LSM manifest"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_writes_tombstone_wal_fragment() {
+        use crate::storage::lsm::{read_manifest, read_uncompacted_fragments, FragmentKind};
+
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "object-store:memory",
+        ));
+        let manager = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        manager
+            .create_collection("delcloud", None, Some(4), None)
+            .await
+            .unwrap();
+        manager
+            .ingest(
+                "delcloud",
+                vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+                &embed,
+            )
+            .await
+            .unwrap();
+
+        // Delete chunk 1 -> a tombstone WAL fragment lands in object storage.
+        let n = manager.delete_chunks("delcloud", &[1]).await.unwrap();
+        assert_eq!(n, 1);
+
+        let (manifest, _) = read_manifest(storage.as_ref(), "delcloud").await.unwrap();
+        // seq 0 = data fragment (the ingest), seq 1 = tombstone fragment.
+        assert_eq!(manifest.fragments.len(), 2);
+        assert_eq!(manifest.fragments[0].kind, FragmentKind::Data);
+        assert_eq!(manifest.fragments[1].kind, FragmentKind::Tombstone);
+
+        // The tombstone fragment decodes to the deleted id [1].
+        let frags = read_uncompacted_fragments(storage.as_ref(), "delcloud", &manifest)
+            .await
+            .unwrap();
+        let deleted_ids: Vec<u64> = serde_json::from_slice(&frags[1].1).unwrap();
+        assert_eq!(deleted_ids, vec![1]);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // THE structural fix: a cloud collection must survive a restart on a FRESH
+    // local disk by rebuilding from S3. Ingest, delete one, then drop the manager
+    // AND wipe the local data dir, then reload from the SAME object store — the
+    // data (minus the deleted chunk) must come back.
+    #[tokio::test]
+    async fn cloud_restart_rehydrates_from_object_storage() {
+        let embed = embed_state();
+        // Shared object store persists across the "restart".
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            m.create_collection("survive", None, Some(4), None)
+                .await
+                .unwrap();
+            m.ingest(
+                "survive",
+                vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+                &embed,
+            )
+            .await
+            .unwrap();
+            m.delete_chunks("survive", &[1]).await.unwrap();
+        }
+        // Simulate node loss: wipe the local disk entirely.
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+
+        // Restart on a BRAND-NEW empty local dir, same object store.
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage)
+            .await
+            .unwrap();
+
+        // The collection is back, recovered from S3.
+        let info = m2.get_collection("survive").await;
+        assert!(info.is_some(), "collection must be recovered from S3");
+
+        // Search finds the surviving chunks (0 and 2), not the deleted one (1).
+        let req = SearchRequest {
+            query: "chunk".to_string(),
+            mode: "semantic".to_string(),
+            vector_space: None,
+            top_k: 10,
+            query_vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
+            filters: HashMap::new(),
+            score_weights: None,
+            recency: None,
+            recency_preset: None,
+            recency_field: None,
+            boosts: Vec::new(),
+            relationship_boost: None,
+            explain: false,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
+        };
+        let (hits, _, _, _) = m2.search("survive", &req, &embed).await.unwrap();
+        let ids: std::collections::HashSet<u64> = hits.iter().map(|(c, _, _, _, _)| c.id).collect();
+        assert!(ids.contains(&0), "chunk 0 recovered");
+        assert!(ids.contains(&2), "chunk 2 recovered");
+        assert!(!ids.contains(&1), "deleted chunk 1 must NOT reappear");
+
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // Compaction folds segments+fragments into one segment, dropping tombstoned
+    // records so they can never resurrect.
+    #[tokio::test]
+    async fn compaction_reclaims_tombstoned_data() {
+        use crate::storage::lsm::read_manifest;
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("comp", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest(
+            "comp",
+            vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+            &embed,
+        )
+        .await
+        .unwrap();
+        m.delete_chunks("comp", &[1]).await.unwrap();
+
+        // Before: manifest has data + tombstone fragments, no segment.
+        let (before, _) = read_manifest(storage.as_ref(), "comp").await.unwrap();
+        assert!(before.segments.is_empty());
+        assert_eq!(before.fragments.len(), 2);
+
+        // Compact.
+        let live = m.compact_collection("comp").await.unwrap();
+        assert_eq!(live, 2, "2 live records (0 and 2) after dropping deleted 1");
+
+        // After: one segment, no fragments.
+        let (after, _) = read_manifest(storage.as_ref(), "comp").await.unwrap();
+        assert_eq!(after.segments.len(), 1);
+        assert!(after.fragments.is_empty());
+
+        // The compacted segment contains only live chunks (0, 2) — deleted 1 gone.
+        let seg =
+            crate::storage::lsm::read_segment(storage.as_ref(), "comp", &after.segments[0].id)
+                .await
+                .unwrap();
+        let segment: cloud::Segment = serde_json::from_slice(&seg).unwrap();
+        let ids: std::collections::HashSet<u64> = segment.chunks.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&0) && ids.contains(&2));
+        assert!(
+            !ids.contains(&1),
+            "compaction must drop the tombstoned chunk"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // #1 regression: typed RELATIONS must survive a cold restart from S3 (the bug
+    // where relation_store was local-redb-only and vanished on rebuild). Create
+    // relations, wipe the local disk, restart on a fresh dir, relations return.
+    #[tokio::test]
+    async fn cloud_restart_recovers_relations() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            m.create_collection("relsurv", None, Some(4), None)
+                .await
+                .unwrap();
+            m.ingest(
+                "relsurv",
+                vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+                &embed,
+            )
+            .await
+            .unwrap();
+            // Create two relations, then delete one — only the survivor should
+            // come back.
+            let created = m
+                .create_relations(
+                    "relsurv",
+                    vec![
+                        CreateRelation {
+                            source_chunk_id: 0,
+                            target_chunk_id: 1,
+                            target_document_id: None,
+                            relation_type: "cites".into(),
+                            metadata: HashMap::new(),
+                        },
+                        CreateRelation {
+                            source_chunk_id: 0,
+                            target_chunk_id: 2,
+                            target_document_id: None,
+                            relation_type: "supersedes".into(),
+                            metadata: HashMap::new(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            m.delete_relation("relsurv", &created[1].relation_id)
+                .await
+                .unwrap();
+        }
+        // Node loss: wipe local disk.
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+
+        // Restart on a fresh local dir, same object store.
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage)
+            .await
+            .unwrap();
+
+        // The surviving relation (0 --cites--> 1) must be recovered from S3;
+        // the deleted one (0 --supersedes--> 2) must NOT reappear.
+        let out = m2
+            .get_chunk_relations("relsurv", 0, RelationDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "exactly one relation should survive restart");
+        assert_eq!(out[0].relation_type, "cites");
+        assert_eq!(out[0].target_chunk_id, 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // #3: auto-compaction. Ingest enough batches to cross the fragment threshold;
+    // the background trigger should fold them into a segment. We poll briefly for
+    // the detached task to run, then assert the WAL is bounded.
+    #[tokio::test]
+    async fn auto_compaction_bounds_the_wal() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("auto", None, Some(4), None)
+            .await
+            .unwrap();
+
+        // One chunk per ingest = one fragment per ingest. Cross the threshold.
+        let batches = AUTO_COMPACT_FRAGMENT_THRESHOLD + 2;
+        for i in 0..batches {
+            m.ingest("auto", vec![ingest_chunk(i as u32)], &embed)
+                .await
+                .unwrap();
+        }
+
+        // Poll up to ~3s for the detached auto-compaction to land a segment and
+        // shrink the uncompacted fragment set.
+        let mut compacted = false;
+        for _ in 0..30 {
+            let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "auto")
+                .await
+                .unwrap();
+            if !man.segments.is_empty()
+                && man.uncompacted().count() < AUTO_COMPACT_FRAGMENT_THRESHOLD
+            {
+                compacted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            compacted,
+            "auto-compaction should have folded the WAL into a segment"
+        );
+
+        // All data still present after auto-compaction (via materialize).
+        let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "auto")
+            .await
+            .unwrap();
+        let mat = cloud::materialize(storage.as_ref(), "auto", &man)
+            .await
+            .unwrap();
+        assert_eq!(mat.chunks.len(), batches, "no data lost in auto-compaction");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // Negative: auto-compaction must NOT fire below the fragment threshold (a
+    // regression dropping the threshold to ~0 would compact on every ingest).
+    #[tokio::test]
+    async fn auto_compaction_does_not_fire_below_threshold() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("below", None, Some(4), None)
+            .await
+            .unwrap();
+
+        // Well under the threshold: a handful of single-chunk ingests.
+        for i in 0..5u32 {
+            m.ingest("below", vec![ingest_chunk(i)], &embed)
+                .await
+                .unwrap();
+        }
+        // Give any (wrongly) spawned compaction ample time to land a segment.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "below")
+            .await
+            .unwrap();
+        assert!(
+            man.segments.is_empty(),
+            "auto-compaction must not fire below the threshold"
+        );
+        assert_eq!(man.fragments.len(), 5, "all fragments still in the WAL");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // F1 regression: compaction must physically GC old objects (deferred one
+    // cycle), not leak them forever. Ingest, compact twice, assert the first
+    // segment's object is deleted and the object count stays bounded.
+    #[tokio::test]
+    async fn compaction_gcs_old_objects() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("gc", None, Some(4), None)
+            .await
+            .unwrap();
+        m.ingest("gc", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+
+        // First compaction → segment S1, stages the 1 fragment for next-cycle GC.
+        m.compact_collection("gc").await.unwrap();
+        let (man1, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "gc")
+            .await
+            .unwrap();
+        let seg1_id = man1.segments[0].id.clone();
+        // The old WAL fragment object is staged (still present this cycle).
+        assert_eq!(man1.pending_deletes.len(), 1);
+
+        // Compact twice more (each cycle GCs the PRIOR cycle's staged objects,
+        // deferred one cycle for in-flight readers). After enough cycles, S1 is
+        // physically gone — the key point is it's GC'd, not leaked forever.
+        for i in 2..5u32 {
+            m.ingest("gc", vec![ingest_chunk(i)], &embed).await.unwrap();
+            m.compact_collection("gc").await.unwrap();
+        }
+        let (man2, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "gc")
+            .await
+            .unwrap();
+
+        // Segment S1 must be physically deleted (GC'd after being folded away).
+        let s1_key = format!("gc/segments/{seg1_id}");
+        assert!(
+            !storage.exists(&s1_key).await.unwrap(),
+            "old segment must be GC'd, not leaked"
+        );
+        // Object count stays BOUNDED across many compaction cycles — proving no
+        // unbounded leak (the F1 bug would grow this without limit).
+        let all = storage.list("gc/").await.unwrap();
+        assert!(
+            all.len() <= 5,
+            "object count must stay bounded across cycles, got {}",
+            all.len()
+        );
+        // Data intact.
+        let mat = cloud::materialize(storage.as_ref(), "gc", &man2)
+            .await
+            .unwrap();
+        assert_eq!(mat.chunks.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // Relations must survive COMPACTION-then-restart (segment-relations path),
+    // not just the fragment-replay path.
+    #[tokio::test]
+    async fn relations_survive_compaction_then_restart() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            m.create_collection("rc", None, Some(4), None)
+                .await
+                .unwrap();
+            m.ingest("rc", vec![ingest_chunk(0), ingest_chunk(1)], &embed)
+                .await
+                .unwrap();
+            m.create_relations(
+                "rc",
+                vec![CreateRelation {
+                    source_chunk_id: 0,
+                    target_chunk_id: 1,
+                    target_document_id: None,
+                    relation_type: "cites".into(),
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+            // Compact so the relation lives in the SEGMENT, not a WAL fragment.
+            m.compact_collection("rc").await.unwrap();
+        }
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage)
+            .await
+            .unwrap();
+        let out = m2
+            .get_chunk_relations("rc", 0, RelationDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "relation must survive compaction+restart");
+        assert_eq!(out[0].relation_type, "cites");
+
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // Concurrent ingests into the same collection: all chunks visible, all ids
+    // unique, no lost writes (stresses the lock drop/reacquire window).
+    #[tokio::test]
+    async fn concurrent_ingests_same_collection() {
+        let embed = std::sync::Arc::new(embed_state());
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m = CollectionManager::new_with_storage(&data_dir, storage.clone())
+            .await
+            .unwrap();
+        m.create_collection("conc", None, Some(4), None)
+            .await
+            .unwrap();
+
+        let n = 12usize;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let m2 = m.clone();
+            let e2 = embed.clone();
+            handles.push(tokio::spawn(async move {
+                m2.ingest("conc", vec![ingest_chunk(i as u32)], &e2).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // All N chunks present, ids 0..N unique (no collision from the lock gap).
+        let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "conc")
+            .await
+            .unwrap();
+        let mat = cloud::materialize(storage.as_ref(), "conc", &man)
+            .await
+            .unwrap();
+        assert_eq!(mat.chunks.len(), n, "all concurrent ingests durable");
+        let ids: std::collections::HashSet<u64> = mat.chunks.keys().copied().collect();
+        assert_eq!(ids.len(), n, "no duplicate/lost ids");
+        assert_eq!(ids, (0..n as u64).collect());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // next_id must NEVER regress across compaction + cold restart. Compaction
+    // physically drops tombstoned chunks; without the segment's stored max_id
+    // high-water mark, a fresh-disk rebuild would recompute next_id from the
+    // live set only and REUSE the deleted ids for new chunks.
+    #[tokio::test]
+    async fn no_id_reuse_after_compaction_and_cold_restart() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir_a = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_a).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir_a, storage)
+                .await
+                .unwrap();
+            m.create_collection("idreuse", None, Some(4), None)
+                .await
+                .unwrap();
+            // ids 0..3; delete the two HIGHEST, then compact them away.
+            m.ingest("idreuse", (0..4u32).map(ingest_chunk).collect(), &embed)
+                .await
+                .unwrap();
+            m.delete_chunks("idreuse", &[2, 3]).await.unwrap();
+            m.compact_collection("idreuse").await.unwrap();
+        }
+        // Node loss: wipe local disk, cold-rebuild from S3 (max live id is 1).
+        std::fs::remove_dir_all(&data_dir_a).unwrap();
+        let data_dir_b = unique_data_dir();
+        std::fs::create_dir_all(&data_dir_b).unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir_b, storage.clone())
+            .await
+            .unwrap();
+
+        // A new ingest must get a FRESH id (4), not reuse deleted id 2.
+        m2.ingest("idreuse", vec![ingest_chunk(9)], &embed)
+            .await
+            .unwrap();
+        let (man, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "idreuse")
+            .await
+            .unwrap();
+        let mat = cloud::materialize(storage.as_ref(), "idreuse", &man)
+            .await
+            .unwrap();
+        assert!(
+            mat.chunks.contains_key(&4),
+            "new chunk must take id 4 (one past the pre-compaction high-water), got ids {:?}",
+            mat.chunks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !mat.chunks.contains_key(&2) && !mat.chunks.contains_key(&3),
+            "deleted ids must not be reused"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir_b);
+    }
+
+    // PERSISTENT-DISK restart path (the one the adversarial review flagged):
+    // in cloud mode, a node restarting with its local disk intact runs
+    // `load_collection` (rehydrate from redb) and SKIPS rebuild-from-S3 for
+    // already-loaded collections. A chunk tombstoned locally (redb) — which is
+    // exactly what delete AND the ingest-compensation path write — must stay
+    // masked after that restart, even though it's still physically in redb.
+    #[tokio::test]
+    async fn persistent_disk_restart_honors_local_tombstones() {
+        let embed = embed_state();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        {
+            let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+                store.clone(),
+                "object-store:memory",
+            ));
+            let m = CollectionManager::new_with_storage(&data_dir, storage)
+                .await
+                .unwrap();
+            m.create_collection("pdisk", None, Some(4), None)
+                .await
+                .unwrap();
+            m.ingest(
+                "pdisk",
+                vec![ingest_chunk(0), ingest_chunk(1), ingest_chunk(2)],
+                &embed,
+            )
+            .await
+            .unwrap();
+            // Writes the redb tombstone + RAM tombstone + S3 tombstone — the
+            // same three places the ingest-compensation path writes.
+            assert_eq!(m.delete_chunks("pdisk", &[1]).await.unwrap(), 1);
+        }
+
+        // Restart with the SAME data_dir (persistent disk — NOT wiped). This
+        // takes the load_collection-first, skip-cloud-rebuild path.
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::from_store(
+            store.clone(),
+            "object-store:memory",
+        ));
+        let m2 = CollectionManager::new_with_storage(&data_dir, storage)
+            .await
+            .unwrap();
+
+        let req = SearchRequest {
+            query: "chunk".to_string(),
+            mode: "semantic".to_string(),
+            vector_space: None,
+            top_k: 20,
+            query_vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
+            filters: HashMap::new(),
+            score_weights: None,
+            recency: None,
+            recency_preset: None,
+            recency_field: None,
+            boosts: Vec::new(),
+            relationship_boost: None,
+            explain: false,
+            include_relations: false,
+            relation_types: None,
+            relation_direction: RelationDirection::Outgoing,
+        };
+        let (hits, _, _, _) = m2.search("pdisk", &req, &embed).await.unwrap();
+        let hit_ids: std::collections::HashSet<u64> =
+            hits.iter().map(|(c, _, _, _, _)| c.id).collect();
+        assert!(
+            !hit_ids.contains(&1),
+            "tombstoned chunk must stay masked after persistent-disk restart"
+        );
+        assert!(
+            hit_ids.contains(&0) && hit_ids.contains(&2),
+            "live chunks must survive, got {:?}",
+            hit_ids
+        );
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -147,14 +147,13 @@ pub fn init_candle_bge(model_dir: &Path) -> Option<ThreadSafeBgeEmbedder> {
 
     // Load model weights from safetensors (always FP32 to avoid dtype mismatches in layer norms)
     let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[weights_path.to_str().unwrap()], DType::F32, &device)
-            .ok()?
+        VarBuilder::from_mmaped_safetensors(&[weights_path.to_str()?], DType::F32, &device).ok()?
     };
 
     let model = BertModel::load(vb, &config).ok()?;
 
     // Load tokenizer
-    let tokenizer = Tokenizer::from_file(tokenizer_path.to_str().unwrap()).ok()?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path.to_str()?).ok()?;
 
     tracing::info!(
         "BGE-small loaded in {:.3}s",

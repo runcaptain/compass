@@ -38,12 +38,15 @@ pub async fn search_collection(
 
     let hits: Vec<SearchHit> = results
         .into_iter()
-        .map(|(chunk, score, source, parent_metadata)| SearchHit {
-            chunk,
-            score,
-            source,
-            parent_metadata,
-        })
+        .map(
+            |(chunk, score, source, parent_metadata, relations)| SearchHit {
+                chunk,
+                score,
+                source,
+                parent_metadata,
+                relations,
+            },
+        )
         .collect();
 
     Ok(Json(SearchResponse {

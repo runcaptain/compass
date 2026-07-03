@@ -9,6 +9,10 @@ use std::path::Path;
 use std::time::Duration;
 
 const CHUNKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("chunks");
+/// Soft-delete tombstones: presence of a chunk id here means it's deleted.
+/// Value is an unused marker byte. Kept in the same redb file as chunks so a
+/// delete + its durability share the collection's storage lifecycle.
+const TOMBSTONES_TABLE: TableDefinition<u64, u8> = TableDefinition::new("tombstones");
 
 /// Max attempts to acquire the redb flock during open. 6 attempts at
 /// OPEN_RETRY_BACKOFF gives a total upper bound of about 30 seconds before
@@ -62,9 +66,38 @@ impl ChunkStore {
         {
             let txn = db.begin_write()?;
             let _ = txn.open_table(CHUNKS_TABLE)?;
+            let _ = txn.open_table(TOMBSTONES_TABLE)?;
             txn.commit()?;
         }
         Ok(Self { db })
+    }
+
+    /// Mark a batch of chunk ids as deleted (soft delete). Idempotent.
+    pub fn tombstone_batch(
+        &self,
+        ids: &[u64],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(TOMBSTONES_TABLE)?;
+            for &id in ids {
+                table.insert(id, 1u8)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Load all tombstoned ids (for rehydrating the in-memory set on startup).
+    pub fn load_tombstones(&self) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TOMBSTONES_TABLE)?;
+        let mut ids = Vec::new();
+        for entry in table.iter()? {
+            let (k, _) = entry?;
+            ids.push(k.value());
+        }
+        Ok(ids)
     }
 
     pub fn get(
