@@ -18,6 +18,7 @@ pub mod store;
 use crate::embed::EmbedState;
 use crate::models::*;
 use crate::scoring::{self, ScoredCandidate};
+use crate::search::chunk_cache::ChunkCache;
 use crate::search::chunk_store::ChunkStore;
 use crate::search::filter_index::{selectivity, FilterIndex};
 use crate::search::filter_pushdown::FilterExpr;
@@ -116,13 +117,11 @@ struct LoadedCollection {
     vector_spaces: HashMap<String, Arc<VectorState>>,
     /// Document relationships (parent-child + sibling groups)
     relationships: RelationshipStore,
-    /// All chunks in memory, keyed by chunk ID for O(1) retrieval. This is a
-    /// hot cache; the disk source of truth is `chunk_store`. Populated on
-    /// startup from `chunk_store.for_each` and kept in sync on every ingest.
-    chunks: HashMap<u64, DocumentChunk>,
-    /// Disk-backed chunk metadata. Every ingest writes through to this redb
-    /// database so chunks survive process restarts and crashes.
-    chunk_store: ChunkStore,
+    /// Bounded read-through cache over the disk-backed chunk store. Chunks
+    /// are NOT held wholesale in RAM anymore — serving memory is O(cache
+    /// budget), not O(collection). Existence checks go through the filter
+    /// index universe (live ids as a treemap).
+    chunk_store: ChunkCache,
     /// Disk-backed typed many-to-many chunk relations. Source of truth on disk;
     /// read on demand at search time (never rehydrated into RAM).
     relation_store: RelationStore,
@@ -438,16 +437,22 @@ impl CollectionManager {
         if let Some(parent) = chunks_db.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let chunk_store = ChunkStore::open(&chunks_db)?;
-        let mut chunks: HashMap<u64, DocumentChunk> = HashMap::new();
+        let chunk_store = ChunkCache::new(ChunkStore::open(&chunks_db)?);
         let mut max_seen_id: u64 = 0;
+        let mut rehydrated_count: usize = 0;
+        let mut filter_index = FilterIndex::new();
+        let tombstones_vec = chunk_store.load_tombstones()?;
+        let tombstones: std::collections::HashSet<u64> = tombstones_vec.into_iter().collect();
         chunk_store.for_each(|id, chunk| {
             if id >= max_seen_id {
                 max_seen_id = id;
             }
-            chunks.insert(id, chunk);
+            rehydrated_count += 1;
+            if !tombstones.contains(&id) {
+                filter_index.insert(id, &filter_meta(&chunk));
+            }
         })?;
-        let rehydrated_count = chunks.len();
+        filter_index.finalize();
         // next_id is a MONOTONIC high-water mark that must never regress or reuse
         // an id. Take the max of: the persisted metadata.next_id (survives even
         // when the local chunk store is empty on a cold restart), and one past
@@ -462,9 +467,6 @@ impl CollectionManager {
         let next_id = metadata.next_id.max(from_disk).max(metadata.chunk_count);
 
         let chunk_count = metadata.chunk_count;
-        let tombstones: std::collections::HashSet<u64> =
-            chunk_store.load_tombstones()?.into_iter().collect();
-        let filter_index = build_filter_index_from_chunks(&chunks, &tombstones);
         let relations_db = store::relations_db_path(&self.data_dir, name);
         let relation_store = RelationStore::open(&relations_db)?;
         let loaded = LoadedCollection {
@@ -480,7 +482,6 @@ impl CollectionManager {
             fts,
             vector_spaces,
             relationships,
-            chunks,
             chunk_store,
             relation_store,
             tombstones,
@@ -581,7 +582,7 @@ impl CollectionManager {
             if let Some(parent) = chunks_db.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let chunk_store = ChunkStore::open(&chunks_db)?;
+            let chunk_store = ChunkCache::new(ChunkStore::open(&chunks_db)?);
             let relations_db = store::relations_db_path(&self.data_dir, name);
             let relation_store = RelationStore::open(&relations_db)?;
 
@@ -594,7 +595,6 @@ impl CollectionManager {
                 fts,
                 vector_spaces: vs_map,
                 relationships: RelationshipStore::new(),
-                chunks: HashMap::new(),
                 chunk_store,
                 relation_store,
                 tombstones: std::collections::HashSet::new(),
@@ -1582,7 +1582,7 @@ impl CollectionManager {
                 }
                 for id in &assigned_ids {
                     loaded.tombstones.insert(*id);
-                    if let Some(c) = loaded.chunks.remove(id) {
+                    if let Ok(Some(c)) = loaded.chunk_store.get(*id) {
                         loaded.filter_index.remove(*id, &filter_meta(&c));
                     }
                 }
@@ -1631,9 +1631,6 @@ impl CollectionManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (id, parent_id, group_id) in rel_adds {
             loaded.relationships.add(id, parent_id, group_id);
-        }
-        for chunk in chunks {
-            loaded.chunks.insert(chunk.id, chunk.clone());
         }
 
         // Phase 3b: Persist chunks to the disk-backed store BEFORE updating
@@ -2073,14 +2070,13 @@ impl CollectionManager {
             recency_config.is_some() || !req.boosts.is_empty() || req.relationship_boost.is_some();
 
         if has_scoring && !candidates.is_empty() {
-            let chunk_metadata: HashMap<u64, HashMap<String, MetadataValue>> = candidates
-                .iter()
-                .filter_map(|c| {
-                    loaded
-                        .chunks
-                        .get(&c.chunk_id)
-                        .map(|chunk| (c.chunk_id, chunk.metadata.clone()))
-                })
+            let candidate_ids: Vec<u64> = candidates.iter().map(|c| c.chunk_id).collect();
+            let chunk_metadata: HashMap<u64, HashMap<String, MetadataValue>> = loaded
+                .chunk_store
+                .get_batch(&candidate_ids)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|chunk| (chunk.id, chunk.metadata.clone()))
                 .collect();
 
             let candidate_ids: Vec<u64> = candidates.iter().map(|c| c.chunk_id).collect();
@@ -2108,7 +2104,8 @@ impl CollectionManager {
         // segments sharing the same parent_id pay for one HashMap lookup,
         // not N. No additional I/O; the chunk map is already in memory.
         let candidate_chunk_ids: Vec<u64> = candidates.iter().map(|c| c.chunk_id).collect();
-        let parent_meta_cache = build_parent_metadata_cache(&candidate_chunk_ids, &loaded.chunks);
+        let parent_meta_cache =
+            build_parent_metadata_cache(&candidate_chunk_ids, &loaded.chunk_store);
 
         // ── Step 5b: Relation enrichment (opt-in) ───────────────────────
         // When include_relations is set, fetch each hit's edges in ONE batched,
@@ -2125,9 +2122,7 @@ impl CollectionManager {
             )?;
             for edges in relations_by_chunk.values_mut() {
                 for edge in edges.iter_mut() {
-                    edge.target_status = if loaded.chunks.contains_key(&edge.target_chunk_id)
-                        && !loaded.tombstones.contains(&edge.target_chunk_id)
-                    {
+                    edge.target_status = if loaded.filter_index.contains(edge.target_chunk_id) {
                         "found".to_string()
                     } else {
                         "missing".to_string()
@@ -2145,28 +2140,33 @@ impl CollectionManager {
         )> = candidates
             .iter()
             .filter_map(|c| {
-                loaded.chunks.get(&c.chunk_id).map(|chunk| {
-                    let parent_metadata = parent_metadata_for(chunk, &parent_meta_cache);
-                    // Some(vec) when requested (possibly empty), None when not —
-                    // mirrors the parent_metadata Option discipline.
-                    let relations = if req.include_relations {
-                        Some(
-                            relations_by_chunk
-                                .get(&c.chunk_id)
-                                .cloned()
-                                .unwrap_or_default(),
+                loaded
+                    .chunk_store
+                    .get(c.chunk_id)
+                    .ok()
+                    .flatten()
+                    .map(|chunk| {
+                        let parent_metadata = parent_metadata_for(&chunk, &parent_meta_cache);
+                        // Some(vec) when requested (possibly empty), None when not —
+                        // mirrors the parent_metadata Option discipline.
+                        let relations = if req.include_relations {
+                            Some(
+                                relations_by_chunk
+                                    .get(&c.chunk_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        } else {
+                            None
+                        };
+                        (
+                            chunk.clone(),
+                            c.final_score,
+                            c.source.clone(),
+                            parent_metadata,
+                            relations,
                         )
-                    } else {
-                        None
-                    };
-                    (
-                        chunk.clone(),
-                        c.final_score,
-                        c.source.clone(),
-                        parent_metadata,
-                        relations,
-                    )
-                })
+                    })
             })
             .collect();
 
@@ -2259,9 +2259,7 @@ impl CollectionManager {
                     target_chunk_id: r.target_chunk_id,
                     target_document_id: r.target_document_id,
                     relation_type: r.relation_type,
-                    target_status: if loaded.chunks.contains_key(&r.target_chunk_id)
-                        && !loaded.tombstones.contains(&r.target_chunk_id)
-                    {
+                    target_status: if loaded.filter_index.contains(r.target_chunk_id) {
                         "found".to_string()
                     } else {
                         "missing".to_string()
@@ -2425,9 +2423,7 @@ impl CollectionManager {
             .relation_store
             .for_chunk(chunk_id, direction, types)?;
         for edge in edges.iter_mut() {
-            edge.target_status = if loaded.chunks.contains_key(&edge.target_chunk_id)
-                && !loaded.tombstones.contains(&edge.target_chunk_id)
-            {
+            edge.target_status = if loaded.filter_index.contains(edge.target_chunk_id) {
                 "found".to_string()
             } else {
                 "missing".to_string()
@@ -2465,8 +2461,8 @@ impl CollectionManager {
         // Keep the filter index in step with the tombstones so `eligible` /
         // selectivity don't count deleted chunks — incrementally (O(batch)).
         for id in apply {
-            if let Some(c) = loaded.chunks.get(id) {
-                loaded.filter_index.remove(*id, &filter_meta(c));
+            if let Ok(Some(c)) = loaded.chunk_store.get(*id) {
+                loaded.filter_index.remove(*id, &filter_meta(&c));
             }
         }
         // Prune relations incident on the deleted chunks (F6: propagate errors;
@@ -2505,7 +2501,7 @@ impl CollectionManager {
                 'chunk: for c in chunks {
                     // Idempotent replay: skip ids already present so
                     // chunk_count can't double-count.
-                    if loaded.chunks.contains_key(&c.id) {
+                    if loaded.filter_index.contains(c.id) || loaded.tombstones.contains(&c.id) {
                         continue;
                     }
                     for (space, emb) in &c.embeddings {
@@ -2561,7 +2557,7 @@ impl CollectionManager {
                 let ids: Vec<u64> = serde_json::from_slice(payload)?;
                 let apply: Vec<u64> = ids
                     .into_iter()
-                    .filter(|id| loaded.chunks.contains_key(id) && !loaded.tombstones.contains(id))
+                    .filter(|id| loaded.filter_index.contains(*id))
                     .collect();
                 if apply.is_empty() {
                     return Ok(());
@@ -2963,11 +2959,7 @@ impl CollectionManager {
             let mut seen = std::collections::HashSet::new();
             ids.iter()
                 .copied()
-                .filter(|id| {
-                    seen.insert(*id)
-                        && loaded.chunks.contains_key(id)
-                        && !loaded.tombstones.contains(id)
-                })
+                .filter(|id| seen.insert(*id) && loaded.filter_index.contains(*id))
                 .collect()
         }; // read lock released here.
         if newly.is_empty() {
@@ -3014,7 +3006,7 @@ impl CollectionManager {
         let apply: Vec<u64> = newly
             .iter()
             .copied()
-            .filter(|id| loaded.chunks.contains_key(id) && !loaded.tombstones.contains(id))
+            .filter(|id| loaded.filter_index.contains(*id))
             .collect();
         if apply.is_empty() {
             return Ok((0, appended_seq));
@@ -3065,13 +3057,13 @@ impl CollectionManager {
             let loaded = collections
                 .get(collection_name)
                 .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
-            loaded
-                .chunks
-                .values()
-                .filter(|c| !loaded.tombstones.contains(&c.id))
-                .filter(|c| crate::filter::matches_filters(c, filters))
-                .map(|c| c.id)
-                .collect()
+            let mut ids: Vec<u64> = Vec::new();
+            loaded.chunk_store.for_each(|id, c| {
+                if !loaded.tombstones.contains(&id) && crate::filter::matches_filters(&c, filters) {
+                    ids.push(id);
+                }
+            })?;
+            ids
         };
         if ids.is_empty() {
             return Ok((0, None));
@@ -3226,7 +3218,7 @@ impl CollectionManager {
             std::fs::create_dir_all(parent)?;
         }
         let _ = std::fs::remove_file(&chunks_db);
-        let chunk_store = ChunkStore::open(&chunks_db)?;
+        let chunk_store = ChunkCache::new(ChunkStore::open(&chunks_db)?);
         let to_persist: Vec<(u64, DocumentChunk)> =
             chunks.iter().map(|c| (c.id, c.clone())).collect();
         chunk_store.insert_batch(&to_persist)?;
@@ -3258,11 +3250,13 @@ impl CollectionManager {
         for c in &chunks {
             relationships.add(c.id, c.parent_id, c.group_id.clone());
         }
-        let chunk_map: HashMap<u64, DocumentChunk> =
-            chunks.iter().map(|c| (c.id, c.clone())).collect();
-        // Materialized state is already live-only (tombstones applied on replay).
-        let filter_index =
-            build_filter_index_from_chunks(&chunk_map, &std::collections::HashSet::new());
+        // Materialized state is already live-only (tombstones applied on
+        // replay); build the index streaming, no full map in RAM.
+        let mut filter_index = FilterIndex::new();
+        for c in &chunks {
+            filter_index.insert(c.id, &filter_meta(c));
+        }
+        filter_index.finalize();
 
         // Reconstruct the typed-relation store from the materialized relations
         // (recovered from the S3 WAL/segments) — so relations survive a cold
@@ -3286,7 +3280,6 @@ impl CollectionManager {
             fts,
             vector_spaces: vs_map,
             relationships,
-            chunks: chunk_map,
             chunk_store,
             relation_store,
             tombstones: std::collections::HashSet::new(),
@@ -3334,10 +3327,12 @@ impl CollectionManager {
 
         let mut texts = Vec::new();
         let mut ids = Vec::new();
-        for (&id, chunk) in &loaded.chunks {
-            ids.push(id);
-            texts.push(chunk.text.clone());
-        }
+        loaded.chunk_store.for_each(|id, chunk| {
+            if !loaded.tombstones.contains(&id) {
+                ids.push(id);
+                texts.push(chunk.text);
+            }
+        })?;
         Ok((texts, ids))
     }
 
@@ -3363,15 +3358,17 @@ impl CollectionManager {
             .get(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
 
-        let mut results: Vec<DocumentChunk> = loaded
-            .chunks
-            .values()
-            .filter(|c| !loaded.tombstones.contains(&c.id))
-            .filter(|c| c.doc_type == "segment")
-            .filter(|c| c.group_id.as_deref() == Some(asset))
-            .filter(|c| segment_in_time_window(c, time_ms, time_start_ms, time_end_ms))
-            .cloned()
-            .collect();
+        let mut collected: Vec<DocumentChunk> = Vec::new();
+        loaded.chunk_store.for_each(|id, c| {
+            if !loaded.tombstones.contains(&id)
+                && c.doc_type == "segment"
+                && c.group_id.as_deref() == Some(asset)
+                && segment_in_time_window(&c, time_ms, time_start_ms, time_end_ms)
+            {
+                collected.push(c);
+            }
+        })?;
+        let mut results: Vec<DocumentChunk> = collected.into_iter().collect();
 
         // Sort ascending by timerange_start_ms. Segments missing the metadata
         // sort to the end (f64::INFINITY) instead of position 0, so callers
@@ -3806,11 +3803,11 @@ pub(crate) fn build_filter_index_from_chunks(
 /// from "parent exists with empty metadata."
 pub(crate) fn build_parent_metadata_cache(
     candidate_chunk_ids: &[u64],
-    chunks: &HashMap<u64, DocumentChunk>,
+    chunks: &ChunkCache,
 ) -> HashMap<u64, HashMap<String, MetadataValue>> {
     let mut cache: HashMap<u64, HashMap<String, MetadataValue>> = HashMap::new();
     for cid in candidate_chunk_ids {
-        let Some(chunk) = chunks.get(cid) else {
+        let Ok(Some(chunk)) = chunks.get(*cid) else {
             continue;
         };
         if chunk.doc_type != "segment" {
@@ -3824,7 +3821,7 @@ pub(crate) fn build_parent_metadata_cache(
         }
         // Only cache parents that actually exist. Missing parents stay out
         // of the cache so `parent_metadata_for` returns None for them.
-        if let Some(parent) = chunks.get(&pid) {
+        if let Ok(Some(parent)) = chunks.get(pid) {
             cache.insert(pid, parent.metadata.clone());
         }
     }
@@ -3886,8 +3883,20 @@ mod parent_metadata_tests {
         }
     }
 
-    fn into_map(chunks: Vec<DocumentChunk>) -> HashMap<u64, DocumentChunk> {
-        chunks.into_iter().map(|c| (c.id, c)).collect()
+    fn into_map(chunks: Vec<DocumentChunk>) -> ChunkCache {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "compass_pmc_{}_{}.redb",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&p);
+        let cache = ChunkCache::new(ChunkStore::open(&p).unwrap());
+        let batch: Vec<(u64, DocumentChunk)> = chunks.into_iter().map(|c| (c.id, c)).collect();
+        cache.insert_batch(&batch).unwrap();
+        cache
     }
 
     #[test]
@@ -3897,7 +3906,7 @@ mod parent_metadata_tests {
             segment(2, Some(1)),
         ]);
         let cache = build_parent_metadata_cache(&[2], &chunks);
-        let meta = parent_metadata_for(chunks.get(&2).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(2).unwrap().unwrap(), &cache);
         assert_eq!(
             meta.unwrap().get("title"),
             Some(&MetadataValue::String("Keynote".to_string()))
@@ -3908,7 +3917,7 @@ mod parent_metadata_tests {
     fn source_hit_gets_none() {
         let chunks = into_map(vec![source_with_meta(1, "title", "Keynote")]);
         let cache = build_parent_metadata_cache(&[1], &chunks);
-        let meta = parent_metadata_for(chunks.get(&1).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(1).unwrap().unwrap(), &cache);
         assert!(meta.is_none());
     }
 
@@ -3916,7 +3925,7 @@ mod parent_metadata_tests {
     fn segment_without_parent_gets_none() {
         let chunks = into_map(vec![segment(2, None)]);
         let cache = build_parent_metadata_cache(&[2], &chunks);
-        let meta = parent_metadata_for(chunks.get(&2).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(2).unwrap().unwrap(), &cache);
         assert!(meta.is_none());
     }
 
@@ -3939,7 +3948,7 @@ mod parent_metadata_tests {
         assert!(cache.contains_key(&10));
         // All three segments resolve to the same parent metadata.
         for cid in [11, 12, 13] {
-            let meta = parent_metadata_for(chunks.get(&cid).unwrap(), &cache);
+            let meta = parent_metadata_for(&chunks.get(cid).unwrap().unwrap(), &cache);
             assert_eq!(
                 meta.unwrap().get("source_id"),
                 Some(&MetadataValue::String("src-001".to_string()))
@@ -3956,7 +3965,7 @@ mod parent_metadata_tests {
         let chunks = into_map(vec![segment(5, Some(99))]);
         let cache = build_parent_metadata_cache(&[5], &chunks);
         assert!(!cache.contains_key(&99), "orphan parent must not be cached");
-        let meta = parent_metadata_for(chunks.get(&5).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(5).unwrap().unwrap(), &cache);
         assert!(meta.is_none(), "orphan segment must yield None");
     }
 
@@ -3980,7 +3989,7 @@ mod parent_metadata_tests {
         };
         let chunks = into_map(vec![parent_no_meta, segment(21, Some(20))]);
         let cache = build_parent_metadata_cache(&[21], &chunks);
-        let meta = parent_metadata_for(chunks.get(&21).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(21).unwrap().unwrap(), &cache);
         assert!(meta.is_some());
         assert!(meta.unwrap().is_empty());
     }
@@ -3997,7 +4006,7 @@ mod parent_metadata_tests {
         // Build cache against an empty candidate list, then look up segment 2.
         let cache = build_parent_metadata_cache(&[], &chunks);
         assert!(cache.is_empty());
-        let meta = parent_metadata_for(chunks.get(&2).unwrap(), &cache);
+        let meta = parent_metadata_for(&chunks.get(2).unwrap().unwrap(), &cache);
         assert!(meta.is_none());
     }
 }

@@ -92,6 +92,13 @@ impl FilterIndex {
         self.universe.is_empty()
     }
 
+    /// Is this id live (inserted and not removed)? The universe excludes
+    /// tombstoned ids on every maintenance path, so this doubles as the
+    /// existence check now that chunks are not held in RAM.
+    pub fn contains(&self, id: u64) -> bool {
+        self.universe.contains(id)
+    }
+
     /// Insert a single chunk with its metadata. `chunk_id` is the full u64
     /// `DocumentChunk::id`; the treemap covers the entire id space, so there is
     /// no cap and no chunk is ever dropped for having a large id.

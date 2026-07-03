@@ -113,6 +113,21 @@ impl ChunkCache {
         Ok(())
     }
 
+    /// Tombstone passthrough (evicts tombstoned ids from the cache too).
+    pub fn tombstone_batch(&self, ids: &[u64]) -> Result<(), BoxErr> {
+        self.store.tombstone_batch(ids)?;
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            cache.pop(id);
+        }
+        Ok(())
+    }
+
+    /// Load persisted tombstones (passthrough).
+    pub fn load_tombstones(&self) -> Result<Vec<u64>, BoxErr> {
+        self.store.load_tombstones()
+    }
+
     /// Number of chunks durably stored (not the cache size).
     pub fn count(&self) -> Result<u64, BoxErr> {
         self.store.count()
