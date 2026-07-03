@@ -150,6 +150,16 @@ async fn commit_manifest(
     }
 }
 
+/// Create-only commit of an EMPTY manifest for a new namespace, making a
+/// zero-ingest collection discoverable (`list_namespaces` keys off
+/// `{ns}/manifest`). `AlreadyExists` bubbles up — it means the namespace
+/// already has data in the bucket (e.g. a pre-existing collection).
+pub async fn init_namespace(storage: &dyn Storage, ns: &str) -> Result<(), StorageError> {
+    commit_manifest(storage, ns, &Manifest::default(), &None)
+        .await
+        .map(|_| ())
+}
+
 /// Append a data WAL fragment. Returns the assigned sequence number.
 pub async fn append_fragment(
     storage: &dyn Storage,

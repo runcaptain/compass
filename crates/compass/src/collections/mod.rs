@@ -322,85 +322,135 @@ impl CollectionManager {
     ) -> Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
         validate_name_segment(name, "Collection")?;
 
-        let mut collections = self.collections.write().await;
-        if collections.contains_key(name) {
-            return Err(format!("Collection '{}' already exists", name).into());
+        let collection = {
+            let mut collections = self.collections.write().await;
+            if collections.contains_key(name) {
+                return Err(format!("Collection '{}' already exists", name).into());
+            }
+
+            // Build vector spaces config: use explicit spaces, or create a "default" space
+            let spaces = vector_spaces.unwrap_or_else(|| {
+                let dims = embedding_dims.unwrap_or(384);
+                let mut m = HashMap::new();
+                m.insert(
+                    "default".to_string(),
+                    VectorSpaceConfig {
+                        dims,
+                        model: "bge-small-en-v1.5".to_string(),
+                        status: "active".to_string(),
+                    },
+                );
+                m
+            });
+
+            let default_space = spaces.keys().next().cloned();
+            let dims = spaces.values().next().map(|s| s.dims).unwrap_or(384);
+
+            let collection = Collection {
+                name: name.to_string(),
+                created_at: Utc::now(),
+                vector_spaces: spaces,
+                default_vector_space: default_space,
+                embedding_dims: dims,
+                chunk_count: 0,
+                next_id: 0,
+                config: config.unwrap_or_default(),
+            };
+
+            store::save_metadata(&self.data_dir, &collection)?;
+
+            // Build empty FTS index
+            let tantivy_dir = store::tantivy_dir(&self.data_dir, name);
+            let fts = tantivy_fts::build_index(&tantivy_dir, &[], 0)?;
+
+            // Create empty vector spaces
+            let mut vs_map = HashMap::new();
+            for (sname, sconfig) in &collection.vector_spaces {
+                vs_map.insert(
+                    sname.clone(),
+                    Arc::new(VectorState {
+                        index: None,
+                        key_to_chunk_id: Vec::new(),
+                        mmap_vectors: None,
+                        vectors: Vec::new(),
+                        dims: sconfig.dims,
+                    }),
+                );
+            }
+
+            // Open the disk-backed chunk store for the new collection. Empty
+            // database file is created at <data_dir>/<name>/chunks.redb.
+            let chunks_db = store::chunks_db_path(&self.data_dir, name);
+            if let Some(parent) = chunks_db.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let chunk_store = ChunkStore::open(&chunks_db)?;
+            let relations_db = store::relations_db_path(&self.data_dir, name);
+            let relation_store = RelationStore::open(&relations_db)?;
+
+            let loaded = LoadedCollection {
+                metadata: collection.clone(),
+                fts,
+                vector_spaces: vs_map,
+                relationships: RelationshipStore::new(),
+                chunks: HashMap::new(),
+                chunk_store,
+                relation_store,
+                tombstones: std::collections::HashSet::new(),
+                next_id: 0,
+                filter_index: FilterIndex::new(),
+            };
+
+            collections.insert(name.to_string(), loaded);
+            collection
+        }; // write lock released — never hold it across S3 round-trips.
+
+        // Cloud mode: make the collection exist DURABLY in the bucket —
+        // create-only config object + empty manifest — so a zero-ingest
+        // collection is discoverable from a fresh disk and stateless writers
+        // can validate against its config. On any bucket failure, roll the
+        // local creation back so local and bucket state agree (= absent).
+        if self.cloud_mode {
+            let rollback_local = || async {
+                self.collections.write().await.remove(name);
+                let _ = store::delete_collection_data(&self.data_dir, name);
+            };
+            let bucket_cfg = cloud::BucketConfig::from_collection(&collection);
+            match cloud::write_bucket_config_if_absent(self.storage.as_ref(), name, &bucket_cfg)
+                .await
+            {
+                Ok(()) => {}
+                Err(crate::storage::StorageError::AlreadyExists(_)) => {
+                    rollback_local().await;
+                    return Err(
+                        format!("Collection '{}' already exists in object storage", name).into(),
+                    );
+                }
+                Err(e) => {
+                    rollback_local().await;
+                    return Err(format!("bucket config write failed: {e}").into());
+                }
+            }
+            match crate::storage::lsm::init_namespace(self.storage.as_ref(), name).await {
+                Ok(()) => {}
+                Err(crate::storage::StorageError::AlreadyExists(_)) => {
+                    // Data exists in the bucket without a config (pre-v0.4
+                    // namespace): this create collides with real data. Remove
+                    // the config we just wrote and refuse.
+                    let _ = self.storage.delete(&cloud::config_key(name)).await;
+                    rollback_local().await;
+                    return Err(
+                        format!("namespace '{}' already has data in object storage", name).into(),
+                    );
+                }
+                Err(e) => {
+                    let _ = self.storage.delete(&cloud::config_key(name)).await;
+                    rollback_local().await;
+                    return Err(format!("bucket manifest init failed: {e}").into());
+                }
+            }
         }
 
-        // Build vector spaces config: use explicit spaces, or create a "default" space
-        let spaces = vector_spaces.unwrap_or_else(|| {
-            let dims = embedding_dims.unwrap_or(384);
-            let mut m = HashMap::new();
-            m.insert(
-                "default".to_string(),
-                VectorSpaceConfig {
-                    dims,
-                    model: "bge-small-en-v1.5".to_string(),
-                    status: "active".to_string(),
-                },
-            );
-            m
-        });
-
-        let default_space = spaces.keys().next().cloned();
-        let dims = spaces.values().next().map(|s| s.dims).unwrap_or(384);
-
-        let collection = Collection {
-            name: name.to_string(),
-            created_at: Utc::now(),
-            vector_spaces: spaces,
-            default_vector_space: default_space,
-            embedding_dims: dims,
-            chunk_count: 0,
-            next_id: 0,
-            config: config.unwrap_or_default(),
-        };
-
-        store::save_metadata(&self.data_dir, &collection)?;
-
-        // Build empty FTS index
-        let tantivy_dir = store::tantivy_dir(&self.data_dir, name);
-        let fts = tantivy_fts::build_index(&tantivy_dir, &[], 0)?;
-
-        // Create empty vector spaces
-        let mut vs_map = HashMap::new();
-        for (sname, sconfig) in &collection.vector_spaces {
-            vs_map.insert(
-                sname.clone(),
-                Arc::new(VectorState {
-                    index: None,
-                    key_to_chunk_id: Vec::new(),
-                    mmap_vectors: None,
-                    vectors: Vec::new(),
-                    dims: sconfig.dims,
-                }),
-            );
-        }
-
-        // Open the disk-backed chunk store for the new collection. Empty
-        // database file is created at <data_dir>/<name>/chunks.redb.
-        let chunks_db = store::chunks_db_path(&self.data_dir, name);
-        if let Some(parent) = chunks_db.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let chunk_store = ChunkStore::open(&chunks_db)?;
-        let relations_db = store::relations_db_path(&self.data_dir, name);
-        let relation_store = RelationStore::open(&relations_db)?;
-
-        let loaded = LoadedCollection {
-            metadata: collection.clone(),
-            fts,
-            vector_spaces: vs_map,
-            relationships: RelationshipStore::new(),
-            chunks: HashMap::new(),
-            chunk_store,
-            relation_store,
-            tombstones: std::collections::HashSet::new(),
-            next_id: 0,
-            filter_index: FilterIndex::new(),
-        };
-
-        collections.insert(name.to_string(), loaded);
         tracing::info!("Created collection '{}'", name);
         Ok(collection)
     }
@@ -453,36 +503,64 @@ impl CollectionManager {
         // character set as collection names.
         validate_name_segment(space_name, "Vector space")?;
 
+        // Phase 1 (short read lock): preconditions only.
+        {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            if loaded.metadata.vector_spaces.contains_key(space_name) {
+                return Err(format!("Vector space '{}' already exists", space_name).into());
+            }
+        }
+
+        // Phase 2 (NO lock): bucket-first CAS — the bucket config is the source
+        // of truth in cloud mode; the mutate closure revalidates against the
+        // LATEST doc so a racing add loses cleanly.
+        if self.cloud_mode {
+            cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
+                if cfg.vector_spaces.contains_key(space_name) {
+                    return Err(format!("Vector space '{}' already exists", space_name).into());
+                }
+                cfg.vector_spaces.insert(
+                    space_name.to_string(),
+                    VectorSpaceConfig {
+                        dims,
+                        model: model.to_string(),
+                        status: "building".to_string(),
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+        }
+
+        // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
         let loaded = collections
             .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
-
-        if loaded.metadata.vector_spaces.contains_key(space_name) {
-            return Err(format!("Vector space '{}' already exists", space_name).into());
+        if !loaded.metadata.vector_spaces.contains_key(space_name) {
+            loaded.metadata.vector_spaces.insert(
+                space_name.to_string(),
+                VectorSpaceConfig {
+                    dims,
+                    model: model.to_string(),
+                    status: "building".to_string(),
+                },
+            );
+            loaded.vector_spaces.insert(
+                space_name.to_string(),
+                Arc::new(VectorState {
+                    index: None,
+                    key_to_chunk_id: Vec::new(),
+                    mmap_vectors: None,
+                    vectors: Vec::new(),
+                    dims,
+                }),
+            );
+            store::save_metadata(&self.data_dir, &loaded.metadata)?;
         }
-
-        loaded.metadata.vector_spaces.insert(
-            space_name.to_string(),
-            VectorSpaceConfig {
-                dims,
-                model: model.to_string(),
-                status: "building".to_string(),
-            },
-        );
-
-        loaded.vector_spaces.insert(
-            space_name.to_string(),
-            Arc::new(VectorState {
-                index: None,
-                key_to_chunk_id: Vec::new(),
-                mmap_vectors: None,
-                vectors: Vec::new(),
-                dims,
-            }),
-        );
-
-        store::save_metadata(&self.data_dir, &loaded.metadata)?;
         Ok(())
     }
 
@@ -496,16 +574,36 @@ impl CollectionManager {
         // `remove_file` calls below.
         validate_name_segment(space_name, "Vector space")?;
 
+        // Phase 1 (short read lock): preconditions.
+        {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            if loaded.metadata.default_vector_space.as_deref() == Some(space_name) {
+                return Err("Cannot delete the default vector space. Switch default first.".into());
+            }
+        }
+
+        // Phase 2 (NO lock): bucket-first CAS, revalidating against the latest doc.
+        if self.cloud_mode {
+            cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
+                if cfg.default_vector_space.as_deref() == Some(space_name) {
+                    return Err(
+                        "Cannot delete the default vector space. Switch default first.".into(),
+                    );
+                }
+                cfg.vector_spaces.remove(space_name);
+                Ok(())
+            })
+            .await?;
+        }
+
+        // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
         let loaded = collections
             .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
-
-        // Don't delete the default vector space
-        if loaded.metadata.default_vector_space.as_deref() == Some(space_name) {
-            return Err("Cannot delete the default vector space. Switch default first.".into());
-        }
-
         loaded.metadata.vector_spaces.remove(space_name);
         loaded.vector_spaces.remove(space_name);
 
@@ -525,15 +623,34 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 1 (short read lock): preconditions.
+        {
+            let collections = self.collections.read().await;
+            let loaded = collections
+                .get(collection_name)
+                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            if !loaded.metadata.vector_spaces.contains_key(space_name) {
+                return Err(format!("Vector space '{}' not found", space_name).into());
+            }
+        }
+
+        // Phase 2 (NO lock): bucket-first CAS.
+        if self.cloud_mode {
+            cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
+                if !cfg.vector_spaces.contains_key(space_name) {
+                    return Err(format!("Vector space '{}' not found", space_name).into());
+                }
+                cfg.default_vector_space = Some(space_name.to_string());
+                Ok(())
+            })
+            .await?;
+        }
+
+        // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
         let loaded = collections
             .get_mut(collection_name)
             .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
-
-        if !loaded.metadata.vector_spaces.contains_key(space_name) {
-            return Err(format!("Vector space '{}' not found", space_name).into());
-        }
-
         loaded.metadata.default_vector_space = Some(space_name.to_string());
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
         Ok(())
@@ -546,6 +663,17 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Bucket-first status flip (NO lock during the CAS).
+        if self.cloud_mode {
+            cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
+                if let Some(space) = cfg.vector_spaces.get_mut(space_name) {
+                    space.status = "active".to_string();
+                }
+                Ok(())
+            })
+            .await?;
+        }
+
         let mut collections = self.collections.write().await;
         let loaded = collections
             .get_mut(collection_name)
@@ -1682,31 +1810,55 @@ impl CollectionManager {
         let chunks: Vec<DocumentChunk> = materialized.chunks.values().cloned().collect();
         let live_count = chunks.len();
 
-        // Infer vector-space config from the recovered chunks' embeddings.
-        let mut vector_spaces: HashMap<String, VectorSpaceConfig> = HashMap::new();
-        for c in &chunks {
-            for (space, emb) in &c.embeddings {
-                vector_spaces
-                    .entry(space.clone())
-                    .or_insert(VectorSpaceConfig {
-                        dims: emb.len(),
-                        model: "recovered".to_string(),
-                        status: "active".to_string(),
-                    });
+        // Collection config: the bucket `{ns}/collection.json` is authoritative
+        // (carries the user's real vector-space specs, created_at, and
+        // CollectionConfig — the old inference fabricated all three and lost
+        // `embed_model`). Fall back to inference only for pre-v0.4 namespaces,
+        // and back-fill the bucket config so the fallback runs at most once.
+        let bucket_cfg = cloud::read_bucket_config(self.storage.as_ref(), collection_name).await?;
+        let (vector_spaces, default_space, dims, created_at, coll_config) = match &bucket_cfg {
+            Some(cfg) => (
+                cfg.vector_spaces.clone(),
+                cfg.default_vector_space.clone(),
+                cfg.embedding_dims,
+                cfg.created_at,
+                cfg.config.clone(),
+            ),
+            None => {
+                // Legacy inference from recovered embeddings.
+                let mut vector_spaces: HashMap<String, VectorSpaceConfig> = HashMap::new();
+                for c in &chunks {
+                    for (space, emb) in &c.embeddings {
+                        vector_spaces
+                            .entry(space.clone())
+                            .or_insert(VectorSpaceConfig {
+                                dims: emb.len(),
+                                model: "recovered".to_string(),
+                                status: "active".to_string(),
+                            });
+                    }
+                }
+                if vector_spaces.is_empty() {
+                    vector_spaces.insert(
+                        "default".to_string(),
+                        VectorSpaceConfig {
+                            dims: 384,
+                            model: "recovered".to_string(),
+                            status: "active".to_string(),
+                        },
+                    );
+                }
+                let default_space = vector_spaces.keys().next().cloned();
+                let dims = vector_spaces.values().next().map(|s| s.dims).unwrap_or(384);
+                (
+                    vector_spaces,
+                    default_space,
+                    dims,
+                    Utc::now(),
+                    CollectionConfig::default(),
+                )
             }
-        }
-        if vector_spaces.is_empty() {
-            vector_spaces.insert(
-                "default".to_string(),
-                VectorSpaceConfig {
-                    dims: 384,
-                    model: "recovered".to_string(),
-                    status: "active".to_string(),
-                },
-            );
-        }
-        let default_space = vector_spaces.keys().next().cloned();
-        let dims = vector_spaces.values().next().map(|s| s.dims).unwrap_or(384);
+        };
         // next_id must never regress or reuse an id: one past the high-water
         // mark whenever ANY id was ever assigned (max_id covers tombstoned ids
         // via the WAL and the segment's stored max_id). The old
@@ -1720,15 +1872,35 @@ impl CollectionManager {
 
         let metadata = Collection {
             name: collection_name.to_string(),
-            created_at: Utc::now(),
+            created_at,
             vector_spaces: vector_spaces.clone(),
             default_vector_space: default_space.clone(),
             embedding_dims: dims,
             chunk_count: live_count as u64,
             next_id,
-            config: CollectionConfig::default(),
+            config: coll_config,
         };
         store::save_metadata(&self.data_dir, &metadata)?;
+        // Organic migration: back-fill the bucket config for pre-v0.4
+        // namespaces (create-only, race-safe; best-effort).
+        if bucket_cfg.is_none() {
+            let backfill = cloud::BucketConfig::from_collection(&metadata);
+            if let Err(e) = cloud::write_bucket_config_if_absent(
+                self.storage.as_ref(),
+                collection_name,
+                &backfill,
+            )
+            .await
+            {
+                if !matches!(e, crate::storage::StorageError::AlreadyExists(_)) {
+                    tracing::warn!(
+                        "bucket config back-fill for '{}' failed: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+        }
 
         // Build local stores from the materialized chunks. Start from a CLEAN
         // chunk store: S3 is the source of truth on recovery, so any pre-existing

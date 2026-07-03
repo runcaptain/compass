@@ -18,11 +18,115 @@
 //! A segment payload is a versioned JSON object `{chunks, relations}` — the full
 //! live set at compaction time.
 
-use crate::models::{ChunkRelation, DocumentChunk};
+use crate::models::{
+    ChunkRelation, Collection, CollectionConfig, DocumentChunk, VectorSpaceConfig,
+};
 use crate::storage::lsm::{self, FragmentKind, Manifest};
 use crate::storage::{Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Bucket-resident collection config — `{ns}/collection.json` in object
+/// storage. The durable source of truth for everything in [`Collection`]
+/// EXCEPT the node-local counters (`chunk_count`, `next_id`). Without it, a
+/// cold rebuild has to fabricate metadata (inferring vector-space specs from
+/// recovered embeddings and silently losing `CollectionConfig.embed_model`).
+///
+/// Distinct from the LOCAL file `data/{ns}/collection.json` (node cache);
+/// bucket writes are strictly gated on cloud mode so a local-disk Storage
+/// backend can never clobber the real local metadata file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketConfig {
+    #[serde(default)]
+    pub version: u8,
+    pub name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub vector_spaces: HashMap<String, VectorSpaceConfig>,
+    pub default_vector_space: Option<String>,
+    pub embedding_dims: usize,
+    #[serde(default)]
+    pub config: CollectionConfig,
+}
+
+const BUCKET_CONFIG_VERSION: u8 = 1;
+
+impl BucketConfig {
+    pub fn from_collection(c: &Collection) -> Self {
+        Self {
+            version: BUCKET_CONFIG_VERSION,
+            name: c.name.clone(),
+            created_at: c.created_at,
+            vector_spaces: c.vector_spaces.clone(),
+            default_vector_space: c.default_vector_space.clone(),
+            embedding_dims: c.embedding_dims,
+            config: c.config.clone(),
+        }
+    }
+}
+
+pub fn config_key(ns: &str) -> String {
+    format!("{ns}/collection.json")
+}
+
+/// Read the bucket config, or None when absent (pre-v0.4 collection).
+pub async fn read_bucket_config(
+    storage: &dyn Storage,
+    ns: &str,
+) -> Result<Option<BucketConfig>, StorageError> {
+    match storage.get(&config_key(ns)).await {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+            StorageError::Io(format!("bucket config decode for '{ns}': {e}"))
+        })?)),
+        Err(StorageError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create-only write of the bucket config. `AlreadyExists` bubbles up so the
+/// caller can distinguish "fresh create" from "collection already in bucket".
+pub async fn write_bucket_config_if_absent(
+    storage: &dyn Storage,
+    ns: &str,
+    cfg: &BucketConfig,
+) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(cfg)
+        .map_err(|e| StorageError::Io(format!("bucket config encode: {e}")))?;
+    storage
+        .put_if_not_exists(&config_key(ns), bytes::Bytes::from(bytes))
+        .await
+        .map(|_| ())
+}
+
+/// CAS read-modify-write on the bucket config. `mutate` sees the LATEST doc
+/// each attempt and may fail validation (e.g. "space already exists") — that
+/// error aborts the loop. Retries only on version conflicts.
+pub async fn cas_update_bucket_config<F>(
+    storage: &dyn Storage,
+    ns: &str,
+    mut mutate: F,
+) -> Result<BucketConfig, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut(&mut BucketConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+{
+    const MAX_RETRIES: u32 = 10;
+    for _ in 0..MAX_RETRIES {
+        let (bytes, version) = storage.get_versioned(&config_key(ns)).await?;
+        let mut cfg: BucketConfig = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::Io(format!("bucket config decode for '{ns}': {e}")))?;
+        mutate(&mut cfg)?;
+        let encoded = serde_json::to_vec(&cfg)
+            .map_err(|e| StorageError::Io(format!("bucket config encode: {e}")))?;
+        match storage
+            .put_if_match(&config_key(ns), bytes::Bytes::from(encoded), &version)
+            .await
+        {
+            Ok(_) => return Ok(cfg),
+            Err(StorageError::VersionConflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err("bucket config CAS failed after max retries (persistent contention)".into())
+}
 
 /// The live materialized state of a collection reconstructed from object storage.
 pub struct Materialized {
