@@ -153,13 +153,16 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
         // 64 MB body limit. Default 2 MB is too small for batched ingest with embeddings.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         // Backpressure: bound in-flight requests instead of queueing without
-        // limit (COMPASS_MAX_CONCURRENCY; unset = unlimited).
+        // limit (COMPASS_MAX_CONCURRENCY; unset = unlimited). The cap must stay
+        // under tokio's Semaphore::MAX_PERMITS (usize::MAX >> 3) — a larger
+        // value PANICS at startup.
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
             std::env::var("COMPASS_MAX_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|n: &usize| *n > 0)
-                .unwrap_or(usize::MAX / 2),
+                .unwrap_or(usize::MAX >> 4)
+                .min(usize::MAX >> 4),
         ))
         .with_state(state)
 }
@@ -168,7 +171,10 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
 /// operational counters plus per-collection gauges.
 async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> String {
     let mut gauges = String::new();
-    for c in state.manager.list_collections().await {
+    // Attached collections only: list_collections in lazy mode does one S3
+    // GET per registered namespace — an unauthenticated request-amplifier if
+    // exposed to a scraper.
+    for c in state.manager.attached_collections().await {
         gauges.push_str(&format!(
             "compass_collection_chunks{{collection=\"{}\"}} {}\n",
             c.name, c.chunk_count

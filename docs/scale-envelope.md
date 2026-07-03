@@ -15,7 +15,7 @@ runs meaningfully faster; treat these as conservative floors.
 | chunks | dims | ingest | cold attach | search (semantic, avg) |
 |---|---|---|---|---|
 | 250,000 | 128 | 156s (1,603 chunks/s) | 134.5s | 5.5ms |
-| 1,000,000 | 128 | (run in progress — see PR) | | |
+| 500,000 | 128 | 359s (1,392 chunks/s) | 369.3s | 11.2ms |
 
 ## What the envelope means
 
@@ -23,6 +23,11 @@ runs meaningfully faster; treat these as conservative floors.
   redb); segment format v2 + multipart removed the 5GB object ceiling;
   partitioned compaction is O(batch) per cycle; per-write index costs are
   O(batch). None of the previous hard walls bind below ~100M chunks.
+- **Merge and attach still need O(live set) RAM on the node doing them**
+  (the periodic full merge clones the live set to encode the merged segment;
+  attach materializes it). Steady-state serving RAM is bounded; the
+  compacting/attaching moment is not — budget worker memory for your largest
+  collection, or shard.
 - **The binding constraint is cold-attach time** (HNSW rebuild from the mmap
   file — roughly linear in collection size). Lazy attach + LRU keep this a
   first-request cost per namespace, not a boot cost, but a 100M-chunk

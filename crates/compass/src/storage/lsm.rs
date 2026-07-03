@@ -293,7 +293,7 @@ pub async fn read_uncompacted_fragments(
 /// MUST be readable. A missing fragment here is corruption — folding a subset
 /// and then advancing the watermark past the missing one would silently drop
 /// that batch. So we fail loudly instead of skipping.
-async fn read_uncompacted_fragments_strict(
+pub async fn read_uncompacted_fragments_strict(
     storage: &dyn Storage,
     ns: &str,
     manifest: &Manifest,

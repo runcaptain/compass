@@ -667,6 +667,13 @@ impl CollectionManager {
         Ok(collection)
     }
 
+    /// Metadata of ATTACHED collections only — no bucket round-trips (used
+    /// by /metrics; lazy-registered namespaces are intentionally excluded).
+    pub async fn attached_collections(&self) -> Vec<Collection> {
+        let collections = self.collections.read().await;
+        collections.values().map(|c| c.metadata.clone()).collect()
+    }
+
     pub async fn list_collections(&self) -> Vec<Collection> {
         let mut out: Vec<Collection> = {
             let collections = self.collections.read().await;
@@ -1750,6 +1757,25 @@ impl CollectionManager {
                                         format!("Failed to load USearch index: {}", e)
                                     })?;
                                 }
+                                // A prior batch may have errored after its
+                                // in-RAM adds but before a save: the on-disk
+                                // file is STALE (missing committed batches
+                                // whose vectors live in the mmap). Adding only
+                                // the new batch and saving would bake that
+                                // hole in permanently — heal from the mmap
+                                // first (rows idx.size()..base_key).
+                                if (idx.size() as usize) < base_key {
+                                    if let Some(m) = &vs.mmap_vectors {
+                                        let threads = 128.max(rayon::current_num_threads());
+                                        idx.reserve_capacity_and_threads(total, threads)
+                                            .map_err(|e| format!("Reserve failed: {}", e))?;
+                                        for i in (idx.size() as usize)..base_key.min(m.len()) {
+                                            idx.add(i as u64, m.get(i)).map_err(|e| {
+                                                format!("Failed to heal index: {}", e)
+                                            })?;
+                                        }
+                                    }
+                                }
                                 (idx, true)
                             }
                         };
@@ -2467,8 +2493,12 @@ impl CollectionManager {
         // Keep the filter index in step with the tombstones so `eligible` /
         // selectivity don't count deleted chunks — incrementally (O(batch)).
         for id in apply {
-            if let Ok(Some(c)) = loaded.chunk_store.get(*id) {
-                loaded.filter_index.remove(*id, &filter_meta(&c));
+            match loaded.chunk_store.get(*id) {
+                Ok(Some(c)) => loaded.filter_index.remove(*id, &filter_meta(&c)),
+                other => tracing::error!(
+                    "filter-index removal skipped for chunk {id}: {other:?} — universe may \
+                     overcount until re-attach (results stay correct via tombstone masking)"
+                ),
             }
         }
         // Prune relations incident on the deleted chunks (F6: propagate errors;
@@ -3649,6 +3679,7 @@ pub(crate) async fn compact_storage(
     const MAX_RETRIES: u32 = 10;
 
     // Phase 1: fold the WAL tail into an APPENDED segment (bounded work).
+    let mut folded_this_run = false;
     for _ in 0..MAX_RETRIES {
         let (manifest, version) = crate::storage::lsm::read_manifest(storage, ns).await?;
         let tail: Vec<_> = manifest.uncompacted().cloned().collect();
@@ -3656,7 +3687,10 @@ pub(crate) async fn compact_storage(
             break;
         }
         let folded_through = tail.iter().map(|f| f.seq).max().unwrap();
-        let frags = crate::storage::lsm::read_uncompacted_fragments(storage, ns, &manifest).await?;
+        // STRICT reads: folding advances the watermark past these fragments;
+        // a tolerated NotFound here would be silent data loss.
+        let frags =
+            crate::storage::lsm::read_uncompacted_fragments_strict(storage, ns, &manifest).await?;
         let segment = cloud::fold_tail(&frags)?;
         let records = segment.chunks.len() as u64;
         let bytes = cloud::encode_segment_v2(&segment)?;
@@ -3679,6 +3713,7 @@ pub(crate) async fn compact_storage(
                     folded_through,
                     records
                 );
+                folded_this_run = true;
                 break;
             }
             Err(crate::storage::StorageError::VersionConflict { .. }) => continue,
@@ -3687,6 +3722,13 @@ pub(crate) async fn compact_storage(
     }
 
     // Phase 2: merge segments when they pile up (the only O(live-set) step).
+    // NEVER in the same invocation as a fold: phase 1 staged the folded
+    // fragments for next-cycle GC, and an immediate merge would GC them out
+    // from under readers still holding the pre-fold manifest.
+    if folded_this_run {
+        let (manifest, _) = crate::storage::lsm::read_manifest(storage, ns).await?;
+        return Ok(manifest.segments.iter().map(|s| s.records).sum());
+    }
     for _ in 0..MAX_RETRIES {
         let (manifest, version) = crate::storage::lsm::read_manifest(storage, ns).await?;
         if manifest.segments.len() <= MERGE_SEGMENTS {
@@ -5345,16 +5387,20 @@ mod cloud_ingest_tests {
             m.ingest("gc", vec![ingest_chunk(i)], &embed).await.unwrap();
             m.compact_collection("gc").await.unwrap();
         }
-        // One more cycle so the merge's staged deletes are GC'd (deferred one
-        // cycle for in-flight readers).
+        // Fold and merge are deliberately SEPARATE invocations (the merge
+        // never runs in the same call as a fold, preserving the one-cycle GC
+        // grace) — drive bare compactions so the merge and its deferred GC run.
+        m.compact_collection("gc").await.unwrap(); // merge (no tail)
         m.ingest("gc", vec![ingest_chunk(99)], &embed)
             .await
             .unwrap();
-        m.compact_collection("gc").await.unwrap();
+        m.compact_collection("gc").await.unwrap(); // fold
+        m.compact_collection("gc").await.unwrap(); // merge + GC prior staged
         m.ingest("gc", vec![ingest_chunk(100)], &embed)
             .await
             .unwrap();
-        m.compact_collection("gc").await.unwrap();
+        m.compact_collection("gc").await.unwrap(); // fold
+        m.compact_collection("gc").await.unwrap(); // merge + GC
         let (man2, _) = crate::storage::lsm::read_manifest(storage.as_ref(), "gc")
             .await
             .unwrap();
@@ -6839,6 +6885,13 @@ mod cloud_ingest_tests {
             }
             async fn delete(&self, k: &str) -> Result<(), crate::storage::StorageError> {
                 self.0.delete(k).await
+            }
+            async fn put_large(
+                &self,
+                k: &str,
+                b: bytes::Bytes,
+            ) -> Result<crate::storage::Version, crate::storage::StorageError> {
+                self.0.put_large(k, b).await
             }
             async fn list(
                 &self,
