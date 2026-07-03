@@ -1285,6 +1285,11 @@ impl CollectionManager {
         embed_state: &EmbedState,
     ) -> Result<(usize, HashMap<String, u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>
     {
+        crate::metrics::inc(&crate::metrics::INGEST_REQUESTS_TOTAL);
+        crate::metrics::add(
+            &crate::metrics::INGEST_CHUNKS_TOTAL,
+            ingest_chunks.len() as u64,
+        );
         // Writer role: durable-append-only ingest, no local state required.
         if self.role == NodeRole::Writer {
             return self
@@ -1843,6 +1848,7 @@ impl CollectionManager {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
+        crate::metrics::inc(&crate::metrics::SEARCH_REQUESTS_TOTAL);
         self.ensure_attached(collection_name).await?;
 
         // Read-your-writes: wait (bounded) until fragments up to `min_seq` are
@@ -2521,6 +2527,7 @@ impl CollectionManager {
                                 space,
                                 expected
                             );
+                            crate::metrics::inc(&crate::metrics::QUARANTINED_CHUNKS_TOTAL);
                             continue 'chunk;
                         }
                     }
@@ -2631,6 +2638,11 @@ impl CollectionManager {
         }
         let start = std::time::Instant::now();
         let n = self.rebuild_collection_from_storage(ns).await?;
+        crate::metrics::inc(&crate::metrics::ATTACH_TOTAL);
+        crate::metrics::add(
+            &crate::metrics::ATTACH_SECONDS_SUM_MILLIS,
+            start.elapsed().as_millis() as u64,
+        );
         tracing::info!(
             "Attached '{}' on demand ({} chunks in {:.2}s)",
             ns,
@@ -2817,6 +2829,7 @@ impl CollectionManager {
                     "refresh '{}': full re-attach (compaction passed local frontier or recreate)",
                     collection_name
                 );
+                crate::metrics::inc(&crate::metrics::REFRESH_REATTACHES_TOTAL);
                 self.rebuild_collection_from_storage(collection_name)
                     .await?;
             }
@@ -2858,6 +2871,7 @@ impl CollectionManager {
                 &bytes,
             )?;
             loaded.applied.mark(fref.seq);
+            crate::metrics::inc(&crate::metrics::REFRESH_FRAGMENTS_APPLIED_TOTAL);
             applied_any = true;
         }
         if applied_any {
@@ -2907,6 +2921,7 @@ impl CollectionManager {
         collection_name: &str,
         ids: &[u64],
     ) -> Result<(usize, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
+        crate::metrics::inc(&crate::metrics::DELETE_REQUESTS_TOTAL);
         // Writer role: durable tombstone only. Without local indexes we can't
         // filter to ids-that-exist; a tombstone for an absent id is an
         // idempotent no-op on replay, so append the deduped set as-is.
@@ -3657,6 +3672,7 @@ pub(crate) async fn compact_storage(
         .await
         {
             Ok(()) => {
+                crate::metrics::inc(&crate::metrics::COMPACTIONS_TOTAL);
                 tracing::info!(
                     "Compacted '{}': folded WAL tail through seq {} ({} live records)",
                     ns,

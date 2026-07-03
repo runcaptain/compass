@@ -33,6 +33,7 @@ mod api;
 mod collections;
 mod embed;
 mod filter;
+mod metrics;
 mod models;
 mod scoring;
 mod search;

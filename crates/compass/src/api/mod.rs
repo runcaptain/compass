@@ -148,10 +148,37 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
     Router::new()
         // ── Health (unauthenticated) ─────────────────────────────────────
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_endpoint))
         .merge(protected)
         // 64 MB body limit. Default 2 MB is too small for batched ingest with embeddings.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        // Backpressure: bound in-flight requests instead of queueing without
+        // limit (COMPASS_MAX_CONCURRENCY; unset = unlimited).
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            std::env::var("COMPASS_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or(usize::MAX / 2),
+        ))
         .with_state(state)
+}
+
+/// GET /metrics — Prometheus text. Unauthenticated (like /health); carries
+/// operational counters plus per-collection gauges.
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> String {
+    let mut gauges = String::new();
+    for c in state.manager.list_collections().await {
+        gauges.push_str(&format!(
+            "compass_collection_chunks{{collection=\"{}\"}} {}\n",
+            c.name, c.chunk_count
+        ));
+        gauges.push_str(&format!(
+            "compass_collection_applied_seq{{collection=\"{}\"}} {}\n",
+            c.name, c.applied_seq
+        ));
+    }
+    crate::metrics::render(&gauges)
 }
 
 /// GET /health
