@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — "warm serverless"
+
+- **Stateless writer role** (`COMPASS_ROLE=writer`): durable-append-only nodes with no local indexes and instant boot. Writes validate against the bucket's collection config, mint ids from CAS-leased blocks, append one WAL fragment, and return its `seq`. Reads and delete-by-filter are refused with clear errors. Consistency contract: durable immediately, searchable on serving nodes within the refresh interval.
+- **Id-block allocator** (`{ns}/id-alloc`): in cloud mode every ingest path claims id blocks via CAS, so attached nodes and stateless writers can never mint colliding ids. Pre-v0.4 namespaces migrate automatically (seeded from the bucket-derived high-water mark). Do not run v0.3 and v0.4 writers against one bucket during a rolling upgrade.
+- **Bucket collection config** (`{ns}/collection.json`): vector-space specs, default space, `created_at`, and `CollectionConfig` are durable in the bucket and survive cold rebuilds (previously specs were re-inferred as `model:"recovered"` and `embed_model` was silently lost). Vector-space CRUD is bucket-first CAS; zero-ingest collections are discoverable from a fresh disk.
+- **Manifest refresh + read-your-writes**: serving nodes converge with other nodes' writes via a background refresher (`COMPASS_REFRESH_INTERVAL`, default 5s) using a per-collection seq tracker that never double-applies a node's own fragments. Config changes sync on refresh; a deleted collection detaches; a recreated one re-attaches. Write responses carry `seq`; `SearchRequest.min_seq` refreshes-then-serves with a bounded wait.
+- **Lazy attach + LRU detach** (`COMPASS_LAZY_ATTACH`, `COMPASS_MAX_ATTACHED`): boot registers bucket namespaces and attaches on first request (stampede-safe, one rebuild); past the budget the least-recently-used collection detaches and re-attaches on demand — the bucket is the source of truth. Default off; local mode unchanged.
+- **CI**: object-storage build + real-S3 integration tests run against MinIO on every PR (with a silent-skip guard); DCO sign-off enforced on PR commits (merge commits exempt).
+
+### Fixed
+
+- Sub-1000-vector collections never persisted the vector keymap, silently relying on identity key→id mapping that returned wrong chunk ids once ids were non-dense (exposed by block allocation; latent since v0.2). The keymap is now saved on every build and synthesized as identity for pre-fix directories.
+
+### Scope & limitations (honest)
+
+- Warm, not cold: attach cost is proportional to collection size until the sectioned segment format + serve-from-storage indexes land (roadmap Phases 5–6). Cross-node convergence is periodic (refresh interval), not synchronous — use `min_seq` when you need read-your-writes.
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
