@@ -57,6 +57,55 @@ jobs:
           sudo apt-get install -y cmake pkg-config libssl-dev
       - run: cargo test --workspace --exclude compass-vector-gpu
 
+  # Cloud-feature coverage: the object-storage build + the real-S3 integration
+  # tests against MinIO. Not in the required-checks list (new job), but a
+  # failure here still blocks review attention.
+  test-cloud:
+    runs-on: ubuntu-24.04
+    services:
+      minio:
+        image: bitnami/minio:2025.4.22
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: compass-data
+        ports:
+          - 9000:9000
+    env:
+      COMPASS_TEST_S3_BUCKET: compass-data
+      COMPASS_S3_ENDPOINT: http://localhost:9000
+      COMPASS_S3_ALLOW_HTTP: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev
+      - run: cargo test -p compass --features object-storage
+
+  # Developer Certificate of Origin: every PR commit carries a Signed-off-by
+  # trailer. Dependency-free check over the PR range.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          missing=0
+          for sha in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
+            if ! git log -1 --format=%B "$sha" | grep -q '^Signed-off-by: '; then
+              echo "::error::commit $sha is missing a Signed-off-by trailer (git commit -s)"
+              missing=1
+            fi
+          done
+          exit $missing
+
   msrv:
     runs-on: ubuntu-24.04
     steps:
