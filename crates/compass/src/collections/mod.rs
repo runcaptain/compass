@@ -6768,4 +6768,194 @@ mod cloud_ingest_tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
     }
+
+    // ── Scale harness (env-gated) ─────────────────────────────────────────
+    // COMPASS_SCALE_N=<chunks> [COMPASS_SCALE_DIMS=<dims>] cargo test
+    //   --features object-storage --release scale_envelope -- --nocapture
+    // Measures ingest throughput, attach (cold rebuild) time, and search
+    // latency against a local-disk Storage backend (same code paths as S3,
+    // disk-bound). Skips (passes) when COMPASS_SCALE_N is unset.
+    #[tokio::test]
+    async fn scale_envelope() {
+        let Ok(n) = std::env::var("COMPASS_SCALE_N") else {
+            eprintln!("skipped: COMPASS_SCALE_N not set");
+            return;
+        };
+        let n: usize = n.parse().unwrap();
+        let dims: usize = std::env::var("COMPASS_SCALE_DIMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let batch = 2_000usize;
+        let embed = embed_state();
+
+        let bucket_dir = unique_data_dir();
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::local::LocalDiskStorage::new(&bucket_dir).unwrap());
+        // local-disk backend reports "local-disk" => cloud_mode false. Wrap it
+        // to report as a cloud backend so the full S3-native path runs.
+        struct CloudyDisk(Arc<dyn Storage>);
+        #[async_trait::async_trait]
+        impl Storage for CloudyDisk {
+            async fn get(&self, k: &str) -> Result<bytes::Bytes, crate::storage::StorageError> {
+                self.0.get(k).await
+            }
+            async fn get_range(
+                &self,
+                k: &str,
+                r: std::ops::Range<u64>,
+            ) -> Result<bytes::Bytes, crate::storage::StorageError> {
+                self.0.get_range(k, r).await
+            }
+            async fn get_versioned(
+                &self,
+                k: &str,
+            ) -> Result<(bytes::Bytes, crate::storage::Version), crate::storage::StorageError>
+            {
+                self.0.get_versioned(k).await
+            }
+            async fn put(
+                &self,
+                k: &str,
+                b: bytes::Bytes,
+            ) -> Result<crate::storage::Version, crate::storage::StorageError> {
+                self.0.put(k, b).await
+            }
+            async fn put_if_match(
+                &self,
+                k: &str,
+                b: bytes::Bytes,
+                e: &crate::storage::Version,
+            ) -> Result<crate::storage::Version, crate::storage::StorageError> {
+                self.0.put_if_match(k, b, e).await
+            }
+            async fn put_if_not_exists(
+                &self,
+                k: &str,
+                b: bytes::Bytes,
+            ) -> Result<crate::storage::Version, crate::storage::StorageError> {
+                self.0.put_if_not_exists(k, b).await
+            }
+            async fn delete(&self, k: &str) -> Result<(), crate::storage::StorageError> {
+                self.0.delete(k).await
+            }
+            async fn list(
+                &self,
+                p: &str,
+            ) -> Result<Vec<crate::storage::ObjectMeta>, crate::storage::StorageError> {
+                self.0.list(p).await
+            }
+            async fn list_dirs(
+                &self,
+                p: &str,
+            ) -> Result<Vec<String>, crate::storage::StorageError> {
+                self.0.list_dirs(p).await
+            }
+            fn backend_name(&self) -> &'static str {
+                "scale-disk"
+            }
+        }
+        let storage: Arc<dyn Storage> = Arc::new(CloudyDisk(storage));
+
+        let node_dir = unique_data_dir();
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let m = CollectionManager::new_with_storage_opts(
+            &node_dir,
+            storage.clone(),
+            NodeRole::Full,
+            false,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let mut spaces = HashMap::new();
+        spaces.insert(
+            "default".to_string(),
+            VectorSpaceConfig {
+                dims,
+                model: "scale".into(),
+                status: "active".into(),
+            },
+        );
+        m.create_collection("scale", Some(spaces), None, None)
+            .await
+            .unwrap();
+
+        // Deterministic pseudo-random embeddings (no Math.random / clock).
+        let mk_vec = |seed: usize| -> Vec<f32> {
+            let mut x = seed as u64 * 6364136223846793005 + 1442695040888963407;
+            (0..dims)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    ((x % 2000) as f32 / 1000.0) - 1.0
+                })
+                .collect()
+        };
+        let t0 = std::time::Instant::now();
+        for b0 in (0..n).step_by(batch) {
+            let chunks: Vec<IngestChunk> = (b0..(b0 + batch).min(n))
+                .map(|i| {
+                    let mut embeddings = HashMap::new();
+                    embeddings.insert("default".to_string(), mk_vec(i));
+                    IngestChunk {
+                        client_id: None,
+                        file_id: format!("f{i}"),
+                        chunk_index: 0,
+                        page: None,
+                        text: format!("scale test chunk number {i} lorem ipsum"),
+                        metadata: HashMap::new(),
+                        doc_type: "chunk".to_string(),
+                        parent_id: None,
+                        parent_ref: None,
+                        group_id: None,
+                        embeddings,
+                        embedding: None,
+                    }
+                })
+                .collect();
+            m.ingest("scale", chunks, &embed).await.unwrap();
+        }
+        let ingest_s = t0.elapsed().as_secs_f64();
+
+        // Cold attach: fresh node dir, same bucket.
+        drop(m);
+        let node2 = unique_data_dir();
+        std::fs::create_dir_all(&node2).unwrap();
+        let t1 = std::time::Instant::now();
+        let m2 = CollectionManager::new_with_storage_opts(
+            &node2,
+            storage.clone(),
+            NodeRole::Full,
+            false,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let attach_s = t1.elapsed().as_secs_f64();
+
+        // Search latency (semantic, 50 queries).
+        let mut req = cloud_search_req(None);
+        let t2 = std::time::Instant::now();
+        let mut hits_total = 0usize;
+        for q in 0..50 {
+            req.query_vector = Some(mk_vec(q * 7919));
+            let (hits, _, _, _) = m2.search("scale", &req, &embed).await.unwrap();
+            hits_total += hits.len();
+        }
+        let search_ms = t2.elapsed().as_secs_f64() * 1000.0 / 50.0;
+        assert!(hits_total > 0);
+
+        eprintln!(
+            "SCALE n={n} dims={dims}: ingest {:.1}s ({:.0} chunks/s) | cold attach {:.1}s | search avg {:.1}ms",
+            ingest_s, n as f64 / ingest_s, attach_s, search_ms
+        );
+        let _ = std::fs::remove_dir_all(&bucket_dir);
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::remove_dir_all(&node2);
+    }
 }
