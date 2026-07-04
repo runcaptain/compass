@@ -53,7 +53,8 @@ impl Version {
     }
 
     /// True when the token carries no usable precondition (CAS must refuse it).
-    #[cfg(all(test, feature = "object-storage"))] // s3_integration asserts real tokens
+    // Used by the object-store backend at runtime and by s3_integration tests.
+    #[cfg(any(test, feature = "object-storage"))]
     pub fn is_empty(&self) -> bool {
         self.e_tag.is_empty() && self.version.as_deref().is_none_or(str::is_empty)
     }
