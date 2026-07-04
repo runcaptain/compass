@@ -197,7 +197,8 @@ impl NodeRole {
 
 impl CollectionManager {
     /// Create a manager with local-disk storage (the default embedded mode).
-    /// Convenience wrapper used by tests and local-only callers.
+    /// Test-only convenience; `main.rs` goes through `new_with_storage_opts`.
+    #[cfg(test)]
     pub async fn new(
         data_dir: &Path,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
@@ -387,7 +388,7 @@ impl CollectionManager {
         let mut fts = if tantivy_dir.join("meta.json").exists() {
             tantivy_fts::open_index(&tantivy_dir)?
         } else {
-            tantivy_fts::build_index(&tantivy_dir, &[], 0)?
+            tantivy_fts::build_index(&tantivy_dir, &[])?
         };
 
         // Load each named vector space from disk
@@ -418,7 +419,6 @@ impl CollectionManager {
                         key_to_chunk_id: Vec::new(),
                         mmap_vectors: None,
                         vectors: Vec::new(),
-                        dims: space_config.dims,
                     }),
                 );
             }
@@ -456,7 +456,6 @@ impl CollectionManager {
                 facet_rebuild.insert_chunk(&chunk);
             }
         })?;
-        filter_index.finalize();
         fts.facet_bitsets = facet_rebuild;
         // next_id is a MONOTONIC high-water mark that must never regress or reuse
         // an id. Take the max of: the persisted metadata.next_id (survives even
@@ -564,11 +563,11 @@ impl CollectionManager {
 
             // Build empty FTS index
             let tantivy_dir = store::tantivy_dir(&self.data_dir, name);
-            let fts = tantivy_fts::build_index(&tantivy_dir, &[], 0)?;
+            let fts = tantivy_fts::build_index(&tantivy_dir, &[])?;
 
             // Create empty vector spaces
             let mut vs_map = HashMap::new();
-            for (sname, sconfig) in &collection.vector_spaces {
+            for sname in collection.vector_spaces.keys() {
                 vs_map.insert(
                     sname.clone(),
                     Arc::new(VectorState {
@@ -576,7 +575,6 @@ impl CollectionManager {
                         key_to_chunk_id: Vec::new(),
                         mmap_vectors: None,
                         vectors: Vec::new(),
-                        dims: sconfig.dims,
                     }),
                 );
             }
@@ -843,7 +841,6 @@ impl CollectionManager {
                     key_to_chunk_id: Vec::new(),
                     mmap_vectors: None,
                     vectors: Vec::new(),
-                    dims,
                 }),
             );
             store::save_metadata(&self.data_dir, &loaded.metadata)?;
@@ -955,8 +952,9 @@ impl CollectionManager {
         Ok(())
     }
 
-    /// Mark a vector space as active (called when rebuild completes).
-    #[allow(dead_code)]
+    /// Mark a vector space as active: flip the persisted status (bucket-first
+    /// CAS in cloud mode) and hot-load the rebuilt index into the serving
+    /// collection. Called by the rebuild job on completion.
     pub async fn mark_vector_space_active(
         &self,
         collection_name: &str,
@@ -1662,8 +1660,7 @@ impl CollectionManager {
         // for THIS batch only — absorb the prior batches' facets (replacing
         // them wholesale was the latent since-v0.2 facet bug).
         let tantivy_dir = store::tantivy_dir(data_dir, collection_name);
-        let mut new_fts =
-            tantivy_fts::build_index(&tantivy_dir, chunks, loaded.metadata.chunk_count)?;
+        let mut new_fts = tantivy_fts::build_index(&tantivy_dir, chunks)?;
         new_fts.facet_bitsets.absorb(&loaded.fts.facet_bitsets);
         loaded.fts = new_fts;
 
@@ -1776,7 +1773,7 @@ impl CollectionManager {
                                 // first (rows idx.size()..base_key).
                                 if (idx.size() as usize) < base_key {
                                     if let Some(m) = &vs.mmap_vectors {
-                                        let threads = 128.max(rayon::current_num_threads());
+                                        let threads = vector::index_threads();
                                         idx.reserve_capacity_and_threads(total, threads)
                                             .map_err(|e| format!("Reserve failed: {}", e))?;
                                         for i in (idx.size() as usize)..base_key.min(m.len()) {
@@ -1789,7 +1786,7 @@ impl CollectionManager {
                                 (idx, true)
                             }
                         };
-                        let threads = 128.max(rayon::current_num_threads());
+                        let threads = vector::index_threads();
                         index
                             .reserve_capacity_and_threads(total, threads)
                             .map_err(|e| format!("Reserve failed: {}", e))?;
@@ -1850,7 +1847,6 @@ impl CollectionManager {
         for c in chunks {
             loaded.filter_index.insert(c.id, &filter_meta(c));
         }
-        loaded.filter_index.finalize();
         Ok(())
     }
 
@@ -1960,8 +1956,7 @@ impl CollectionManager {
 
         // ── Step 1: Retrieve candidates (filter-aware) ───────────────────
         let fts_results = if matches!(mode, SearchMode::Fts | SearchMode::Hybrid) {
-            let (raw, _, _) =
-                tantivy_fts::search(&loaded.fts, &req.query, &HashMap::new(), rerank_k)?;
+            let (raw, _, _) = tantivy_fts::search(&loaded.fts, &req.query, rerank_k)?;
             // FTS doesn't yet have predicate pushdown; post-filter results
             // against the same eligible bitmap so the merged top-k respects
             // the filter exactly the same way the semantic path does.
@@ -2797,7 +2792,7 @@ impl CollectionManager {
                 } else if loaded.metadata.vector_spaces != cfg.vector_spaces
                     || loaded.metadata.default_vector_space != cfg.default_vector_space
                 {
-                    for (name, spec) in &cfg.vector_spaces {
+                    for name in cfg.vector_spaces.keys() {
                         if !loaded.vector_spaces.contains_key(name) {
                             loaded.vector_spaces.insert(
                                 name.clone(),
@@ -2806,7 +2801,6 @@ impl CollectionManager {
                                     key_to_chunk_id: Vec::new(),
                                     mmap_vectors: None,
                                     vectors: Vec::new(),
-                                    dims: spec.dims,
                                 }),
                             );
                         }
@@ -3106,19 +3100,17 @@ impl CollectionManager {
             );
         }
         self.ensure_attached(collection_name).await?;
-        // Collect matching, not-yet-deleted ids under a read lock first.
+        // Resolve matching live ids from the roaring filter index — the same
+        // pushdown search uses, so delete-by-filter and search can never
+        // disagree about what a filter matches. (This replaced a second,
+        // chunk-scanning filter implementation.)
         let ids: Vec<u64> = {
             let collections = self.collections.read().await;
             let loaded = collections
                 .get(collection_name)
                 .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
-            let mut ids: Vec<u64> = Vec::new();
-            loaded.chunk_store.for_each(|id, c| {
-                if !loaded.tombstones.contains(&id) && crate::filter::matches_filters(&c, filters) {
-                    ids.push(id);
-                }
-            })?;
-            ids
+            let expr = crate::search::filter_pushdown::FilterExpr::compile(filters);
+            loaded.filter_index.eligible(&expr).iter().collect()
         };
         if ids.is_empty() {
             return Ok((0, None));
@@ -3280,7 +3272,7 @@ impl CollectionManager {
 
         // FTS index.
         let tantivy_dir = store::tantivy_dir(&self.data_dir, collection_name);
-        let fts = tantivy_fts::build_index(&tantivy_dir, &chunks, 0)?;
+        let fts = tantivy_fts::build_index(&tantivy_dir, &chunks)?;
 
         // Vector spaces (HNSW) from embeddings.
         let vectors_dir = store::vectors_dir(&self.data_dir, collection_name);
@@ -3311,7 +3303,6 @@ impl CollectionManager {
         for c in &chunks {
             filter_index.insert(c.id, &filter_meta(c));
         }
-        filter_index.finalize();
 
         // Reconstruct the typed-relation store from the materialized relations
         // (recovered from the S3 WAL/segments) — so relations survive a cold
@@ -3830,30 +3821,6 @@ fn filter_meta(chunk: &DocumentChunk) -> HashMap<String, MetadataValue> {
         MetadataValue::String(chunk.doc_type.clone()),
     );
     m
-}
-
-pub(crate) fn build_filter_index_from_chunks(
-    chunks: &HashMap<u64, DocumentChunk>,
-    tombstones: &std::collections::HashSet<u64>,
-) -> FilterIndex {
-    let mut idx = FilterIndex::new();
-    for (&chunk_id, chunk) in chunks {
-        if tombstones.contains(&chunk_id) {
-            continue;
-        }
-        let mut effective = chunk.metadata.clone();
-        // doc_type is a struct field, not a metadata key, but the filter
-        // language treats it as one. Mirror it here so the bitmap covers it.
-        effective.insert(
-            "doc_type".to_string(),
-            MetadataValue::String(chunk.doc_type.clone()),
-        );
-        // chunk_id is the full u64; the treemap-backed FilterIndex indexes the
-        // whole id space, so no chunk is dropped regardless of id magnitude.
-        idx.insert(chunk_id, &effective);
-    }
-    idx.finalize();
-    idx
 }
 
 /// Build a deduplicated cache of parent chunk metadata for a set of candidate

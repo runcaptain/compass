@@ -132,6 +132,7 @@ impl ObjectStoreBackend {
     }
 
     /// Construct directly from an existing object store (used by tests).
+    #[cfg(test)]
     pub fn from_store(inner: Arc<dyn ObjectStore>, label: &'static str) -> Self {
         Self { inner, label }
     }

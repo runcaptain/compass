@@ -235,6 +235,7 @@ impl RelationStore {
     }
 
     /// Total number of stored edges. Used by tests + diagnostics.
+    #[cfg(test)]
     pub fn count(&self) -> Result<u64, BoxErr> {
         use redb::ReadableTableMetadata;
         let txn = self.db.begin_read()?;

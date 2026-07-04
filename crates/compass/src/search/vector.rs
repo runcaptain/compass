@@ -46,8 +46,6 @@ pub struct VectorState {
     pub mmap_vectors: Option<super::mmap_vectors::MmapVectors>,
     /// Legacy in-memory vectors for datasets without an mmap file (e.g. first build).
     pub vectors: Vec<Vec<f32>>,
-    /// Embedding dimensionality (e.g. 384 for BGE-small)
-    pub dims: usize,
 }
 
 unsafe impl Send for VectorState {}
@@ -78,10 +76,10 @@ pub fn create_index(
     let index = Index::new(&opts).map_err(|e| format!("Failed to create USearch index: {}", e))?;
     if capacity > 0 {
         // Reserve enough concurrent search slots for the spawn_blocking pool.
-        // Default rayon threads (=CPU count) is too low when search runs on
-        // tokio's blocking pool. 128 slots costs ~256KB and avoids the
-        // "No available threads to lock" fallback to brute-force.
-        let threads = 128.max(rayon::current_num_threads());
+        // CPU count is too low when search runs on tokio's blocking pool.
+        // 128 slots costs ~256KB and avoids the "No available threads to
+        // lock" fallback to brute-force.
+        let threads = index_threads();
         index
             .reserve_capacity_and_threads(capacity, threads)
             .map_err(|e| format!("Failed to reserve USearch capacity: {}", e))?;
@@ -105,7 +103,6 @@ pub fn build_vector_index(
             key_to_chunk_id: Vec::new(),
             mmap_vectors: None,
             vectors: Vec::new(),
-            dims,
         });
     }
 
@@ -127,14 +124,13 @@ pub fn build_vector_index(
             key_to_chunk_id: chunk_ids.to_vec(),
             mmap_vectors: Some(mmap),
             vectors: Vec::new(),
-            dims,
         });
     }
 
     // Build the HNSW index
     let index = create_index(dims, vectors.len())?;
 
-    // Insert vectors using parallel threads via rayon
+    // Insert vectors using usearch's internal thread slots
     for (key, vec) in vectors.iter().enumerate() {
         index
             .add(key as u64, vec)
@@ -161,7 +157,6 @@ pub fn build_vector_index(
         key_to_chunk_id: chunk_ids.to_vec(),
         mmap_vectors: Some(mmap),
         vectors: Vec::new(),
-        dims,
     })
 }
 
@@ -223,7 +218,6 @@ pub fn load_vector_index(
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         });
     }
 
@@ -255,7 +249,7 @@ pub fn load_vector_index(
             healed
                 .load(index_path_str)
                 .map_err(|e| format!("Failed to load USearch index for heal: {}", e))?;
-            let threads = 128.max(rayon::current_num_threads());
+            let threads = index_threads();
             healed
                 .reserve_capacity_and_threads(key_to_chunk_id.len(), threads)
                 .map_err(|e| format!("Reserve failed: {}", e))?;
@@ -285,7 +279,6 @@ pub fn load_vector_index(
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         })
     } else {
         Ok(VectorState {
@@ -293,7 +286,6 @@ pub fn load_vector_index(
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         })
     }
 }
@@ -303,12 +295,6 @@ pub fn load_vector_index(
 /// + selectivity story end-to-end.
 #[derive(Debug, Clone, Default)]
 pub struct FilteredSearchExplain {
-    /// |eligible| at query time.
-    pub eligible_count: u64,
-    /// |universe| at query time.
-    pub universe_count: u64,
-    /// eligible / universe.
-    pub selectivity: f64,
     /// Whether the HNSW filtered walk was used (vs. brute force fallback).
     pub used_hnsw: bool,
     /// Number of HNSW candidates inspected. Counted via the filter closure
@@ -331,20 +317,11 @@ pub fn search_vectors_filtered(
     top_k: usize,
     eligible: &RoaringTreemap,
 ) -> (Vec<VectorResult>, FilteredSearchExplain) {
-    let universe = state.key_to_chunk_id.len() as u64;
-    let eligible_count = eligible.len();
     let mut explain = FilteredSearchExplain {
-        eligible_count,
-        universe_count: universe,
-        selectivity: if universe == 0 {
-            1.0
-        } else {
-            eligible_count as f64 / universe as f64
-        },
         used_hnsw: false,
         candidates_inspected: 0,
     };
-    if eligible_count == 0 {
+    if eligible.is_empty() {
         return (Vec::new(), explain);
     }
 
@@ -499,30 +476,18 @@ pub fn search_vectors(query_vec: &[f32], state: &VectorState, top_k: usize) -> V
 }
 
 // ── Persistence helpers ──────────────────────────────────────────────────────
-// Simple binary formats for saving/loading vectors and key maps to disk.
+// Binary formats for loading vectors and key maps from disk. (The legacy
+// vector WRITER is gone — only the mmap format is written; the legacy reader
+// below survives for migration.)
 
-/// Save vectors to a binary file (legacy format, kept for migration).
-/// Format: [u32 count] [u32 dims] [count * dims * f32 values]
-#[allow(dead_code)]
-fn save_vectors(
-    path: &Path,
-    vectors: &[Vec<f32>],
-    dims: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let count = vectors.len();
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + count * dims * 4);
-    buf.extend_from_slice(&(count as u32).to_le_bytes());
-    buf.extend_from_slice(&(dims as u32).to_le_bytes());
-    for vec in vectors {
-        for &val in vec {
-            buf.extend_from_slice(&val.to_le_bytes());
-        }
-    }
-    std::fs::write(path, buf)?;
-    Ok(())
+/// Thread-slot count for usearch reserve calls: at least 128 (tokio's
+/// blocking pool can run more concurrent searches than there are cores).
+pub(crate) fn index_threads() -> usize {
+    128.max(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
 }
 
 /// Load vectors from a binary file.

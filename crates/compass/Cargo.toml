@@ -14,9 +14,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Opt-in GPU vector backend via the compass-vector-gpu crate.
 # Requires CUDA 12+ and a Linux host. See ARCHITECTURE.md for build details.
-gpu = ["dep:compass-vector-gpu"]
 # Opt-in object-storage backend (S3/GCS/Azure/MinIO) via the object_store crate.
 # Off by default — local-first deployments pull in zero extra dependencies.
 object-storage = ["dep:object_store", "dep:futures"]
@@ -24,7 +22,6 @@ object-storage = ["dep:object_store", "dep:futures"]
 [dependencies]
 # Internal trait crate — defines VectorIndex, IndexParams, IndexError.
 # Stable surface that pluggable backends bind to.
-compass-index-api = { workspace = true }
 
 axum = { workspace = true }
 tower = { workspace = true }
@@ -34,7 +31,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-rayon = { workspace = true }
 half = { workspace = true }
 tantivy = { workspace = true }
 usearch = { workspace = true }
@@ -59,5 +55,3 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Optional GPU backend, enabled with --features gpu
-compass-vector-gpu = { path = "../compass-vector-gpu", optional = true }

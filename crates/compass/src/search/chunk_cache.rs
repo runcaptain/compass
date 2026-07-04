@@ -129,6 +129,7 @@ impl ChunkCache {
     }
 
     /// Number of chunks durably stored (not the cache size).
+    #[cfg(test)]
     pub fn count(&self) -> Result<u64, BoxErr> {
         self.store.count()
     }
@@ -140,11 +141,13 @@ impl ChunkCache {
     }
 
     /// Current number of resident (cached) chunks — for tests/metrics.
+    #[cfg(test)]
     pub fn resident(&self) -> usize {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Access the underlying store (for code paths that must bypass the cache).
+    #[cfg(test)]
     pub fn store(&self) -> &ChunkStore {
         &self.store
     }

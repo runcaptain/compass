@@ -78,6 +78,7 @@ pub async fn start_rebuild(
     _batch_size: usize,
     tracker: RebuildTracker,
     collection_name: String,
+    manager: Arc<super::CollectionManager>,
 ) -> Result<(), String> {
     let key = format!("{}/{}", collection_name, space_name);
 
@@ -113,15 +114,14 @@ pub async fn start_rebuild(
         let rt = tokio::runtime::Handle::current();
         let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
+        // External embedding endpoints are accepted in the request but not yet
+        // dispatched to — every rebuild embeds with the built-in models. Kept
+        // as a field (not a branch) so clients sending it keep working.
+        let _ = embed_endpoint;
+
         // Embed each chunk's text
         for (i, text) in texts.iter().enumerate() {
-            let vec = if let Some(ref _endpoint) = embed_endpoint {
-                // TODO: HTTP POST to external endpoint for GPU embedding
-                // For now, fall back to built-in embedder
-                embed_state
-                    .embed_query(text)
-                    .unwrap_or_else(|_| vec![0.0; dims])
-            } else {
+            let vec = {
                 // Use built-in Candle embedder
                 embed_state
                     .embed_query(text)
@@ -145,16 +145,31 @@ pub async fn start_rebuild(
         let result =
             vector::build_vector_index(&index_path, &vectors_path, &chunk_ids, &all_vectors, dims);
 
-        // Update final status
+        // Update final status. On success, ALSO flip the space's persisted
+        // status and hot-load the new index into the serving collection —
+        // without this the space stayed "building" (and the rebuilt index
+        // unused) until the next restart, even though the progress endpoint
+        // reported active.
         let progress = progress.clone();
         let key = key.clone();
         rt.block_on(async {
             let mut p = progress.write().await;
             match result {
                 Ok(_) => {
-                    p.status = "active".to_string();
-                    p.embedded = p.total;
-                    tracing::info!("Rebuild complete for {}", key);
+                    match manager
+                        .mark_vector_space_active(&collection_name, &space_name)
+                        .await
+                    {
+                        Ok(()) => {
+                            p.status = "active".to_string();
+                            p.embedded = p.total;
+                            tracing::info!("Rebuild complete for {}", key);
+                        }
+                        Err(e) => {
+                            p.status = format!("failed: activation: {}", e);
+                            tracing::error!("Rebuild activation failed for {}: {}", key, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     p.status = format!("failed: {}", e);

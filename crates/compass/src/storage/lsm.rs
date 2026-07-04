@@ -21,7 +21,6 @@
 use super::{Storage, StorageError, Version};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Max CAS attempts when committing the manifest before giving up.
 const MAX_CAS_RETRIES: u32 = 10;
@@ -315,97 +314,8 @@ pub async fn read_uncompacted_fragments_strict(
     Ok(out)
 }
 
-/// Compact: fold all uncompacted WAL fragments into ONE new segment object via
-/// `merge`, advance the watermark, and CAS-commit. `merge` receives the ordered
-/// `(FragmentRef, payload)` list — so it can see each fragment's `kind` and
-/// apply latest-wins + drop tombstoned records — and returns the segment bytes +
-/// record count.
-///
-/// Fixes vs. the earlier version:
-/// - **F3**: the segment gets a UNIQUE id (UUID), so two concurrent compactions
-///   never overwrite each other's segment object.
-/// - **F2/F4**: deferred-delete GC runs only AFTER the manifest CAS succeeds, so
-///   a losing retry never deletes objects the committed manifest still needs.
-/// - Strict read: a missing fragment aborts (no silent data loss).
-pub async fn compact<F>(storage: &dyn Storage, ns: &str, merge: F) -> Result<bool, StorageError>
-where
-    // `Fn` (not `FnOnce`) because the CAS retry loop may call it more than once.
-    F: Fn(&[(FragmentRef, Bytes)]) -> Result<(Bytes, u64), StorageError>,
-{
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let (mut manifest, version) = read_manifest(storage, ns).await?;
-
-        // Snapshot the previous cycle's deferred deletes; we only physically
-        // delete these AFTER our CAS commit succeeds (below).
-        let carried_deletes = manifest.pending_deletes.clone();
-
-        // Strict read: every listed uncompacted fragment must be present, so we
-        // only ever fold a complete set (never a subset with a hole).
-        let frags = read_uncompacted_fragments_strict(storage, ns, &manifest).await?;
-        if frags.is_empty() {
-            // Nothing to compact. Still commit if we have deletes to drain.
-            if carried_deletes.is_empty() {
-                return Ok(false);
-            }
-            manifest.pending_deletes.clear();
-            match commit_manifest(storage, ns, &manifest, &version).await {
-                Ok(_) => {
-                    gc_keys(storage, &carried_deletes).await;
-                    return Ok(false);
-                }
-                Err(StorageError::VersionConflict { .. }) if attempt < MAX_CAS_RETRIES => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        let (segment_bytes, records) = merge(&frags)?;
-        // Unique segment id (F3): concurrent compactions can't clobber.
-        let segment_id = uuid::Uuid::new_v4().to_string();
-        storage
-            .put(&segment_key(ns, &segment_id), segment_bytes)
-            .await?;
-
-        // Safe: `frags` is the COMPLETE uncompacted set, so max seq covers
-        // exactly what we merged.
-        let new_watermark = frags.iter().map(|(fref, _)| fref.seq).max().unwrap_or(0);
-
-        // The fragment objects we just compacted away — stage them for deletion
-        // NEXT cycle (keyed by unique id), so any in-flight reader still on the
-        // old manifest can read them for one more cycle.
-        let newly_staged: Vec<String> = manifest
-            .fragments
-            .iter()
-            .filter(|f| f.seq <= new_watermark)
-            .map(|f| fragment_key(ns, &f.id))
-            .collect();
-
-        manifest.compaction_watermark = Some(new_watermark);
-        manifest.fragments.retain(|f| f.seq > new_watermark);
-        manifest.segments.push(SegmentRef {
-            id: segment_id,
-            records,
-        });
-        manifest.pending_deletes = newly_staged;
-
-        match commit_manifest(storage, ns, &manifest, &version).await {
-            Ok(_) => {
-                // Commit succeeded: NOW physically delete the carried (previous
-                // cycle's) objects. The just-compacted fragments stay one cycle
-                // in pending_deletes so any in-flight reader on the old manifest
-                // can still read them.
-                gc_keys(storage, &carried_deletes).await;
-                return Ok(true);
-            }
-            Err(StorageError::VersionConflict { .. }) if attempt < MAX_CAS_RETRIES => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Physically delete a set of object keys, best-effort (a transient failure is
-/// logged; the key stays referenced only if it was still in pending_deletes).
+/// Best-effort deferred GC: delete the prior cycle's staged objects. A failed
+/// delete only leaks an orphan object (retried next cycle via pending_deletes).
 async fn gc_keys(storage: &dyn Storage, keys: &[String]) {
     for key in keys {
         if let Err(e) = storage.delete(key).await {
@@ -581,13 +491,11 @@ pub async fn replace_with_single_segment(
     }
 }
 
-/// Convenience to share a storage handle into the async helpers.
-pub type SharedStorage = Arc<dyn Storage>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::local::LocalDiskStorage;
+    use std::sync::Arc;
 
     fn storage(name: &str) -> Arc<dyn Storage> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -728,18 +636,28 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Merge concatenates fragment payloads.
-        let did = compact(s.as_ref(), "ns", |frags| {
-            let mut out = Vec::new();
-            for (_, b) in frags {
-                out.extend_from_slice(b);
-            }
-            let records = frags.len() as u64;
-            Ok((Bytes::from(out), records))
-        })
+        // Fold via the live primitives: strict tail read -> append_segment
+        // (what compact_storage does), concatenating fragment payloads.
+        let (m0, v0) = read_manifest(s.as_ref(), "ns").await.unwrap();
+        let frags = read_uncompacted_fragments_strict(s.as_ref(), "ns", &m0)
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for (_, b) in &frags {
+            out.extend_from_slice(b);
+        }
+        let folded_through = m0.fragments.iter().map(|f| f.seq).max().unwrap();
+        append_segment(
+            s.as_ref(),
+            "ns",
+            &v0,
+            &m0,
+            Bytes::from(out),
+            frags.len() as u64,
+            folded_through,
+        )
         .await
         .unwrap();
-        assert!(did);
 
         let (m, _) = read_manifest(s.as_ref(), "ns").await.unwrap();
         assert_eq!(m.segments.len(), 1);
@@ -752,14 +670,12 @@ mod tests {
         let seg = read_segment(s.as_ref(), "ns", &seg_id).await.unwrap();
         assert_eq!(&seg[..], b"012");
 
-        // A subsequent compaction with nothing new is a no-op.
-        let did2 = compact(s.as_ref(), "ns", |frags| {
-            assert!(frags.is_empty());
-            Ok((Bytes::new(), 0))
-        })
-        .await
-        .unwrap();
-        assert!(!did2);
+        // Nothing new to fold: the strict tail read comes back empty.
+        let (m1, _) = read_manifest(s.as_ref(), "ns").await.unwrap();
+        let tail = read_uncompacted_fragments_strict(s.as_ref(), "ns", &m1)
+            .await
+            .unwrap();
+        assert!(tail.is_empty());
     }
 
     #[tokio::test]
@@ -768,11 +684,10 @@ mod tests {
         append_fragment(s.as_ref(), "ns", Bytes::from_static(b"old"), 1)
             .await
             .unwrap();
-        compact(s.as_ref(), "ns", |frags| {
-            Ok((Bytes::from_static(b"seg"), frags.len() as u64))
-        })
-        .await
-        .unwrap();
+        let (m0, v0) = read_manifest(s.as_ref(), "ns").await.unwrap();
+        append_segment(s.as_ref(), "ns", &v0, &m0, Bytes::from_static(b"seg"), 1, 0)
+            .await
+            .unwrap();
 
         let seq = append_fragment(s.as_ref(), "ns", Bytes::from_static(b"new"), 1)
             .await
@@ -826,13 +741,13 @@ mod tests {
         let victim = format!("ns/wal/{}.frag", m0.fragments[0].id);
         s.delete(&victim).await.unwrap();
 
-        let result = compact(s.as_ref(), "ns", |frags| {
-            Ok((Bytes::from_static(b"seg"), frags.len() as u64))
-        })
-        .await;
+        // The live compaction path reads the tail STRICTLY before folding; a
+        // missing fragment must error out (never silently skip lost data).
+        let (m1, _) = read_manifest(s.as_ref(), "ns").await.unwrap();
+        let result = read_uncompacted_fragments_strict(s.as_ref(), "ns", &m1).await;
         assert!(
             result.is_err(),
-            "compaction must abort on a missing fragment"
+            "strict tail read must abort on a missing fragment"
         );
 
         // Manifest is untouched: watermark did NOT advance, fragment 1 still live.

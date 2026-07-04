@@ -55,11 +55,6 @@ impl FilterExpr {
         }
         FilterExpr { predicates }
     }
-
-    /// Evaluate the expression against a chunk's metadata. AND across predicates.
-    pub fn eval(&self, metadata: &HashMap<String, MetadataValue>) -> bool {
-        self.predicates.iter().all(|p| eval_predicate(p, metadata))
-    }
 }
 
 fn push_condition(out: &mut Vec<Predicate>, field: &str, cond: &FilterCondition) {
@@ -84,77 +79,20 @@ fn push_condition(out: &mut Vec<Predicate>, field: &str, cond: &FilterCondition)
     }
 }
 
-fn eval_predicate(p: &Predicate, metadata: &HashMap<String, MetadataValue>) -> bool {
-    match p {
-        Predicate::Eq { field, value } => match metadata.get(field) {
-            Some(mv) => mv == value,
-            None => false,
-        },
-        Predicate::Range { field, gte, lte } => {
-            match metadata.get(field).and_then(|m| m.as_f64()) {
-                Some(n) => {
-                    gte.map(|g| n >= g).unwrap_or(true) && lte.map(|l| n <= l).unwrap_or(true)
-                }
-                None => false,
-            }
-        }
-        Predicate::Contains { field, value } => match metadata.get(field) {
-            Some(MetadataValue::StringList(xs)) => xs.iter().any(|x| x == value),
-            Some(MetadataValue::String(s)) => s == value,
-            _ => false,
-        },
-        Predicate::In { field, values } => match metadata.get(field) {
-            Some(MetadataValue::String(s)) => values.contains(s),
-            None => false,
-            _ => false,
-        },
-    }
-}
-
-/// Canonical string form for an equality / set-membership key. Booleans and
-/// numbers normalize to a stable string so that the filter index can key on
-/// `(field, string)` without juggling typed variants.
-pub fn stringify_metadata(mv: &MetadataValue) -> String {
-    match mv {
-        MetadataValue::Bool(b) => b.to_string(),
-        MetadataValue::Int(i) => i.to_string(),
-        MetadataValue::Float(f) => f.to_string(),
-        MetadataValue::String(s) => s.clone(),
-        MetadataValue::StringList(xs) => xs.join(","),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn meta(pairs: &[(&str, MetadataValue)]) -> HashMap<String, MetadataValue> {
-        pairs
-            .iter()
-            .cloned()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
-    }
-
+    // Semantics (eq / range / contains / in, AND across fields) are covered
+    // end-to-end in filter_index.rs tests via FilterIndex::eligible — the one
+    // live evaluator. These only pin the compile() shape.
     #[test]
-    fn eq_matches_string() {
+    fn compile_shapes() {
         let mut f = HashMap::new();
         f.insert(
             "org_id".into(),
             FilterValue::Exact(MetadataValue::String("acme".into())),
         );
-        let expr = FilterExpr::compile(&f);
-        assert!(expr.eval(&meta(&[("org_id", MetadataValue::String("acme".into()))])));
-        assert!(!expr.eval(&meta(&[(
-            "org_id",
-            MetadataValue::String("widgets".into())
-        )])));
-        assert!(!expr.eval(&meta(&[])));
-    }
-
-    #[test]
-    fn range_inclusive_bounds() {
-        let mut f = HashMap::new();
         f.insert(
             "created_at".into(),
             FilterValue::Condition(FilterCondition {
@@ -165,67 +103,8 @@ mod tests {
             }),
         );
         let expr = FilterExpr::compile(&f);
-        assert!(expr.eval(&meta(&[("created_at", MetadataValue::Int(100))])));
-        assert!(expr.eval(&meta(&[("created_at", MetadataValue::Float(150.5))])));
-        assert!(expr.eval(&meta(&[("created_at", MetadataValue::Int(200))])));
-        assert!(!expr.eval(&meta(&[("created_at", MetadataValue::Int(99))])));
-        assert!(!expr.eval(&meta(&[("created_at", MetadataValue::Int(201))])));
-    }
-
-    #[test]
-    fn and_of_eq_and_range() {
-        let mut f = HashMap::new();
-        f.insert(
-            "org_id".into(),
-            FilterValue::Exact(MetadataValue::String("acme".into())),
-        );
-        f.insert(
-            "created_at".into(),
-            FilterValue::Condition(FilterCondition {
-                gte: Some(100.0),
-                lte: None,
-                contains: None,
-                in_values: None,
-            }),
-        );
-        let expr = FilterExpr::compile(&f);
-        let ok = meta(&[
-            ("org_id", MetadataValue::String("acme".into())),
-            ("created_at", MetadataValue::Int(150)),
-        ]);
-        let wrong_org = meta(&[
-            ("org_id", MetadataValue::String("widgets".into())),
-            ("created_at", MetadataValue::Int(150)),
-        ]);
-        let too_old = meta(&[
-            ("org_id", MetadataValue::String("acme".into())),
-            ("created_at", MetadataValue::Int(50)),
-        ]);
-        assert!(expr.eval(&ok));
-        assert!(!expr.eval(&wrong_org));
-        assert!(!expr.eval(&too_old));
-    }
-
-    #[test]
-    fn contains_on_string_list() {
-        let mut f = HashMap::new();
-        f.insert(
-            "tags".into(),
-            FilterValue::Condition(FilterCondition {
-                gte: None,
-                lte: None,
-                contains: Some("sports".into()),
-                in_values: None,
-            }),
-        );
-        let expr = FilterExpr::compile(&f);
-        assert!(expr.eval(&meta(&[(
-            "tags",
-            MetadataValue::StringList(vec!["sports".into(), "goals".into()]),
-        )])));
-        assert!(!expr.eval(&meta(&[(
-            "tags",
-            MetadataValue::StringList(vec!["news".into()]),
-        )])));
+        assert_eq!(expr.predicates.len(), 2);
+        assert!(!expr.is_empty());
+        assert!(FilterExpr::compile(&HashMap::new()).is_empty());
     }
 }

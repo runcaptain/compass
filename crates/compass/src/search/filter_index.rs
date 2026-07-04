@@ -88,10 +88,6 @@ impl FilterIndex {
         self.universe.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.universe.is_empty()
-    }
-
     /// The live-id universe (treemap) — shared with facet counting so deleted
     /// chunks never inflate counts.
     pub fn universe(&self) -> &RoaringTreemap {
@@ -149,10 +145,6 @@ impl FilterIndex {
             }
         }
     }
-
-    /// No-op since the numeric index moved to a BTreeMap (kept so existing
-    /// build sites don't churn).
-    pub fn finalize(&mut self) {}
 
     /// Remove one chunk (reverse of `insert`). O(log N) per field value —
     /// deletes no longer trigger an O(collection) index rebuild.
@@ -281,250 +273,6 @@ pub fn selectivity(eligible: &RoaringTreemap, universe_len: u64) -> f64 {
     eligible.len() as f64 / universe_len as f64
 }
 
-// ── Persistence ────────────────────────────────────────────────────────────
-// Serialize the whole index to bytes. NOT YET WIRED: every load path currently
-// rebuilds the index from the chunk map; persisting/reloading it through the
-// Storage trait (skipping the O(N) rebuild on startup) is future work.
-// RoaringTreemaps use their native portable format; the container framing is a
-// small length-prefixed encoding. Note the length prefixes are u32 — per-field
-// entry counts are bounded by that (fine in practice; the u64 work in this
-// module is about CHUNK IDS, not per-field entry counts).
-
-impl MetadataKey {
-    // Type-tagged encoding. Tag byte + payload.
-    fn encode(&self, buf: &mut Vec<u8>) {
-        match self {
-            MetadataKey::Bool(b) => {
-                buf.push(0);
-                buf.push(*b as u8);
-            }
-            MetadataKey::Int(i) => {
-                buf.push(1);
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            MetadataKey::Float(bits) => {
-                buf.push(2);
-                buf.extend_from_slice(&bits.to_le_bytes());
-            }
-            MetadataKey::String(s) => {
-                buf.push(3);
-                write_str(buf, s);
-            }
-            MetadataKey::StringList(xs) => {
-                buf.push(4);
-                buf.extend_from_slice(&(xs.len() as u32).to_le_bytes());
-                for x in xs {
-                    write_str(buf, x);
-                }
-            }
-        }
-    }
-
-    fn decode(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        let tag = *buf.get(*pos)?;
-        *pos += 1;
-        Some(match tag {
-            0 => {
-                let b = *buf.get(*pos)? != 0;
-                *pos += 1;
-                MetadataKey::Bool(b)
-            }
-            1 => MetadataKey::Int(read_i64(buf, pos)?),
-            2 => MetadataKey::Float(read_u64(buf, pos)?),
-            3 => MetadataKey::String(read_str(buf, pos)?),
-            4 => {
-                let n = read_u32(buf, pos)? as usize;
-                let mut xs = Vec::with_capacity(n);
-                for _ in 0..n {
-                    xs.push(read_str(buf, pos)?);
-                }
-                MetadataKey::StringList(xs)
-            }
-            _ => return None,
-        })
-    }
-}
-
-fn write_str(buf: &mut Vec<u8>, s: &str) {
-    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    buf.extend_from_slice(s.as_bytes());
-}
-
-fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
-    let end = *pos + 4;
-    let v = u32::from_le_bytes(buf.get(*pos..end)?.try_into().ok()?);
-    *pos = end;
-    Some(v)
-}
-
-fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let end = *pos + 8;
-    let v = u64::from_le_bytes(buf.get(*pos..end)?.try_into().ok()?);
-    *pos = end;
-    Some(v)
-}
-
-fn read_i64(buf: &[u8], pos: &mut usize) -> Option<i64> {
-    Some(read_u64(buf, pos)? as i64)
-}
-
-fn read_str(buf: &[u8], pos: &mut usize) -> Option<String> {
-    let len = read_u32(buf, pos)? as usize;
-    let end = *pos + len;
-    let s = String::from_utf8(buf.get(*pos..end)?.to_vec()).ok()?;
-    *pos = end;
-    Some(s)
-}
-
-fn write_treemap(buf: &mut Vec<u8>, t: &RoaringTreemap) {
-    let mut tmp = Vec::new();
-    // RoaringTreemap::serialize_into writes the portable format.
-    t.serialize_into(&mut tmp).expect("treemap serialize");
-    buf.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&tmp);
-}
-
-fn read_treemap(buf: &[u8], pos: &mut usize) -> Option<RoaringTreemap> {
-    let len = read_u32(buf, pos)? as usize;
-    let end = *pos + len;
-    let slice = buf.get(*pos..end)?;
-    let t = RoaringTreemap::deserialize_from(slice).ok()?;
-    *pos = end;
-    Some(t)
-}
-
-// field -> RoaringTreemap
-fn write_map_tm(buf: &mut Vec<u8>, m: &HashMap<String, RoaringTreemap>) {
-    buf.extend_from_slice(&(m.len() as u32).to_le_bytes());
-    for (k, v) in m {
-        write_str(buf, k);
-        write_treemap(buf, v);
-    }
-}
-
-fn read_map_tm(buf: &[u8], pos: &mut usize) -> Option<HashMap<String, RoaringTreemap>> {
-    let n = read_u32(buf, pos)? as usize;
-    let mut m = HashMap::with_capacity(n);
-    for _ in 0..n {
-        let k = read_str(buf, pos)?;
-        let v = read_treemap(buf, pos)?;
-        m.insert(k, v);
-    }
-    Some(m)
-}
-
-// field -> (string -> RoaringTreemap)
-fn write_map_str_tm(buf: &mut Vec<u8>, m: &HashMap<String, HashMap<String, RoaringTreemap>>) {
-    buf.extend_from_slice(&(m.len() as u32).to_le_bytes());
-    for (k, inner) in m {
-        write_str(buf, k);
-        write_map_tm(buf, inner);
-    }
-}
-
-fn read_map_str_tm(
-    buf: &[u8],
-    pos: &mut usize,
-) -> Option<HashMap<String, HashMap<String, RoaringTreemap>>> {
-    let n = read_u32(buf, pos)? as usize;
-    let mut m = HashMap::with_capacity(n);
-    for _ in 0..n {
-        let k = read_str(buf, pos)?;
-        let inner = read_map_tm(buf, pos)?;
-        m.insert(k, inner);
-    }
-    Some(m)
-}
-
-impl FilterIndex {
-    /// Format version for the serialized index (bump on any framing change).
-    const FORMAT_VERSION: u8 = 1;
-
-    /// Serialize the whole index to a byte buffer.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(Self::FORMAT_VERSION);
-
-        // equality: field -> (MetadataKey -> treemap)
-        buf.extend_from_slice(&(self.equality.len() as u32).to_le_bytes());
-        for (field, inner) in &self.equality {
-            write_str(&mut buf, field);
-            buf.extend_from_slice(&(inner.len() as u32).to_le_bytes());
-            for (key, tm) in inner {
-                key.encode(&mut buf);
-                write_treemap(&mut buf, tm);
-            }
-        }
-
-        write_map_str_tm(&mut buf, &self.equality_strings);
-
-        // numeric: field -> flattened (ordered-bits, id) pairs.
-        buf.extend_from_slice(&(self.numeric.len() as u32).to_le_bytes());
-        for (field, vals) in &self.numeric {
-            write_str(&mut buf, field);
-            let n: u64 = vals.values().map(|tm| tm.len()).sum();
-            buf.extend_from_slice(&(n as u32).to_le_bytes());
-            for (key, tm) in vals {
-                for id in tm {
-                    buf.extend_from_slice(&key.to_le_bytes());
-                    buf.extend_from_slice(&id.to_le_bytes());
-                }
-            }
-        }
-
-        write_map_str_tm(&mut buf, &self.string_list_contains);
-        write_map_tm(&mut buf, &self.present);
-        write_treemap(&mut buf, &self.universe);
-        buf
-    }
-
-    /// Reconstruct an index from bytes produced by [`FilterIndex::serialize`].
-    pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        let mut pos = 0usize;
-        let version = *buf.get(pos)?;
-        pos += 1;
-        if version != Self::FORMAT_VERSION {
-            return None;
-        }
-
-        let mut idx = FilterIndex::new();
-
-        let n_eq = read_u32(buf, &mut pos)? as usize;
-        for _ in 0..n_eq {
-            let field = read_str(buf, &mut pos)?;
-            let n_inner = read_u32(buf, &mut pos)? as usize;
-            let mut inner = HashMap::with_capacity(n_inner);
-            for _ in 0..n_inner {
-                let key = MetadataKey::decode(buf, &mut pos)?;
-                let tm = read_treemap(buf, &mut pos)?;
-                inner.insert(key, tm);
-            }
-            idx.equality.insert(field, inner);
-        }
-
-        idx.equality_strings = read_map_str_tm(buf, &mut pos)?;
-
-        let n_num = read_u32(buf, &mut pos)? as usize;
-        for _ in 0..n_num {
-            let field = read_str(buf, &mut pos)?;
-            let n_vals = read_u32(buf, &mut pos)? as usize;
-            let mut vals: std::collections::BTreeMap<u64, RoaringTreemap> = Default::default();
-            for _ in 0..n_vals {
-                let key = read_u64(buf, &mut pos)?;
-                let id = read_u64(buf, &mut pos)?;
-                vals.entry(key).or_default().insert(id);
-            }
-            idx.numeric.insert(field, vals);
-        }
-
-        idx.string_list_contains = read_map_str_tm(buf, &mut pos)?;
-        idx.present = read_map_tm(buf, &mut pos)?;
-        idx.universe = read_treemap(buf, &mut pos)?;
-
-        Some(idx)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,7 +307,6 @@ mod tests {
                 ]),
             );
         }
-        idx.finalize();
         idx
     }
 
@@ -661,7 +408,6 @@ mod tests {
                 ("tags", MetadataValue::StringList(vec!["even".into()])),
             ]),
         );
-        idx.finalize();
 
         assert_eq!(idx.len(), 1);
 
@@ -700,58 +446,5 @@ mod tests {
             }),
         );
         assert!(idx.eligible(&FilterExpr::compile(&con)).contains(big));
-    }
-
-    #[test]
-    fn serialize_roundtrip_preserves_queries() {
-        let idx = build_index();
-        let bytes = idx.serialize();
-        let restored = FilterIndex::deserialize(&bytes).expect("deserialize ok");
-
-        assert_eq!(restored.len(), idx.len());
-
-        // Equality query matches identically.
-        let mut eq = HashMap::new();
-        eq.insert(
-            "org_id".into(),
-            FilterValue::Exact(MetadataValue::String("acme".into())),
-        );
-        let expr = FilterExpr::compile(&eq);
-        assert_eq!(idx.eligible(&expr).len(), restored.eligible(&expr).len());
-        assert_eq!(restored.eligible(&expr).len(), 10);
-
-        // Range query matches identically after restore.
-        let mut rng = HashMap::new();
-        rng.insert(
-            "created_at".into(),
-            FilterValue::Condition(FilterCondition {
-                gte: Some(100.0),
-                lte: Some(200.0),
-                contains: None,
-                in_values: None,
-            }),
-        );
-        let rexpr = FilterExpr::compile(&rng);
-        assert_eq!(idx.eligible(&rexpr).len(), restored.eligible(&rexpr).len());
-
-        // Contains query matches identically.
-        let mut con = HashMap::new();
-        con.insert(
-            "tags".into(),
-            FilterValue::Condition(FilterCondition {
-                gte: None,
-                lte: None,
-                contains: Some("even".into()),
-                in_values: None,
-            }),
-        );
-        let cexpr = FilterExpr::compile(&con);
-        assert_eq!(restored.eligible(&cexpr).len(), 500);
-    }
-
-    #[test]
-    fn deserialize_rejects_bad_version() {
-        assert!(FilterIndex::deserialize(&[]).is_none());
-        assert!(FilterIndex::deserialize(&[99]).is_none()); // bad version byte
     }
 }

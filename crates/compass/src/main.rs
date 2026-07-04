@@ -1,6 +1,5 @@
 // Pre-existing clippy lints from newer toolchain — will be cleaned up separately.
 #![allow(
-    dead_code,
     clippy::too_many_arguments,
     clippy::type_complexity,
     clippy::collapsible_if,
@@ -32,16 +31,13 @@
 mod api;
 mod collections;
 mod embed;
-mod filter;
 mod metrics;
 mod models;
 mod scoring;
 mod search;
-// Storage abstraction (Storage trait + LocalDiskStorage + object-storage backend
-// + LSM). main() selects and verifies the backend at startup; full engine
-// persistence through it is the follow-on. `allow(dead_code)` covers the parts
-// (LSM, chunk cache, filter-index serde) not yet on the hot path.
-#[allow(dead_code)]
+// Storage abstraction: Storage trait + LocalDiskStorage + object-storage
+// backend + the LSM (WAL fragments, manifest, segments) — the cloud-mode
+// persistence layer.
 mod storage;
 mod telemetry;
 

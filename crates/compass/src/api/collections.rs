@@ -177,6 +177,7 @@ pub async fn trigger_rebuild(
         req.batch_size,
         state.manager.rebuild_tracker.clone(),
         name,
+        state.manager.clone(),
     )
     .await
     .map_err(|e| (StatusCode::CONFLICT, e))?;

@@ -53,6 +53,7 @@ impl Version {
     }
 
     /// True when the token carries no usable precondition (CAS must refuse it).
+    #[cfg(all(test, feature = "object-storage"))] // s3_integration asserts real tokens
     pub fn is_empty(&self) -> bool {
         self.e_tag.is_empty() && self.version.as_deref().is_none_or(str::is_empty)
     }
@@ -60,6 +61,9 @@ impl Version {
 
 /// Metadata about a stored object, returned by `list`.
 #[derive(Debug, Clone)]
+// size/version are part of the listing contract; current callers key off
+// `key` only. Kept — deleting them would change every backend's list().
+#[allow(dead_code)]
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
@@ -104,6 +108,9 @@ pub trait Storage: Send + Sync {
 
     /// Range read — fetch only `range` bytes of the object. The primitive that
     /// makes large segments servable without loading the whole object.
+    // Range reads are the sectioned-segment read primitive (v2 TOC points at
+    // byte ranges); both backends implement it, callers land with Phase 5/6.
+    #[allow(dead_code)]
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
     /// Read the object together with its current version, for a CAS cycle.
