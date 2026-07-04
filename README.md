@@ -593,7 +593,7 @@ Telemetry is **off by default** — Compass never phones home unless you set `CO
 
 ## Security
 
-To report a vulnerability, email **security@runcaptain.com**. See [SECURITY.md](SECURITY.md) for details.
+To report a vulnerability, email **support@runcaptain.com**. See [SECURITY.md](SECURITY.md) for details.
 
 ## License
 

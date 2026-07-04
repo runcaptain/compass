@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-We take the security of Compass seriously. If you discover a security vulnerability, please email security@runcaptain.com with the following information:
+We take the security of Compass seriously. If you discover a security vulnerability, please email support@runcaptain.com with the following information:
 
 1. **Description** of the vulnerability
 2. **Steps to reproduce** (if applicable)

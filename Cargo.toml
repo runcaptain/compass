@@ -10,7 +10,7 @@ default-members = ["crates/compass"]
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-authors = ["Captain Technologies <founders@runcaptain.com>"]
+authors = ["Captain Technologies <support@runcaptain.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/runcaptain/compass"
 homepage = "https://runcaptain.com"
