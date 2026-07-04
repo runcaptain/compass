@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # feat/** so stacked PRs (feature targeting feature) get CI too.
+    branches: [main, "feat/**"]
 
 env:
   CARGO_TERM_COLOR: always
