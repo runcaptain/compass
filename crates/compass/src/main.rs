@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Anonymous telemetry — opt out with COMPASS_TELEMETRY=off or DO_NOT_TRACK=1
+    // Anonymous telemetry — OPT-IN ONLY (COMPASS_TELEMETRY=on); off by default
     telemetry::spawn_telemetry(data_dir.clone(), app_state.manager.clone());
 
     // Bearer-token auth via COMPASS_API_KEY. When unset, auth is disabled.

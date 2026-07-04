@@ -43,23 +43,27 @@ crates/compass/src/
     mod.rs           SearchMode enum + re-exports.
     backend.rs       VectorIndex trait shim. UsearchHnswIndex (CPU) lives here.
     vector.rs        USearch HNSW build + search + persistence (CPU primitives).
-    tantivy_fts.rs   Full-text search via Tantivy (BM25).
+    tantivy_fts.rs   Full-text search via Tantivy (BM25) + facet treemaps.
     hybrid.rs        Reciprocal Rank Fusion (RRF, k=60) over FTS + semantic.
+    ivf.rs           IVF clustering built at compaction (cold-read layout).
+    cold.rs          Serve-from-storage query path (range reads, no attach).
+    filter_index.rs  Roaring-treemap metadata filter index (warm pushdown).
+    chunk_store.rs / chunk_cache.rs   redb chunk store + bounded LRU cache.
+  collections/
+    partitions.rs    Tenant-partition routing helpers.
+    cloud.rs         Segment codec (CSEG0003), materialize, bucket config.
+  storage/           Storage trait + local disk + object-store backends + LSM.
+  metrics.rs         /metrics counters. telemetry.rs: opt-in usage pings.
 ```
 
-## Vector backend abstraction
+## Vector backends
 
-All vector backends implement `compass_index_api::VectorIndex`. The default backend is `UsearchHnswIndex` (CPU, mmap-backed, disk-persistent). The opt-in GPU backend is `compass_vector_gpu::CuvsHnswIndex` (CAGRA build on GPU, HNSW search on CPU).
-
-Selection happens at startup in `search::backend::build_backend`, driven by the `COMPASS_BACKEND` environment variable:
-
-| Value | Behavior |
-|-------|----------|
-| `cpu` (default) | USearch on CPU. Always available. |
-| `gpu` | cuVS on GPU. Requires the `gpu` feature and a CUDA-capable device. Falls back to CPU with a warning if either is missing. |
-| `auto` | Probe for GPU, fall back to CPU silently if unavailable. |
-
-The trait is intentionally narrow: `build`, `add`, `search`, `len`, `dims`, `save`, `backend_name`. New backends should fit through this surface or extend it via a follow-up trait, not by branching on a concrete type.
+The engine uses USearch HNSW directly (CPU, mmap-backed, disk-persistent)
+for warm serving, plus an IVF layout inside segments (`search/ivf.rs`) for
+serve-from-storage cold reads. `compass-index-api` (a narrow `VectorIndex`
+trait) and `compass-vector-gpu` (cuVS) exist as standalone crates for a
+future GPU integration but are NOT wired into the engine — there is no
+`COMPASS_BACKEND` knob and no `gpu` feature on the `compass` crate today.
 
 ## Storage layout
 
@@ -80,8 +84,8 @@ data/<collection>/
 
 In cloud mode the object-storage bucket additionally holds, per collection:
 `collection.json` (bucket config), `manifest` (LSM manifest, CAS-committed),
-`wal/{uuid}.frag` (WAL fragments), `segments/{uuid}` (CSEG0002 sectioned
-segments), and `id-alloc` (CAS-leased chunk-id blocks).
+`wal/{uuid}.frag` (WAL fragments), `segments/{uuid}` (CSEG0003 sectioned
+segments: row-addressable metadata + IVF-clustered vectors; v2 readable), and `id-alloc` (CAS-leased chunk-id blocks).
 
 The disk format is the contract. Bumping it requires a migration path documented in CHANGELOG.md.
 
@@ -118,7 +122,8 @@ cuVS CAGRA build on an A10G runs ~12x faster than USearch CPU build at the same 
 1. Create a new crate `crates/compass-vector-<name>/`.
 2. Depend on `compass-index-api` (workspace dep) and your backend library.
 3. Implement `VectorIndex` (and `LoadableIndex` if loading from disk makes sense).
-4. Add a `#[cfg(feature = "<name>")]`-gated branch in `search::backend::build_backend`.
+4. Wire it into the engine (there is currently no runtime backend selector —
+   proposing that wiring is part of such a PR; open an issue first).
 5. Document the build prerequisites in `ARCHITECTURE.md` (this file).
 6. Add a smoke binary under `src/bin/` that builds, queries, and prints latency.
 

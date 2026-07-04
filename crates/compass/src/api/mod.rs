@@ -4,7 +4,9 @@
 // vector space CRUD, rebuild triggers, and status checks.
 //
 // Bearer-token auth middleware is applied to all routes
-// except /health. See `AuthConfig` and `auth_middleware` below.
+// except /health and /metrics (both unauthenticated by design; /metrics
+// exposes collection names + counts — firewall it if that matters).
+// See `AuthConfig` and `auth_middleware` below.
 
 pub mod collections;
 pub mod delete;

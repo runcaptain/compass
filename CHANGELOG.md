@@ -6,11 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added — serve-from-storage (Phase 5, "true serverless")
+### Added — serve-from-storage ("true serverless")
 
-- **`COMPASS_COLD_SERVE=true`**: semantic queries on collections (and tenant partitions) that are NOT attached are answered directly from object storage — a manifest read, cached centroid/TOC artifacts, and a handful of range-GETs — instead of triggering a full index rebuild. Compaction now writes IVF-clustered vector sections (`cent:`/`clu:`, k-means, unit-normalized) plus a row-addressable metadata index (`meta2`/`metaidx`) into segments (format CSEG0003; v2 segments remain readable, pre-v0.5 readers fail loudly on v3). Cold reads see the full committed state including the WAL tail and tombstones, so read-your-writes holds by construction; metadata filters apply; FTS on a cold namespace returns a clear error (inverted indexes still need an attach). Repeated cold hits (`COMPASS_WARM_AFTER`, default 3) promote a background attach so hot namespaces migrate to the fast path on their own. RAM per cold namespace is megabytes (centroids + directories), independent of collection size.
+- **`COMPASS_COLD_SERVE=true`**: semantic queries on collections (and tenant partitions) that are NOT attached are answered directly from object storage — a manifest read, cached centroid/TOC artifacts, and a handful of range-GETs — instead of triggering a full index rebuild. Compaction now writes IVF-clustered vector sections (`cent:`/`clu:`, k-means, unit-normalized) plus a row-addressable metadata index (`meta2`/`metaidx`) into segments (format CSEG0003; v2 segments remain readable, pre-v0.4 readers fail loudly on v3). Cold reads see the full committed state including the WAL tail and tombstones, so read-your-writes holds by construction; metadata filters apply; FTS on a cold namespace returns a clear error (inverted indexes still need an attach). Repeated cold hits (`COMPASS_WARM_AFTER`, default 3) promote a background attach so hot namespaces migrate to the fast path on their own. RAM per cold namespace is megabytes (centroids + directories), independent of collection size.
 
-### Added — tenant-partitioned collections (Phase 6)
+### Added — tenant-partitioned collections
 
 - **`config.partition_by`**: create a collection partitioned by a metadata field (e.g. `tenant_id`) and every chunk routes to an internal per-tenant partition — a full engine namespace (own LSM, indexes, attach/evict lifecycle) behind one collection API. Searches and deletes filter by the partition field (exact → one partition; `{"in": [...]}` fans out up to 16, merged by score); chunk ids are collection-unique via the parent's CAS id allocator; partitions auto-create on first ingest (writer role included), attach on demand, are hidden from listings, and cascade-delete with the parent. This moves the scale envelope from per-collection to per-tenant: RAM and refresh cost track the HOT tenant set, so one collection can hold billions of vectors across tenants while serving on bounded memory. Not yet routed on partitioned collections (clear errors): relations, facets, TAMS lookup, vector-space CRUD.
 
@@ -35,9 +35,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pork audit (three independent review passes): −1,200 lines of dead weight removed — the unwired VectorIndex/GPU backend plumbing (`COMPASS_BACKEND` did nothing), a third never-called filter evaluator, never-wired filter-index persistence codecs, the legacy vector writer, the `rayon` dependency, and assorted dead fields/params. `delete_by_filter` now resolves ids through the same roaring filter-index pushdown as search (one filter semantics, not three). The `dead_code` lint is enabled again crate-wide. `collections/mod.rs` shrank from 7,100 to 3,700 lines (test modules extracted to files).
 
+### Changed (behavior)
+
+- **Telemetry is now opt-in** (`COMPASS_TELEMETRY=on`); previously it defaulted on. An engine whose promise is "data never leaves your machine" should not phone home by default.
+
 ### Scope & limitations (honest)
 
-- Warm, not cold: attach cost is proportional to collection size until the sectioned segment format + serve-from-storage indexes land (roadmap Phases 5–6). Cross-node convergence is periodic (refresh interval), not synchronous — use `min_seq` when you need read-your-writes.
+- Cold serving is semantic-only: full-text (and hybrid-with-text) queries on a cold namespace return a clear error until it warms — BM25 still needs local indexes. Cold recall depends on embedding-space structure (see docs/search-quality.md); the default nprobe reaches warm parity on clustered embeddings. Cross-node convergence is periodic (refresh interval), not synchronous — use `min_seq` when you need read-your-writes (cold reads have it by construction).
 
 ## [0.3.0] - 2026-07-03
 

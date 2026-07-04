@@ -32,7 +32,7 @@ runs meaningfully faster; treat these as conservative floors.
   file — roughly linear in collection size). Lazy attach + LRU keep this a
   first-request cost per namespace, not a boot cost, but a 100M-chunk
   collection still takes tens of minutes to attach on first use.
-- **Billion-vector serving therefore remains out of envelope** until
+Billion-vector serving is reached via tenant partitions + serve-from-storage: the per-NAMESPACE envelope above bounds the largest tenant, not the collection, and cold reads serve unattached namespaces from object storage (see docs/search-quality.md for the recall contract).
   serve-from-storage indexes land (roadmap Phase 6: centroid routing over
   range-readable segments — attach becomes "fetch centroids", milliseconds).
   Do not deploy a single collection past ~10–50M chunks and expect

@@ -1,6 +1,6 @@
 # Serverless Roadmap
 
-> Status: Phases 0-3 SHIPPED (feat/warm-serverless); Phase 6 tenant partitions + Phase 5 serve-from-storage SHIPPED on their stacked branches; remaining: routing/affinity hooks, auth binding, intra-tenant sharding. Target: evolve Compass from a cloud-durable single-node
+> Status: warm serverless (stateless writers, refresh, lazy attach), tenant partitions, and serve-from-storage cold reads are SHIPPED on the v0.4 branches (phase numbers below predate the final split). Remaining: routing/affinity hooks, per-tenant auth binding, cold FTS, intra-tenant sharding. Target: evolve Compass from a cloud-durable single-node
 > engine (v0.3.0) into a fully serverless database — storage/compute separated,
 > stateless workers, bounded cold starts, scale-to-zero — with **every item
 > additive and open source** under Apache 2.0. Local-first, zero-config
