@@ -26,7 +26,7 @@ pub async fn ingest_chunks(
         .manager
         .ingest(&name, req.chunks, &state.embed_state)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
 
     let took_ms = start.elapsed().as_millis() as u64;
 

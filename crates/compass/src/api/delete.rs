@@ -16,18 +16,7 @@ use axum::Json;
 use std::sync::Arc;
 
 fn map_err(e: Box<dyn std::error::Error + Send + Sync>) -> (StatusCode, String) {
-    let msg = e.to_string();
-    if msg.contains("not found") {
-        (StatusCode::NOT_FOUND, msg)
-    } else {
-        // Log the detail server-side; internal errors (paths, backends, redb
-        // internals) don't belong in response bodies.
-        tracing::error!("delete handler error: {msg}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error (see server logs)".to_string(),
-        )
-    }
+    crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// DELETE /collections/:name/chunks/:id

@@ -34,7 +34,7 @@ pub async fn search_collection(
         .manager
         .search(&name, &req, &state.embed_state)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
     let hits: Vec<SearchHit> = results
         .into_iter()
@@ -70,7 +70,7 @@ pub async fn get_facets(
         .manager
         .get_facets(&name, query_str, &req.fields)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
     Ok(Json(FacetResponse { facets, took_us }))
 }

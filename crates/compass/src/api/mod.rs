@@ -25,6 +25,23 @@ use axum::{Json, Router};
 use std::sync::Arc;
 
 /// Shared application state passed to every request handler.
+/// Map an engine error to an HTTP response. Typed `NotFound` becomes 404
+/// regardless of the handler's default; a 500 default logs the detail and
+/// returns a generic body (backend/path internals don't belong in responses).
+pub(crate) fn error_response(
+    e: Box<dyn std::error::Error + Send + Sync>,
+    default: StatusCode,
+) -> (StatusCode, String) {
+    if e.downcast_ref::<crate::collections::NotFound>().is_some() {
+        return (StatusCode::NOT_FOUND, e.to_string());
+    }
+    if default == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!("handler error: {e}");
+        return (default, "internal error (see server logs)".to_string());
+    }
+    (default, e.to_string())
+}
+
 pub struct AppState {
     pub manager: Arc<CollectionManager>,
     pub embed_state: Arc<EmbedState>,

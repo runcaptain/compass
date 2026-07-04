@@ -743,7 +743,7 @@ impl CollectionManager {
                     .flatten()
                     .is_some();
             if !in_bucket {
-                return Err(format!("Collection '{}' not found", name).into());
+                return Err(not_found(format_args!("Collection \'{}\' not found", name)));
             }
         }
         if attached {
@@ -792,9 +792,9 @@ impl CollectionManager {
         // Phase 1 (short read lock): preconditions only.
         {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             if loaded.metadata.vector_spaces.contains_key(space_name) {
                 return Err(format!("Vector space '{}' already exists", space_name).into());
             }
@@ -823,9 +823,9 @@ impl CollectionManager {
 
         // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         if !loaded.metadata.vector_spaces.contains_key(space_name) {
             loaded.metadata.vector_spaces.insert(
                 space_name.to_string(),
@@ -868,9 +868,9 @@ impl CollectionManager {
         // Phase 1 (short read lock): preconditions.
         {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             if loaded.metadata.default_vector_space.as_deref() == Some(space_name) {
                 return Err("Cannot delete the default vector space. Switch default first.".into());
             }
@@ -892,9 +892,9 @@ impl CollectionManager {
 
         // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         loaded.metadata.vector_spaces.remove(space_name);
         loaded.vector_spaces.remove(space_name);
 
@@ -923,11 +923,14 @@ impl CollectionManager {
         // Phase 1 (short read lock): preconditions.
         {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             if !loaded.metadata.vector_spaces.contains_key(space_name) {
-                return Err(format!("Vector space '{}' not found", space_name).into());
+                return Err(not_found(format_args!(
+                    "Vector space \'{}\' not found",
+                    space_name
+                )));
             }
         }
 
@@ -935,7 +938,10 @@ impl CollectionManager {
         if self.cloud_mode {
             cloud::cas_update_bucket_config(self.storage.as_ref(), collection_name, |cfg| {
                 if !cfg.vector_spaces.contains_key(space_name) {
-                    return Err(format!("Vector space '{}' not found", space_name).into());
+                    return Err(not_found(format_args!(
+                        "Vector space \'{}\' not found",
+                        space_name
+                    )));
                 }
                 cfg.default_vector_space = Some(space_name.to_string());
                 Ok(())
@@ -945,9 +951,9 @@ impl CollectionManager {
 
         // Phase 3 (write lock): apply locally.
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         loaded.metadata.default_vector_space = Some(space_name.to_string());
         store::save_metadata(&self.data_dir, &loaded.metadata)?;
         Ok(())
@@ -979,9 +985,9 @@ impl CollectionManager {
         }
 
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
 
         if let Some(config) = loaded.metadata.vector_spaces.get_mut(space_name) {
             config.status = "active".to_string();
@@ -1057,9 +1063,9 @@ impl CollectionManager {
         loop {
             {
                 let mut collections = self.collections.write().await;
-                let loaded = collections
-                    .get_mut(collection_name)
-                    .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+                let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+                    not_found(format_args!("Collection \'{}\' not found", collection_name))
+                })?;
                 let available: u64 = loaded.id_pool.iter().map(|r| r.end - r.start).sum();
                 if available >= count as u64 {
                     let mut ids = Vec::with_capacity(count);
@@ -1084,7 +1090,12 @@ impl CollectionManager {
             match collections.get_mut(collection_name) {
                 Some(loaded) => loaded.id_pool.push_back(range),
                 // Collection deleted mid-claim: the block leaks (gaps are fine).
-                None => return Err(format!("Collection '{}' not found", collection_name).into()),
+                None => {
+                    return Err(not_found(format_args!(
+                        "Collection \'{}\' not found",
+                        collection_name
+                    )))
+                }
             }
         }
     }
@@ -1104,7 +1115,12 @@ impl CollectionManager {
         }
         let cfg = cloud::read_bucket_config(self.storage.as_ref(), ns)
             .await?
-            .ok_or_else(|| format!("Collection '{}' not found in object storage", ns))?;
+            .ok_or_else(|| {
+                not_found(format_args!(
+                    "Collection \'{}\' not found in object storage",
+                    ns
+                ))
+            })?;
         self.bucket_configs
             .write()
             .await
@@ -1323,9 +1339,9 @@ impl CollectionManager {
         };
 
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
 
         // Phase 1: Assign IDs and build client_id -> chunk_id map
         let mut client_id_map: HashMap<String, u64> = HashMap::new();
@@ -1537,7 +1553,10 @@ impl CollectionManager {
                         );
                     }
                 }
-                return Err(format!("Collection '{}' not found", collection_name).into());
+                return Err(not_found(format_args!(
+                    "Collection \'{}\' not found",
+                    collection_name
+                )));
             }
         };
         // Double-apply guard: between our S3 append and this reacquire, the
@@ -1893,9 +1912,9 @@ impl CollectionManager {
                 loop {
                     let covered = {
                         let collections = self.collections.read().await;
-                        let loaded = collections
-                            .get(collection_name)
-                            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+                        let loaded = collections.get(collection_name).ok_or_else(|| {
+                            not_found(format_args!("Collection \'{}\' not found", collection_name))
+                        })?;
                         loaded
                             .last_used
                             .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
@@ -1924,9 +1943,9 @@ impl CollectionManager {
         }
         let start = std::time::Instant::now();
         let collections = self.collections.read().await;
-        let loaded = collections
-            .get(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         loaded
             .last_used
             .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
@@ -2284,9 +2303,9 @@ impl CollectionManager {
         let mut built: Vec<ChunkRelation> = Vec::with_capacity(new.len());
         {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             for r in new {
                 if r.source_chunk_id == r.target_chunk_id {
                     return Err("A relation's source and target chunk must differ".into());
@@ -2350,7 +2369,10 @@ impl CollectionManager {
                         r
                     }
                 }
-                None => Err(format!("Collection '{}' not found", collection_name).into()),
+                None => Err(not_found(format_args!(
+                    "Collection \'{}\' not found",
+                    collection_name
+                ))),
             }
         };
         if let Err(e) = apply_result {
@@ -2398,7 +2420,10 @@ impl CollectionManager {
         {
             let collections = self.collections.read().await;
             if !collections.contains_key(collection_name) {
-                return Err(format!("Collection '{}' not found", collection_name).into());
+                return Err(not_found(format_args!(
+                    "Collection \'{}\' not found",
+                    collection_name
+                )));
             }
         }
 
@@ -2419,9 +2444,9 @@ impl CollectionManager {
 
         // Apply locally (write lock: the seq tracker needs &mut).
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         if appended_seq.map(|s| loaded.applied.covers(s)) == Some(true) {
             return Ok(true); // refresher already applied our delete
         }
@@ -2451,9 +2476,9 @@ impl CollectionManager {
         }
         self.ensure_attached(collection_name).await?;
         let collections = self.collections.read().await;
-        let loaded = collections
-            .get(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         loaded
             .last_used
             .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
@@ -2668,7 +2693,7 @@ impl CollectionManager {
             if !exists {
                 // Don't leak an attach-lock entry per garbage name probed.
                 self.attach_locks.lock().await.remove(ns);
-                return Err(format!("Collection '{}' not found", ns).into());
+                return Err(not_found(format_args!("Collection \'{}\' not found", ns)));
             }
             self.registered.write().await.insert(ns.to_string());
         }
@@ -2823,9 +2848,9 @@ impl CollectionManager {
 
         let contiguous = {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             loaded.applied.contiguous
         };
 
@@ -2892,9 +2917,9 @@ impl CollectionManager {
             )
             .await?;
             let mut collections = self.collections.write().await;
-            let loaded = collections
-                .get_mut(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             if loaded.applied.covers(fref.seq) {
                 continue;
             }
@@ -3003,9 +3028,9 @@ impl CollectionManager {
         // chunk_count by) ONE delete, not three.
         let newly: Vec<u64> = {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             let mut seen = std::collections::HashSet::new();
             ids.iter()
                 .copied()
@@ -3043,9 +3068,9 @@ impl CollectionManager {
         // a redundant S3 tombstone for an already-deleted id is a harmless
         // idempotent no-op on replay.
         let mut collections = self.collections.write().await;
-        let loaded = collections
-            .get_mut(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get_mut(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         // Double-apply guard: the refresher may have applied OUR tombstone
         // fragment between the append and this reacquire.
         if let Some(seq) = appended_seq {
@@ -3107,9 +3132,9 @@ impl CollectionManager {
         // chunk-scanning filter implementation.)
         let ids: Vec<u64> = {
             let collections = self.collections.read().await;
-            let loaded = collections
-                .get(collection_name)
-                .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+            let loaded = collections.get(collection_name).ok_or_else(|| {
+                not_found(format_args!("Collection \'{}\' not found", collection_name))
+            })?;
             let expr = crate::search::filter_pushdown::FilterExpr::compile(filters);
             loaded.filter_index.eligible(&expr).iter().collect()
         };
@@ -3140,7 +3165,10 @@ impl CollectionManager {
         {
             let collections = self.collections.read().await;
             if !collections.contains_key(collection_name) {
-                return Err(format!("Collection '{}' not found", collection_name).into());
+                return Err(not_found(format_args!(
+                    "Collection \'{}\' not found",
+                    collection_name
+                )));
             }
         }
 
@@ -3353,9 +3381,9 @@ impl CollectionManager {
         }
         self.ensure_attached(collection_name).await?;
         let collections = self.collections.read().await;
-        let loaded = collections
-            .get(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
         loaded
             .last_used
             .store(next_lru_tick(), std::sync::atomic::Ordering::Relaxed);
@@ -3368,9 +3396,9 @@ impl CollectionManager {
         collection_name: &str,
     ) -> Result<(Vec<String>, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
         let collections = self.collections.read().await;
-        let loaded = collections
-            .get(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
 
         let mut texts = Vec::new();
         let mut ids = Vec::new();
@@ -3401,9 +3429,9 @@ impl CollectionManager {
         time_end_ms: Option<f64>,
     ) -> Result<Vec<DocumentChunk>, Box<dyn std::error::Error + Send + Sync>> {
         let collections = self.collections.read().await;
-        let loaded = collections
-            .get(collection_name)
-            .ok_or_else(|| format!("Collection '{}' not found", collection_name))?;
+        let loaded = collections.get(collection_name).ok_or_else(|| {
+            not_found(format_args!("Collection \'{}\' not found", collection_name))
+        })?;
 
         let mut collected: Vec<DocumentChunk> = Vec::new();
         loaded.chunk_store.for_each(|id, c| {
@@ -3486,6 +3514,25 @@ pub(crate) fn segment_in_time_window(
 
 #[cfg(test)]
 mod segments_at_tests;
+
+/// Typed "does not exist" error. The API layer downcasts to map these to
+/// HTTP 404; every other engine error keeps the handler's default status.
+/// (Previously a missing collection surfaced as 500 from /search and 400
+/// from /ingest — stringly errors carried no classification.)
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
+fn not_found(what: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(NotFound(what.to_string()))
+}
 
 /// Uncompacted-fragment count above which a cloud collection is auto-compacted.
 /// Keeps the WAL bounded and reclaims tombstoned data without operator action.
