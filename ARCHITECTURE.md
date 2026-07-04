@@ -67,17 +67,21 @@ Per-collection state lives under `$DATA_DIR/<collection>/`:
 
 ```
 data/<collection>/
-  meta.json                 CollectionMetadata (name, default vector space, vector_spaces map)
-  chunks.bin                Append-only log of Chunk records
-  metadata.bin              Per-chunk metadata (typed values, bitset-faceted)
-  fts/                      Tantivy directory
-  vectors/<space>/
-    index.usearch           USearch HNSW (CPU) — mmap-backed
-    index.cuvs              cuVS HNSW (GPU build) — when COMPASS_BACKEND=gpu
-    index.keymap            Internal HNSW key -> external chunk id mapping
-    vectors.bin             Raw float buffer (used for brute-force fallback + rebuilds)
+  collection.json           Collection metadata (name, config, vector_spaces map, applied_seq)
+  chunks.redb               Chunk bodies + metadata (redb; disk source of truth)
+  relations.redb            Typed many-to-many chunk relations (redb)
   relationships.bin         Parent-child + sibling edges
+  tantivy/                  Tantivy FTS index directory
+  vectors/
+    <space>.index           USearch HNSW graph — mmap-backed
+    <space>.keymap          Internal HNSW key -> external chunk id mapping
+    <space>.bin             CMV2 mmap vector file (torn-append-safe, per-batch durable)
 ```
+
+In cloud mode the object-storage bucket additionally holds, per collection:
+`collection.json` (bucket config), `manifest` (LSM manifest, CAS-committed),
+`wal/{uuid}.frag` (WAL fragments), `segments/{uuid}` (CSEG0002 sectioned
+segments), and `id-alloc` (CAS-leased chunk-id blocks).
 
 The disk format is the contract. Bumping it requires a migration path documented in CHANGELOG.md.
 

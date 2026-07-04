@@ -136,7 +136,8 @@ struct LoadedCollection {
     /// and HNSW indexes on every ingest batch, and on load from the rehydrated
     /// chunks. Powers filter-aware ANN: queries with `filters={...}` compile
     /// to a `FilterExpr`, resolve to an eligible bitmap, and route through
-    /// USearch's `filtered_search`. Planned follow-up.
+    /// USearch's `filtered_search`. Also the live-id universe for facets and
+    /// delete-by-filter.
     filter_index: FilterIndex,
 }
 
@@ -3653,14 +3654,6 @@ mod segments_at_tests {
     }
 }
 
-/// Build a roaring-bitmap FilterIndex over a chunk map. Synthesizes a
-/// `doc_type` metadata entry from the struct field so filter expressions
-/// can target it without requiring callers to duplicate `doc_type` into
-/// `chunk.metadata`. Matches the semantics of `filter::matches_filters`.
-///
-/// Called on collection load (over rehydrated chunks) and after every
-/// ingest batch (alongside FTS/HNSW rebuild). The index lives in-memory
-/// only for now; persistence lands when chunk metadata migrates off redb.
 /// Uncompacted-fragment count above which a cloud collection is auto-compacted.
 /// Keeps the WAL bounded and reclaims tombstoned data without operator action.
 pub(crate) const AUTO_COMPACT_FRAGMENT_THRESHOLD: usize = 32;
@@ -5040,6 +5033,56 @@ mod cloud_ingest_tests {
             !manifest_path.exists(),
             "local mode must not write an LSM manifest"
         );
+        // Nor an id-block allocator: local mode allocates from next_id.
+        assert!(
+            !data_dir.join("localcoll").join("id-alloc").exists(),
+            "local mode must not seed the id-block allocator"
+        );
+        // And ids stay dense from 0 (block allocation would start at 0 too,
+        // but a second ingest would jump; assert both batches are contiguous).
+        manager
+            .ingest("localcoll", vec![ingest_chunk(1)], &embed)
+            .await
+            .unwrap();
+        let (_, mut ids) = manager.get_all_chunk_data("localcoll").await.unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1], "local ids must be dense next_id values");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A stray COMPASS_ROLE=writer on a local-disk deployment must be
+    // neutralized: cloud_mode is false, so the constructor forces Full and
+    // the node keeps serving reads and creating collections normally.
+    #[tokio::test]
+    async fn writer_role_is_neutralized_in_local_mode() {
+        let data_dir = unique_data_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let embed = embed_state();
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::local::LocalDiskStorage::new(&data_dir).unwrap());
+        let manager = CollectionManager::new_with_storage_opts(
+            &data_dir,
+            storage,
+            NodeRole::Writer,
+            false,
+            usize::MAX,
+            0,
+        )
+        .await
+        .unwrap();
+        manager
+            .create_collection("localwriter", None, Some(4), None)
+            .await
+            .expect("local node must create collections despite COMPASS_ROLE=writer");
+        manager
+            .ingest("localwriter", vec![ingest_chunk(0)], &embed)
+            .await
+            .unwrap();
+        let (_, ids) = manager
+            .get_all_chunk_data("localwriter")
+            .await
+            .expect("local node must serve reads despite COMPASS_ROLE=writer");
+        assert_eq!(ids.len(), 1);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

@@ -26,7 +26,7 @@ docker run -p 4001:4001 -v ./data:/app/data compass
 crates/
   compass/                Main engine binary (Axum API, search, scoring, embed)
   compass-index-api/      VectorIndex trait (no I/O, no async)
-  compass-vector-gpu/     Optional cuVS GPU backend (--features gpu, Linux + CUDA)
+  compass-vector-gpu/     cuVS GPU backend crate (standalone; not yet wired into the engine)
 ```
 
 ## Architecture
@@ -100,7 +100,10 @@ POST   /collections/:name/vector-spaces/:space/rebuild Trigger re-embedding
 GET    /collections/:name/vector-spaces/:space/status  Rebuild progress
 PUT    /collections/:name/default-vector-space         Switch default space
 
+GET    /collections/:name/segments/at                  Temporal segment lookup (TAMS)
+
 GET    /health                                         Health check
+GET    /metrics                                        Prometheus-text metrics
 ```
 
 ## Embedding Models

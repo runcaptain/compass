@@ -566,7 +566,10 @@ POST   /collections/:name/vector-spaces/:space/rebuild Trigger re-embedding
 GET    /collections/:name/vector-spaces/:space/status  Rebuild progress
 PUT    /collections/:name/default-vector-space         Switch default space
 
+GET    /collections/:name/segments/at                  Temporal segment lookup (TAMS)
+
 GET    /health                                         Health check
+GET    /metrics                                        Prometheus-text metrics
 ```
 
 ## Contributing
