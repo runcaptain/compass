@@ -10,6 +10,11 @@
 // search with full scoring pipeline, vector space CRUD, background rebuild jobs.
 
 pub mod cloud;
+#[cfg(all(test, feature = "object-storage"))]
+mod partition_cloud_tests;
+#[cfg(test)]
+mod partition_tests;
+pub mod partitions;
 pub mod rebuild;
 pub mod relation_store;
 pub mod relationships;
@@ -517,6 +522,35 @@ impl CollectionManager {
         embedding_dims: Option<usize>,
         config: Option<CollectionConfig>,
     ) -> Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
+        // The partition separator is reserved: user collections must not
+        // squat on internal partition namespaces.
+        if partitions::is_partition_ns(name) {
+            return Err(format!(
+                "Collection name '{name}' contains the reserved partition separator '{}'",
+                partitions::PART_SEP
+            )
+            .into());
+        }
+        if let Some(cfg) = &config {
+            if let Some(field) = &cfg.partition_by {
+                if field.is_empty() {
+                    return Err("partition_by must name a metadata field".into());
+                }
+            }
+        }
+        self.create_collection_inner(name, vector_spaces, embedding_dims, config)
+            .await
+    }
+
+    /// Shared create path. Partition namespaces (containing [`partitions::PART_SEP`])
+    /// may only be created internally by the ingest router.
+    async fn create_collection_inner(
+        &self,
+        name: &str,
+        vector_spaces: Option<HashMap<String, VectorSpaceConfig>>,
+        embedding_dims: Option<usize>,
+        config: Option<CollectionConfig>,
+    ) -> Result<Collection, Box<dyn std::error::Error + Send + Sync>> {
         if self.role == NodeRole::Writer {
             return Err(
                 "this node runs in writer role; create collections via a serving node".into(),
@@ -640,9 +674,13 @@ impl CollectionManager {
                 Ok(()) => {
                     // Fresh namespace: seed the id allocator at 0 so every
                     // ingest path (attached or stateless) can claim blocks.
-                    if let Err(e) =
+                    // Partition namespaces mint from the PARENT's allocator
+                    // (collection-unique ids) and are never seeded themselves.
+                    if let Err(e) = if partitions::is_partition_ns(name) {
+                        Ok(())
+                    } else {
                         crate::storage::id_alloc::seed(self.storage.as_ref(), name, 0).await
-                    {
+                    } {
                         let _ = crate::storage::lsm::delete_namespace(self.storage.as_ref(), name)
                             .await;
                         rollback_local().await;
@@ -667,6 +705,16 @@ impl CollectionManager {
             }
         }
 
+        // Partitioned parents allocate chunk ids from a shared CAS allocator
+        // in LOCAL mode too (partitions must never mint colliding ids). This
+        // is a single JSON file under the collection dir — no WAL/manifest.
+        if !self.cloud_mode
+            && collection.config.partition_by.is_some()
+            && !partitions::is_partition_ns(name)
+        {
+            crate::storage::id_alloc::seed(self.storage.as_ref(), name, 0).await?;
+        }
+
         tracing::info!("Created collection '{}'", name);
         Ok(collection)
     }
@@ -683,6 +731,8 @@ impl CollectionManager {
             let collections = self.collections.read().await;
             collections.values().map(|c| c.metadata.clone()).collect()
         };
+        // Partition namespaces are internal — the parent represents them.
+        out.retain(|c| !partitions::is_partition_ns(&c.name));
         if self.lazy_attach {
             let attached: std::collections::HashSet<String> =
                 out.iter().map(|c| c.name.clone()).collect();
@@ -694,6 +744,9 @@ impl CollectionManager {
                     .collect()
             };
             for name in names {
+                if partitions::is_partition_ns(&name) {
+                    continue;
+                }
                 if let Ok(Some(cfg)) = cloud::read_bucket_config(self.storage.as_ref(), &name).await
                 {
                     out.push(Collection {
@@ -726,6 +779,49 @@ impl CollectionManager {
         &self,
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Partitioned parent: cascade over every partition namespace FIRST,
+        // so a failure mid-cascade leaves the parent (and the retry path)
+        // intact. Partitions are discovered from all sources — attached map,
+        // lazy registry, local dirs, and the bucket (a writer node may have
+        // created partitions this node never saw).
+        if !partitions::is_partition_ns(name) {
+            let prefix = format!("{name}{}", partitions::PART_SEP);
+            let mut parts: std::collections::HashSet<String> = std::collections::HashSet::new();
+            {
+                let collections = self.collections.read().await;
+                parts.extend(
+                    collections
+                        .keys()
+                        .filter(|k| k.starts_with(&prefix))
+                        .cloned(),
+                );
+            }
+            parts.extend(
+                self.registered
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned(),
+            );
+            if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
+                for e in entries.flatten() {
+                    if let Some(n) = e.file_name().to_str() {
+                        if n.starts_with(&prefix) {
+                            parts.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+            if self.cloud_mode {
+                if let Ok(all) = crate::storage::lsm::list_namespaces(self.storage.as_ref()).await {
+                    parts.extend(all.into_iter().filter(|n| n.starts_with(&prefix)));
+                }
+            }
+            for part in parts {
+                Box::pin(self.delete_collection(&part)).await?;
+            }
+        }
         // Lazy mode: the collection may be registered-but-unattached (or LRU
         // evicted) — deleting it must still purge the bucket.
         let attached = {
@@ -776,6 +872,8 @@ impl CollectionManager {
         dims: usize,
         model: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "vector-space changes")
+            .await?;
         // Validate `space_name` before it touches the filesystem. The name is
         // interpolated into on-disk paths (`{space_name}.bin`, `.index`,
         // `.keymap`), so an unconstrained value like `../../tmp/pwn` could
@@ -855,6 +953,8 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "vector-space changes")
+            .await?;
         // Same path-traversal guard as add_vector_space — the name flows into
         // `remove_file` calls below.
         validate_name_segment(space_name, "Vector space")?;
@@ -914,6 +1014,8 @@ impl CollectionManager {
         collection_name: &str,
         space_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "vector-space changes")
+            .await?;
         if self.role == NodeRole::Writer {
             return Err(
                 "this node runs in writer role; manage vector spaces via a serving node".into(),
@@ -1020,6 +1122,214 @@ impl CollectionManager {
         store::vectors_dir(&self.data_dir, collection_name)
     }
 
+    // ── Tenant partitions (Phase 6) ──────────────────────────────────────
+
+    /// The partition field of a collection, or None for normal collections
+    /// and partition namespaces themselves. Attaches the parent if needed
+    /// (cheap: a partitioned parent holds config only, no chunk data).
+    async fn partition_field(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if partitions::is_partition_ns(name) {
+            return Ok(None);
+        }
+        self.ensure_attached(name).await?;
+        let collections = self.collections.read().await;
+        Ok(collections
+            .get(name)
+            .and_then(|l| l.metadata.config.partition_by.clone()))
+    }
+
+    /// Make sure a partition namespace exists and is servable, creating it on
+    /// first sight (inheriting the parent's vector spaces + embed model).
+    /// Racing creators and partitions created by writer nodes resolve via the
+    /// create path's own already-exists handling.
+    async fn ensure_partition(
+        &self,
+        parent: &str,
+        pval: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let ns = partitions::partition_ns(parent, pval);
+        if self.collections.read().await.contains_key(&ns) {
+            return Ok(ns);
+        }
+        if self.cloud_mode && self.registered.read().await.contains(&ns) {
+            return Ok(ns); // lazy attach loads it at the entry point
+        }
+        let (spaces, config) = {
+            let collections = self.collections.read().await;
+            let parent_meta = collections
+                .get(parent)
+                .ok_or_else(|| not_found(format_args!("Collection '{}' not found", parent)))?;
+            (
+                parent_meta.metadata.vector_spaces.clone(),
+                CollectionConfig {
+                    embed_model: parent_meta.metadata.config.embed_model.clone(),
+                    partition_by: None,
+                },
+            )
+        };
+        match self
+            .create_collection_inner(&ns, Some(spaces), None, Some(config))
+            .await
+        {
+            Ok(_) => Ok(ns),
+            // Lost a create race (local map, bucket config, or bucket data) —
+            // the partition exists; ensure_attached at the entry point loads it.
+            Err(e) if e.to_string().contains("already") => Ok(ns),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ingest into a partitioned collection: one delegated ingest per touched
+    /// partition. `seq` is passed through when exactly one partition was
+    /// touched; multi-partition batches return None (each partition has its
+    /// own manifest and thus its own seq domain).
+    async fn ingest_partitioned(
+        &self,
+        parent: &str,
+        field: &str,
+        ingest_chunks: Vec<IngestChunk>,
+        embed_state: &EmbedState,
+    ) -> Result<(usize, HashMap<String, u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let groups = partitions::group_by_partition(field, ingest_chunks)?;
+        let multi = groups.len() > 1;
+        let mut total = 0usize;
+        let mut id_map = HashMap::new();
+        let mut last_seq = None;
+        for (pval, group) in groups {
+            let ns = self.ensure_partition(parent, &pval).await?;
+            let (n, ids, seq) = Box::pin(self.ingest(&ns, group, embed_state)).await?;
+            total += n;
+            id_map.extend(ids);
+            last_seq = seq;
+        }
+        Ok((total, id_map, if multi { None } else { last_seq }))
+    }
+
+    /// Search a partitioned collection: route to the partitions named by the
+    /// partition-field filter, merge by score, truncate to top_k. Partitions
+    /// that do not exist yet contribute zero results (a tenant with no data
+    /// is empty, not an error).
+    #[allow(clippy::type_complexity)]
+    async fn search_partitioned(
+        &self,
+        parent: &str,
+        field: &str,
+        req: &SearchRequest,
+        embed_state: &EmbedState,
+    ) -> Result<
+        (
+            Vec<(
+                DocumentChunk,
+                f32,
+                String,
+                Option<HashMap<String, MetadataValue>>,
+                Option<Vec<ChunkRelation>>,
+            )>,
+            usize,
+            u64,
+            Option<ExplainPlan>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let pvals = partitions::partition_values_from_filters(field, &req.filters)?;
+        if req.min_seq.is_some() && pvals.len() > 1 {
+            return Err("min_seq applies to a single partition's write history; \
+                 filter to one partition value when using it"
+                .into());
+        }
+        let mut merged = Vec::new();
+        let mut total = 0usize;
+        let mut took = 0u64;
+        let mut explain = None;
+        for pval in pvals {
+            let ns = partitions::partition_ns(parent, &pval);
+            match Box::pin(self.search(&ns, req, embed_state)).await {
+                Ok((results, t, us, ex)) => {
+                    merged.extend(results);
+                    total += t;
+                    took += us;
+                    if explain.is_none() {
+                        explain = ex;
+                    }
+                }
+                Err(e) if e.downcast_ref::<NotFound>().is_some() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(req.top_k);
+        Ok((merged, total, took, explain))
+    }
+
+    /// Writer-side partition bootstrap: create-only bucket objects for a
+    /// partition namespace (config copy + empty manifest). Idempotent — racing
+    /// writers and serving nodes all converge on the first writer's objects.
+    /// No per-partition id allocator is seeded (ids mint from the parent's).
+    async fn ensure_partition_ns_cloud(
+        &self,
+        parent_cfg: &cloud::BucketConfig,
+        pval: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let ns = partitions::partition_ns(&parent_cfg.name, pval);
+        if self.bucket_configs.read().await.contains_key(&ns) {
+            return Ok(ns);
+        }
+        let mut part_cfg = parent_cfg.clone();
+        part_cfg.name = ns.clone();
+        part_cfg.config.partition_by = None;
+        match cloud::write_bucket_config_if_absent(self.storage.as_ref(), &ns, &part_cfg).await {
+            Ok(()) | Err(crate::storage::StorageError::AlreadyExists(_)) => {}
+            Err(e) => return Err(format!("partition config write failed: {e}").into()),
+        }
+        match crate::storage::lsm::init_namespace(self.storage.as_ref(), &ns).await {
+            Ok(()) | Err(crate::storage::StorageError::AlreadyExists(_)) => {}
+            Err(e) => return Err(format!("partition manifest init failed: {e}").into()),
+        }
+        Ok(ns)
+    }
+
+    /// Typed fence for operations not yet routed on partitioned collections.
+    /// Writer nodes consult the bucket config (they hold no local metadata);
+    /// without this a writer would durably append e.g. relations into the
+    /// parent namespace, which no serving node ever materializes.
+    async fn reject_if_partitioned(
+        &self,
+        name: &str,
+        what: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.is_partitioned_any_role(name).await? {
+            return Err(format!(
+                "{what} is not supported on a partitioned collection yet \
+                 (collection '{name}' is partitioned)"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Role-aware "is this collection partitioned?": serving nodes read local
+    /// metadata (attaching if needed); writers consult the bucket config.
+    async fn is_partitioned_any_role(
+        &self,
+        name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if partitions::is_partition_ns(name) {
+            return Ok(false);
+        }
+        if self.role == NodeRole::Writer {
+            return Ok(self
+                .bucket_config(name, false)
+                .await
+                .map(|c| c.config.partition_by.is_some())
+                .unwrap_or(false));
+        }
+        Ok(self.partition_field(name).await?.is_some())
+    }
+
     // ── Ingest ───────────────────────────────────────────────────────────
 
     /// Ingest chunks with batch parent resolution, named embeddings, and relationships.
@@ -1033,6 +1343,9 @@ impl CollectionManager {
         count: u64,
     ) -> Result<std::ops::Range<u64>, Box<dyn std::error::Error + Send + Sync>> {
         use crate::storage::id_alloc;
+        // Partitions mint from the PARENT's allocator: chunk ids stay unique
+        // across the whole partitioned collection.
+        let ns = partitions::alloc_ns(ns);
         match id_alloc::claim(self.storage.as_ref(), ns, count).await {
             Ok(r) => Ok(r),
             Err(crate::storage::StorageError::NotFound(_)) => {
@@ -1145,6 +1458,26 @@ impl CollectionManager {
             return Ok((0, HashMap::new(), None));
         }
         let cfg = self.bucket_config(collection_name, false).await?;
+
+        // Partitioned collection: group by the partition field, make each
+        // partition's bucket objects exist (idempotent create-only writes —
+        // a writer may see a tenant before any serving node does), delegate.
+        if let Some(field) = cfg.config.partition_by.clone() {
+            let groups = partitions::group_by_partition(&field, ingest_chunks)?;
+            let multi = groups.len() > 1;
+            let mut total = 0usize;
+            let mut id_map = HashMap::new();
+            let mut last_seq = None;
+            for (pval, group) in groups {
+                let ns = self.ensure_partition_ns_cloud(&cfg, &pval).await?;
+                let (n, ids, seq) =
+                    Box::pin(self.ingest_stateless(&ns, group, embed_state)).await?;
+                total += n;
+                id_map.extend(ids);
+                last_seq = seq;
+            }
+            return Ok((total, id_map, if multi { None } else { last_seq }));
+        }
 
         // Ids from the writer-side pool (same allocator as attached nodes).
         // The pool mutex is NEVER held across the S3 claim: drain what's
@@ -1324,6 +1657,14 @@ impl CollectionManager {
                 .await;
         }
 
+        // Partitioned collection: group by the partition field and delegate
+        // each group to its partition namespace (partitions.rs).
+        if let Some(field) = self.partition_field(collection_name).await? {
+            return self
+                .ingest_partitioned(collection_name, &field, ingest_chunks, embed_state)
+                .await;
+        }
+
         let count = ingest_chunks.len();
         self.ensure_attached(collection_name).await?;
 
@@ -1332,11 +1673,16 @@ impl CollectionManager {
         // BEFORE taking the write lock (its refill path does S3 round-trips).
         // A failed ingest after this point leaks the taken ids — gaps are fine;
         // the invariant is no-reuse, not density.
-        let cloud_ids: Option<Vec<u64>> = if self.cloud_mode && count > 0 {
-            Some(self.take_ids_cloud(collection_name, count).await?)
-        } else {
-            None
-        };
+        //
+        // Partition namespaces use the block allocator in LOCAL mode too: all
+        // partitions of one collection mint from the PARENT's allocator, so a
+        // per-partition next_id counter would collide across siblings.
+        let cloud_ids: Option<Vec<u64>> =
+            if (self.cloud_mode || partitions::is_partition_ns(collection_name)) && count > 0 {
+                Some(self.take_ids_cloud(collection_name, count).await?)
+            } else {
+                None
+            };
 
         let mut collections = self.collections.write().await;
         let loaded = collections.get_mut(collection_name).ok_or_else(|| {
@@ -1901,6 +2247,13 @@ impl CollectionManager {
             return Err("this node runs in writer role and does not serve queries".into());
         }
         crate::metrics::inc(&crate::metrics::SEARCH_REQUESTS_TOTAL);
+
+        // Partitioned collection: route to the partitions named by the filter.
+        if let Some(field) = self.partition_field(collection_name).await? {
+            return self
+                .search_partitioned(collection_name, &field, req, embed_state)
+                .await;
+        }
         self.ensure_attached(collection_name).await?;
 
         // Read-your-writes: wait (bounded) until fragments up to `min_seq` are
@@ -2261,6 +2614,8 @@ impl CollectionManager {
         collection_name: &str,
         new: Vec<CreateRelation>,
     ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "creating relations")
+            .await?;
         // Writer role: build the edges without local state — target_status is
         // stored as "missing" and re-resolved against the live chunk set at
         // every read on serving nodes — and append ONE durable fragment.
@@ -2404,6 +2759,8 @@ impl CollectionManager {
         collection_name: &str,
         relation_id: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "deleting relations")
+            .await?;
         // Writer role: durable relation-delete only (idempotent on replay).
         if self.role == NodeRole::Writer {
             crate::storage::lsm::append_relation_delete(
@@ -2471,6 +2828,8 @@ impl CollectionManager {
         direction: RelationDirection,
         types: Option<&[String]>,
     ) -> Result<Vec<ChunkRelation>, Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "listing relations")
+            .await?;
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
@@ -2664,7 +3023,11 @@ impl CollectionManager {
         &self,
         ns: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.lazy_attach {
+        // Partition namespaces attach on demand EVEN in non-lazy cloud mode:
+        // partitions appear dynamically (a writer node can mint one at any
+        // time), so "everything attached at boot" can never hold for them.
+        let dynamic_partition = self.cloud_mode && partitions::is_partition_ns(ns);
+        if !self.lazy_attach && !dynamic_partition {
             return Ok(());
         }
         if self.collections.read().await.contains_key(ns) {
@@ -2982,6 +3345,18 @@ impl CollectionManager {
         ids: &[u64],
     ) -> Result<(usize, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
         crate::metrics::inc(&crate::metrics::DELETE_REQUESTS_TOTAL);
+        // Ids alone don't say which partition holds them (a fan-out probe of
+        // every partition would be unbounded) — partitioned collections
+        // delete via POST /delete with the partition filter. This applies to
+        // writer nodes too: a tombstone appended to the PARENT namespace
+        // would never be materialized by any serving node.
+        if self.is_partitioned_any_role(collection_name).await? {
+            return Err(format!(
+                "collection '{collection_name}' is partitioned: delete via filters \
+                 (POST .../delete with the partition field), not bare ids"
+            )
+            .into());
+        }
         // Writer role: durable tombstone only. Without local indexes we can't
         // filter to ids-that-exist; a tombstone for an absent id is an
         // idempotent no-op on replay, so append the deduped set as-is.
@@ -2998,8 +3373,11 @@ impl CollectionManager {
             // Ids can never legitimately reach the allocator frontier; a bogus
             // huge id would otherwise poison max_id forever (rebuilds compute
             // next_id = max_id + 1 → overflow / id reuse).
-            let frontier =
-                crate::storage::id_alloc::frontier(self.storage.as_ref(), collection_name).await?;
+            let frontier = crate::storage::id_alloc::frontier(
+                self.storage.as_ref(),
+                partitions::alloc_ns(collection_name),
+            )
+            .await?;
             if let Some(bad) = newly.iter().find(|id| **id >= frontier) {
                 return Err(format!(
                     "chunk id {bad} was never allocated in '{collection_name}' \
@@ -3124,6 +3502,26 @@ impl CollectionManager {
                  (delete by explicit ids instead)"
                     .into(),
             );
+        }
+        // Partitioned collection: route to the partitions named by the filter
+        // (same routing rule as search; NotFound partitions delete nothing).
+        if let Some(field) = self.partition_field(collection_name).await? {
+            let pvals = partitions::partition_values_from_filters(&field, filters)?;
+            let multi = pvals.len() > 1;
+            let mut total = 0usize;
+            let mut last_seq = None;
+            for pval in pvals {
+                let ns = partitions::partition_ns(collection_name, &pval);
+                match Box::pin(self.delete_by_filter(&ns, filters)).await {
+                    Ok((n, seq)) => {
+                        total += n;
+                        last_seq = seq;
+                    }
+                    Err(e) if e.downcast_ref::<NotFound>().is_some() => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok((total, if multi { None } else { last_seq }));
         }
         self.ensure_attached(collection_name).await?;
         // Resolve matching live ids from the roaring filter index — the same
@@ -3379,6 +3777,8 @@ impl CollectionManager {
         if self.role == NodeRole::Writer {
             return Err("this node runs in writer role and does not serve queries".into());
         }
+        self.reject_if_partitioned(collection_name, "facet counting")
+            .await?;
         self.ensure_attached(collection_name).await?;
         let collections = self.collections.read().await;
         let loaded = collections.get(collection_name).ok_or_else(|| {
@@ -3428,6 +3828,8 @@ impl CollectionManager {
         time_start_ms: Option<f64>,
         time_end_ms: Option<f64>,
     ) -> Result<Vec<DocumentChunk>, Box<dyn std::error::Error + Send + Sync>> {
+        self.reject_if_partitioned(collection_name, "temporal segment lookup")
+            .await?;
         let collections = self.collections.read().await;
         let loaded = collections.get(collection_name).ok_or_else(|| {
             not_found(format_args!("Collection \'{}\' not found", collection_name))

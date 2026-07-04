@@ -155,6 +155,11 @@ fn default_dims() -> usize {
 pub struct CollectionConfig {
     #[serde(default = "default_embed_model")]
     pub embed_model: String,
+    /// Tenant-partitioned collections: the metadata field whose (string)
+    /// value routes each chunk to its own internal partition namespace.
+    /// Immutable after create. None = normal single-namespace collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_by: Option<String>,
 }
 
 fn default_embed_model() -> String {
