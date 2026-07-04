@@ -4,6 +4,7 @@
 set -u
 FULL=${FULL:-localhost:4001}
 WRITER=${WRITER:-localhost:4009}
+COLD=${COLD:-}   # optional: a COMPASS_COLD_SERVE node against the same bucket
 pass=0; fail=0
 ok(){ echo "  ✅ $1"; pass=$((pass+1)); }
 bad(){ echo "  ❌ $1 ($2)"; fail=$((fail+1)); }
@@ -145,6 +146,26 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE $FULL/collections/e2e)
 [ "$code" -lt 400 ] && ok "delete collection" || bad coll-del "$code"
 code=$(curl -s -o /dev/null -w '%{http_code}' $FULL/collections/e2e)
 [ "$code" = "404" ] || [ "$(curl -s $FULL/collections/e2e)" = "null" ] && ok "collection gone" || bad gone "$code"
+
+if [ -n "$COLD" ]; then
+echo "── serve-from-storage (cold node) ──"
+post $FULL/collections '{"name":"icy","embedding_dims":4}' >/dev/null
+post $FULL/collections/icy/ingest '{"chunks":[
+ {"file_id":"i1","chunk_index":0,"doc_type":"chunk","text":"glacier core","metadata":{"kind":"ice"},"embeddings":{"default":[0.9,0.1,0.1,0.1]}},
+ {"file_id":"i2","chunk_index":0,"doc_type":"chunk","text":"magma core","metadata":{"kind":"fire"},"embeddings":{"default":[0.1,0.9,0.1,0.1]}}]}' >/dev/null
+r=$(post $COLD/collections/icy/search '{"query":"","mode":"semantic","top_k":3,"query_vector":[0.9,0.1,0.1,0.1]}')
+f1=$(echo "$r" | jqn "d['results'][0]['chunk']['file_id']")
+[ "$f1" = "i1" ] && ok "cold node answers without attach" || bad cold-search "$f1"
+n=$(post $COLD/collections/icy/search '{"query":"","mode":"semantic","top_k":3,"query_vector":[0.9,0.1,0.1,0.1],"filters":{"kind":"fire"}}' | jqn "d['results'][0]['chunk']['file_id']")
+[ "$n" = "i2" ] && ok "cold filters apply" || bad cold-filter "$n"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST $COLD/collections/icy/search -H 'content-type: application/json' -d '{"query":"glacier","mode":"fts"}')
+[ "$code" -ge 400 ] && ok "cold FTS rejected with guidance" || bad cold-fts "$code"
+wseq2=$(post $WRITER/collections/icy/ingest '{"chunks":[{"file_id":"i3","chunk_index":0,"doc_type":"chunk","text":"fresh tail","metadata":{"kind":"new"},"embeddings":{"default":[0.1,0.1,0.9,0.1]}}]}' | jqn "d['seq']")
+f3=$(post $COLD/collections/icy/search '{"query":"","mode":"semantic","top_k":1,"query_vector":[0.1,0.1,0.9,0.1]}' | jqn "d['results'][0]['chunk']['file_id']")
+[ "$f3" = "i3" ] && ok "cold read-your-writes (writer tail visible instantly, seq $wseq2)" || bad cold-ryw "$f3"
+curl -s $COLD/metrics | grep -q "compass_cold_searches_total [1-9]" && ok "cold metrics counting" || bad cold-metrics x
+curl -s -o /dev/null -X DELETE $FULL/collections/icy
+fi
 
 echo ""
 echo "E2E RESULT: $pass passed, $fail failed"
