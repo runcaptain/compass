@@ -724,6 +724,21 @@ impl CollectionManager {
                     }
                 }
                 Err(crate::storage::StorageError::AlreadyExists(_)) => {
+                    if partitions::is_partition_ns(name) {
+                        // A racing writer bootstrapped this partition's
+                        // manifest between our config write and here. That is
+                        // the expected create race for partitions — the
+                        // namespace (config + manifest) is exactly what we
+                        // wanted; adopt it. (Destroying the config here left
+                        // a config-less namespace that cold serving and warm
+                        // attach then disagreed about.)
+                        rollback_local().await;
+                        return Err(format!(
+                            "Collection '{}' already exists in object storage",
+                            name
+                        )
+                        .into());
+                    }
                     // Data exists in the bucket without a config (pre-v0.4
                     // namespace): this create collides with real data. Remove
                     // the config we just wrote and refuse.
@@ -748,7 +763,14 @@ impl CollectionManager {
             && collection.config.partition_by.is_some()
             && !partitions::is_partition_ns(name)
         {
-            crate::storage::id_alloc::seed(self.storage.as_ref(), name, 0).await?;
+            if let Err(e) = crate::storage::id_alloc::seed(self.storage.as_ref(), name, 0).await {
+                // Roll back: a partitioned parent without an allocator could
+                // never ingest (the migrate path needs a manifest that local
+                // mode deliberately doesn't have).
+                self.collections.write().await.remove(name);
+                let _ = store::delete_collection_data(&self.data_dir, name);
+                return Err(format!("id allocator seed failed: {e}").into());
+            }
         }
 
         tracing::info!("Created collection '{}'", name);
@@ -1202,20 +1224,51 @@ impl CollectionManager {
     > {
         let start = std::time::Instant::now();
         crate::metrics::inc(&crate::metrics::COLD_SEARCHES_TOTAL);
-        if req.mode == "fts" {
+        // The cold path is pure vector search. Anything that needs local
+        // indexes or the scoring pipeline is REJECTED, not silently ignored —
+        // identical requests must never return materially different rankings
+        // cold vs. warm without a signal. ("hybrid" with an empty text query
+        // degenerates to semantic legitimately and is allowed.)
+        if req.mode == "fts" || (req.mode == "hybrid" && !req.query.is_empty()) {
             return Err(format!(
-                "collection '{ns}' is cold (not attached): full-text search needs local \
-                 indexes. Use semantic mode, or query again after the namespace warms."
+                "collection '{ns}' is cold (not attached): '{}' search needs local \
+                 indexes. Use mode \"semantic\", or query again after the namespace warms.",
+                req.mode
+            )
+            .into());
+        }
+        if req.recency.is_some()
+            || req.recency_preset.is_some()
+            || !req.boosts.is_empty()
+            || req.relationship_boost.is_some()
+            || req.include_relations
+        {
+            return Err(format!(
+                "collection '{ns}' is cold (not attached): recency/boosts/relationship \
+                 options need the warm scoring pipeline. Drop them, or query again after \
+                 the namespace warms."
             )
             .into());
         }
 
-        // The bucket config names the default space and proves existence.
-        let cfg = self.bucket_config(ns, false).await?;
+        // The bucket config names the default space. A namespace can hold
+        // data WITHOUT a config (older create paths could destroy the config
+        // after a race) — warm attach accepts manifest-exists, so cold must
+        // too, falling back to the requested/"default" space.
+        let default_space = match self.bucket_config(ns, false).await {
+            Ok(cfg) => cfg.default_vector_space.clone(),
+            Err(e) if e.downcast_ref::<NotFound>().is_some() => {
+                if !self.storage.exists(&format!("{ns}/manifest")).await? {
+                    return Err(e);
+                }
+                None
+            }
+            Err(e) => return Err(e),
+        };
         let space = req
             .vector_space
             .clone()
-            .or_else(|| cfg.default_vector_space.clone())
+            .or(default_space)
             .unwrap_or_else(|| "default".to_string());
 
         let query_vec: Vec<f32> = match &req.query_vector {
@@ -1305,13 +1358,21 @@ impl CollectionManager {
         if after == 0 {
             return;
         }
-        let hits = {
+        let fire = {
             let mut map = self.cold_hits.lock().unwrap();
             let e = map.entry(ns.to_string()).or_insert(0);
             *e += 1;
-            *e
+            // Reset at the threshold so a namespace that got promoted and
+            // later LRU-evicted can warm AGAIN after `after` fresh cold hits
+            // (an == latch would seal shut forever after the first firing).
+            if *e >= after {
+                *e = 0;
+                true
+            } else {
+                false
+            }
         };
-        if hits == after {
+        if fire {
             if let Some(m) = self.self_weak.get().and_then(|w| w.upgrade()) {
                 let ns = ns.to_string();
                 tokio::spawn(async move {
@@ -1346,12 +1407,15 @@ impl CollectionManager {
         }
         if self.cloud_mode {
             // Unattached: the bucket config answers without an attach. A
-            // missing namespace answers None here — the caller's own lookup
-            // produces the not-found.
+            // MISSING config means "not partitioned" (the caller's own lookup
+            // produces the not-found) — but a transient storage error must
+            // PROPAGATE: swallowing it would reclassify a partitioned
+            // collection as unpartitioned and misroute tenant writes into the
+            // parent namespace, where no partition-routed search looks.
             return Ok(
-                match cloud::read_bucket_config(self.storage.as_ref(), name).await {
-                    Ok(Some(cfg)) => cfg.config.partition_by,
-                    _ => None,
+                match cloud::read_bucket_config(self.storage.as_ref(), name).await? {
+                    Some(cfg) => cfg.config.partition_by,
+                    None => None,
                 },
             );
         }
@@ -1374,18 +1438,32 @@ impl CollectionManager {
         if self.cloud_mode && self.registered.read().await.contains(&ns) {
             return Ok(ns); // lazy attach loads it at the entry point
         }
-        let (spaces, config) = {
+        // Parent template: attached metadata when present, else the bucket
+        // config — a lazy/cold-serve node routes partitioned ingest without
+        // ever attaching the parent, so requiring attachment here would break
+        // first ingest of a new tenant on exactly those nodes.
+        let attached_template = {
             let collections = self.collections.read().await;
-            let parent_meta = collections
-                .get(parent)
-                .ok_or_else(|| not_found(format_args!("Collection '{}' not found", parent)))?;
-            (
-                parent_meta.metadata.vector_spaces.clone(),
-                CollectionConfig {
-                    embed_model: parent_meta.metadata.config.embed_model.clone(),
-                    partition_by: None,
-                },
-            )
+            collections.get(parent).map(|p| {
+                (
+                    p.metadata.vector_spaces.clone(),
+                    p.metadata.config.embed_model.clone(),
+                )
+            })
+        };
+        let (spaces, embed_model) = match attached_template {
+            Some(t) => t,
+            None if self.cloud_mode => {
+                let cfg = self.bucket_config(parent, false).await?;
+                (cfg.vector_spaces.clone(), cfg.config.embed_model.clone())
+            }
+            None => {
+                return Err(not_found(format_args!("Collection '{}' not found", parent)));
+            }
+        };
+        let config = CollectionConfig {
+            embed_model,
+            partition_by: None,
         };
         match self
             .create_collection_inner(&ns, Some(spaces), None, Some(config))
@@ -1495,6 +1573,11 @@ impl CollectionManager {
         if self.bucket_configs.read().await.contains_key(&ns) {
             return Ok(ns);
         }
+        // First sight of this partition: re-validate the PARENT with a fresh
+        // read before creating bucket objects. A writer's cached parent
+        // config outlives a cascade delete — bootstrapping from it would
+        // resurrect the collection as an orphan namespace.
+        let parent_cfg = self.bucket_config(&parent_cfg.name, true).await?;
         let mut part_cfg = parent_cfg.clone();
         part_cfg.name = ns.clone();
         part_cfg.config.partition_by = None;
@@ -1538,11 +1621,15 @@ impl CollectionManager {
             return Ok(false);
         }
         if self.role == NodeRole::Writer {
-            return Ok(self
-                .bucket_config(name, false)
-                .await
-                .map(|c| c.config.partition_by.is_some())
-                .unwrap_or(false));
+            return match self.bucket_config(name, false).await {
+                Ok(c) => Ok(c.config.partition_by.is_some()),
+                // Unknown collection: not partitioned (downstream 404s).
+                Err(e) if e.downcast_ref::<NotFound>().is_some() => Ok(false),
+                // Transient storage errors PROPAGATE — treating them as
+                // "not partitioned" would let a writer append tombstones
+                // into the parent namespace no serving node materializes.
+                Err(e) => Err(e),
+            };
         }
         Ok(self.partition_field(name).await?.is_some())
     }
@@ -3313,7 +3400,10 @@ impl CollectionManager {
         if self.max_attached == 0 {
             return;
         }
-        // Pick the victim under a short read lock.
+        // Pick the victim under a short read lock. In NON-lazy mode only
+        // dynamic partition namespaces may be evicted — a normal collection
+        // evicted there could never re-attach (ensure_attached early-returns
+        // for non-partitions when lazy attach is off).
         let victim: Option<String> = {
             let collections = self.collections.read().await;
             if collections.len() <= self.max_attached {
@@ -3322,6 +3412,7 @@ impl CollectionManager {
                 collections
                     .iter()
                     .filter(|(name, _)| name.as_str() != just_attached)
+                    .filter(|(name, _)| self.lazy_attach || partitions::is_partition_ns(name))
                     .min_by_key(|(_, l)| l.last_used.load(std::sync::atomic::Ordering::Relaxed))
                     .map(|(name, _)| name.clone())
             }
@@ -3578,11 +3669,14 @@ impl CollectionManager {
         // writer nodes too: a tombstone appended to the PARENT namespace
         // would never be materialized by any serving node.
         if self.is_partitioned_any_role(collection_name).await? {
-            return Err(format!(
-                "collection '{collection_name}' is partitioned: delete via filters \
-                 (POST .../delete with the partition field), not bare ids"
-            )
-            .into());
+            let hint = if self.role == NodeRole::Writer {
+                "route the delete through a serving node (writers cannot resolve \
+                 partition-scoped filters)"
+            } else {
+                "delete via filters (POST .../delete with the partition field), \
+                 not bare ids"
+            };
+            return Err(format!("collection '{collection_name}' is partitioned: {hint}").into());
         }
         // Writer role: durable tombstone only. Without local indexes we can't
         // filter to ids-that-exist; a tombstone for an absent id is an
@@ -4196,7 +4290,7 @@ pub(crate) async fn compact_storage(
             crate::storage::lsm::read_uncompacted_fragments_strict(storage, ns, &manifest).await?;
         let segment = cloud::fold_tail(&frags)?;
         let records = segment.chunks.len() as u64;
-        let bytes = cloud::encode_segment_v2(&segment)?;
+        let bytes = cloud::encode_segment_v3(&segment)?;
         match crate::storage::lsm::append_segment(
             storage,
             ns,

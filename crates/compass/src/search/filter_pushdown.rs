@@ -84,8 +84,9 @@ mod tests {
     use super::*;
 
     // Semantics (eq / range / contains / in, AND across fields) are covered
-    // end-to-end in filter_index.rs tests via FilterIndex::eligible — the one
-    // live evaluator. These only pin the compile() shape.
+    // in filter_index.rs tests (FilterIndex::eligible, the warm evaluator)
+    // and cold.rs (eval_filters, its cold-path mirror). These only pin the
+    // compile() shape.
     #[test]
     fn compile_shapes() {
         let mut f = HashMap::new();

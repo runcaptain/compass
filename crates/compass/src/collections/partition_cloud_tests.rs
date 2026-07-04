@@ -162,7 +162,11 @@ async fn writer_partitioned_ingest_visible_on_serving_node() {
 
     // Writer refuses partitioned operations that would black-hole data.
     let err = writer.delete_chunks("wp", &[0]).await.unwrap_err();
-    assert!(err.to_string().contains("delete via filters"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("route the delete through a serving node"),
+        "{err}"
+    );
     let err = writer
         .create_relations(
             "wp",

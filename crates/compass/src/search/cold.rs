@@ -26,17 +26,17 @@ use std::sync::Arc;
 
 /// Clusters probed per segment per query (env-tunable via the manager).
 pub const DEFAULT_NPROBE: usize = 8;
-/// Overfetch factor before filtering/deduping down to top_k.
+/// Overfetch factor before deduping down to top_k.
 const OVERFETCH: usize = 4;
+/// Additional overfetch multiplier when metadata filters are present (cold
+/// filtering is post-selection; see the recall-contract note in search()).
+const FILTER_OVERFETCH: usize = 8;
 /// Header bytes fetched optimistically (magic + max_id + toc_len + TOC).
 const HEADER_PROBE: u64 = 16 * 1024;
 /// metaidx at or below this size is fetched whole; larger ones page in
 /// blocks on demand.
 const METAIDX_FULL_MAX: u64 = 8 * 1024 * 1024;
 const METAIDX_BLOCK_ROWS: usize = 2048;
-
-const MAGIC_V2: &[u8; 8] = b"CSEG0002";
-const MAGIC_V3: &[u8; 8] = b"CSEG0003";
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -48,8 +48,9 @@ pub struct ColdSegment {
     sections: HashMap<String, (u64, u64)>,
     /// space -> parsed centroids + cluster directory
     cents: HashMap<String, ivf::Centroids>,
-    /// ids tombstoned BY this segment (apply to this and all older segments)
-    pub tombstones: HashSet<u64>,
+    /// ids tombstoned BY this segment (they apply to OLDER segments only —
+    /// see the generation rule in `search`)
+    tombstones: HashSet<u64>,
     metaidx: MetaIdx,
 }
 
@@ -82,15 +83,29 @@ impl ColdSegment {
     /// Build the cached artifacts with a few small reads. Total fetched:
     /// TOC + centroids + tombstones + (metaidx or its anchors).
     pub async fn open(storage: &dyn Storage, ns: &str, segment_id: &str) -> Result<Self, BoxErr> {
+        Self::open_with_limits(storage, ns, segment_id, METAIDX_FULL_MAX).await
+    }
+
+    /// `open` with an explicit full-fetch threshold — lets tests exercise the
+    /// paged metadata-index path without a 400k-chunk segment.
+    async fn open_with_limits(
+        storage: &dyn Storage,
+        ns: &str,
+        segment_id: &str,
+        metaidx_full_max: u64,
+    ) -> Result<Self, BoxErr> {
         let key = seg_key(ns, segment_id);
         // Header + TOC (optimistic single read; re-read if the TOC is huge).
         let head = storage.get_range(&key, 0..HEADER_PROBE).await?;
         if head.len() < 20 {
             return Err(format!("segment {segment_id}: truncated header").into());
         }
-        if &head[0..8] != MAGIC_V3 && &head[0..8] != MAGIC_V2 {
+        // Only v3 segments carry the cold-read sections (metaidx/meta2 and
+        // clusters). v2 would brute-force its whole flat section and then
+        // drop every hit at hydration — reject loudly instead.
+        if head[0..8] != crate::collections::cloud::SEG_MAGIC_V3 {
             return Err(format!(
-                "segment {segment_id} is not cold-servable (pre-v2 JSON format); \
+                "segment {segment_id} predates the cold-servable format; \
                  run POST /collections/:name/compact once to upgrade it"
             )
             .into());
@@ -135,9 +150,15 @@ impl ColdSegment {
         // Metadata index: whole if small, paged anchors otherwise.
         let metaidx = match sections.get("metaidx") {
             Some(&(off, len)) if len > 8 => {
-                if len <= METAIDX_FULL_MAX {
+                if len <= metaidx_full_max {
                     let body = get_range(storage, &key, off, len).await?;
                     let n = u64::from_le_bytes(body[0..8].try_into().unwrap()) as usize;
+                    if body.len() < 8 + n * 20 {
+                        return Err(format!(
+                            "segment {segment_id}: truncated metaidx ({n} rows declared)"
+                        )
+                        .into());
+                    }
                     let mut rows = Vec::with_capacity(n);
                     for i in 0..n {
                         let p = 8 + i * 20;
@@ -149,15 +170,9 @@ impl ColdSegment {
                     }
                     MetaIdx::Full(rows)
                 } else {
-                    // Anchor row (the id) of every block: one strided read per
-                    // block start — batched into a single ranged read of the
-                    // first 8 bytes of each block would still be N requests;
-                    // instead read the count, then fetch anchor ids in one
-                    // pass over block-leading rows via a coalesced read of
-                    // just the id columns is not possible over HTTP — so
-                    // fetch the whole index ONCE here (paged builds accept a
-                    // one-time cost bounded by index size / 50MB at 2.5M
-                    // rows) and keep only anchors resident.
+                    // Big index: fetch it whole ONCE at open (bounded by
+                    // index size, ~20B/row) but keep only per-block anchor
+                    // ids resident; lookups page 20B×2048 blocks on demand.
                     let body = get_range(storage, &key, off, len).await?;
                     let n = u64::from_le_bytes(body[0..8].try_into().unwrap());
                     let mut anchors = Vec::new();
@@ -310,11 +325,19 @@ pub async fn search(
     let mut q = query.to_vec();
     ivf::normalize(&mut q);
 
-    // Tombstones: every segment's carried deletes + the live WAL tail's.
-    let mut dead: HashSet<u64> = HashSet::new();
-    for s in segments {
-        dead.extend(s.tombstones.iter().copied());
-    }
+    // Tombstone semantics must match materialize(): a segment's carried
+    // tombstones apply only to OLDER segments (its own chunks are written
+    // after them, and a NEWER segment's re-ingest of the same id must
+    // survive). So a candidate from generation g dies only to a tombstone
+    // from generation > g. A single flat union would permanently suppress
+    // re-ingested chunks that warm search serves.
+    let tomb_of = |generation: usize| -> &HashSet<u64> { &segments[generation].tombstones };
+    let killed_by_newer = |id: u64, generation: usize| -> bool {
+        ((generation + 1)..segments.len()).any(|j| tomb_of(j).contains(&id))
+    };
+    // Tail tombstones (replayed in seq order below) are the newest
+    // generation of all: they kill any segment candidate.
+    let mut tail_dead: HashSet<u64> = HashSet::new();
 
     // WAL tail: bounded by the auto-compaction threshold in healthy
     // operation. A pathologically long tail (compaction disabled/failing)
@@ -337,7 +360,7 @@ pub async fn search(
                 let chunks: Vec<DocumentChunk> = serde_json::from_slice(payload)
                     .map_err(|e| format!("tail fragment decode: {e}"))?;
                 for c in chunks {
-                    dead.remove(&c.id); // re-ingest after delete resurrects
+                    tail_dead.remove(&c.id); // re-ingest after delete resurrects
                     tail_chunks.insert(c.id, c);
                 }
             }
@@ -345,7 +368,7 @@ pub async fn search(
                 let ids: Vec<u64> = serde_json::from_slice(payload)
                     .map_err(|e| format!("tail tombstone decode: {e}"))?;
                 for id in ids {
-                    dead.insert(id);
+                    tail_dead.insert(id);
                     tail_chunks.remove(&id);
                 }
             }
@@ -353,7 +376,17 @@ pub async fn search(
         }
     }
 
-    let want = (top_k * OVERFETCH).max(top_k);
+    // Filters are applied POST-candidate-selection on the cold path (there
+    // is no roaring index to push down without attaching), so a selective
+    // filter needs a deeper candidate pool. Recall contract: cold filtered
+    // queries can under-return when matches are rarer than ~1/FILTER_OVERFETCH
+    // of the probed neighborhoods; warm search has no such limit.
+    let overfetch = if filters.is_empty() {
+        OVERFETCH
+    } else {
+        OVERFETCH * FILTER_OVERFETCH
+    };
+    let want = (top_k * overfetch).max(top_k).min(512);
     let mut candidates: Vec<Candidate> = Vec::new();
 
     // Segment candidates: probe clusters (or brute-force flat sections).
@@ -389,7 +422,10 @@ pub async fn search(
         .await?;
         for body in bodies {
             for (id, v) in ivf::parse_cluster_rows(&body, dims) {
-                if dead.contains(&id) || tail_chunks.contains_key(&id) {
+                if tail_dead.contains(&id)
+                    || tail_chunks.contains_key(&id)
+                    || killed_by_newer(id, gen)
+                {
                     continue;
                 }
                 // Flat sections store raw vectors; clustered store unit-norm.
@@ -504,9 +540,12 @@ fn eval_filters(expr: &FilterExpr, chunk: &DocumentChunk) -> bool {
             Some(n) => gte.map(|g| n >= g).unwrap_or(true) && lte.map(|l| n <= l).unwrap_or(true),
             None => false,
         },
+        // Parity with FilterIndex: `contains` matches STRING LISTS only (the
+        // warm index populates string_list_contains from StringList values) —
+        // matching bare strings here would make cold return hits warm never
+        // would.
         Predicate::Contains { field, value } => match get(field) {
             Some(MetadataValue::StringList(xs)) => xs.iter().any(|x| x == value),
-            Some(MetadataValue::String(s)) => &s == value,
             _ => false,
         },
         Predicate::In { field, values } => match get(field) {
@@ -514,4 +553,210 @@ fn eval_filters(expr: &FilterExpr, chunk: &DocumentChunk) -> bool {
             _ => false,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::local::LocalDiskStorage;
+
+    fn storage(name: &str) -> (std::path::PathBuf, Arc<dyn Storage>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "compass_cold_unit_{}_{}_{}",
+            name,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s: Arc<dyn Storage> = Arc::new(LocalDiskStorage::new(&root).unwrap());
+        (root, s)
+    }
+
+    fn seg_with_chunks(ids: &[u64], tombstones: &[u64]) -> Vec<u8> {
+        use crate::models::DocumentChunk;
+        let chunks: Vec<DocumentChunk> = ids
+            .iter()
+            .map(|&i| {
+                let mut c = DocumentChunk {
+                    id: i,
+                    collection: "ns".into(),
+                    file_id: format!("f{i}"),
+                    chunk_index: 0,
+                    page: None,
+                    text: format!("t{i}"),
+                    metadata: Default::default(),
+                    doc_type: "chunk".into(),
+                    parent_id: None,
+                    group_id: None,
+                    embeddings: Default::default(),
+                    embedding: None,
+                };
+                c.embeddings
+                    .insert("default".into(), vec![i as f32, 1.0, 0.0, 0.0]);
+                c
+            })
+            .collect();
+        crate::collections::cloud::encode_segment_v3(&crate::collections::cloud::Segment {
+            version: 2,
+            chunks,
+            relations: vec![],
+            max_id: ids.iter().copied().max().unwrap_or(0),
+            tombstones: tombstones.to_vec(),
+            relation_tombstones: vec![],
+        })
+        .unwrap()
+    }
+
+    // C1 regression: an OLDER segment's carried tombstone must not suppress
+    // the same id re-ingested into a NEWER segment (materialize parity).
+    #[tokio::test]
+    async fn newer_segment_survives_older_tombstone() {
+        let (root, s) = storage("gen");
+        // seg A (gen 0): chunk 1 live, carries tombstone for id 5.
+        s.put(
+            "ns/segments/a",
+            bytes::Bytes::from(seg_with_chunks(&[1], &[5])),
+        )
+        .await
+        .unwrap();
+        // seg B (gen 1): id 5 re-ingested.
+        s.put(
+            "ns/segments/b",
+            bytes::Bytes::from(seg_with_chunks(&[5], &[])),
+        )
+        .await
+        .unwrap();
+        let manifest = lsm::Manifest {
+            segments: vec![
+                lsm::SegmentRef {
+                    id: "a".into(),
+                    records: 1,
+                },
+                lsm::SegmentRef {
+                    id: "b".into(),
+                    records: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let segs = vec![
+            Arc::new(ColdSegment::open(s.as_ref(), "ns", "a").await.unwrap()),
+            Arc::new(ColdSegment::open(s.as_ref(), "ns", "b").await.unwrap()),
+        ];
+        let hits = search(
+            s.as_ref(),
+            "ns",
+            &segs,
+            &manifest,
+            "default",
+            &[5.0, 1.0, 0.0, 0.0],
+            10,
+            DEFAULT_NPROBE,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter().any(|(c, _)| c.id == 5),
+            "id 5 lives in the NEWER segment; the older tombstone must not kill it"
+        );
+        // And the reverse still holds: a NEWER segment's tombstone kills an
+        // OLDER segment's chunk.
+        s.put(
+            "ns/segments/c",
+            bytes::Bytes::from(seg_with_chunks(&[9], &[1])),
+        )
+        .await
+        .unwrap();
+        let manifest2 = lsm::Manifest {
+            segments: vec![
+                lsm::SegmentRef {
+                    id: "a".into(),
+                    records: 1,
+                },
+                lsm::SegmentRef {
+                    id: "c".into(),
+                    records: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let segs2 = vec![
+            segs[0].clone(),
+            Arc::new(ColdSegment::open(s.as_ref(), "ns", "c").await.unwrap()),
+        ];
+        let hits = search(
+            s.as_ref(),
+            "ns",
+            &segs2,
+            &manifest2,
+            "default",
+            &[1.0, 1.0, 0.0, 0.0],
+            10,
+            DEFAULT_NPROBE,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter().all(|(c, _)| c.id != 1),
+            "newer segment's tombstone must kill the older chunk"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Paged metadata-index path: force it with a tiny full-fetch threshold
+    // and verify hydration still resolves every candidate.
+    #[tokio::test]
+    async fn paged_metaidx_hydrates() {
+        let (root, s) = storage("paged");
+        let ids: Vec<u64> = (0..50).collect();
+        s.put(
+            "ns/segments/p",
+            bytes::Bytes::from(seg_with_chunks(&ids, &[])),
+        )
+        .await
+        .unwrap();
+        let seg = ColdSegment::open_with_limits(s.as_ref(), "ns", "p", 16)
+            .await
+            .unwrap();
+        assert!(
+            matches!(seg.metaidx, MetaIdx::Paged { .. }),
+            "tiny threshold must force the paged variant"
+        );
+        let ranges = seg
+            .meta_ranges(s.as_ref(), &[0, 7, 49, 999_999])
+            .await
+            .unwrap();
+        let found: std::collections::HashSet<u64> = ranges.iter().map(|r| r.0).collect();
+        assert_eq!(
+            found,
+            [0u64, 7, 49].into_iter().collect(),
+            "paged lookups must resolve present ids and skip absent ones"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Pre-v3 segments are rejected loudly — v2 has no metaidx, so cold
+    // serving it would read the whole flat section and then drop every hit.
+    #[tokio::test]
+    async fn v2_segment_rejected_with_upgrade_hint() {
+        let (root, s) = storage("v2");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::collections::cloud::SEG_MAGIC_V2);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(b"[]");
+        s.put("ns/segments/old", bytes::Bytes::from(bytes))
+            .await
+            .unwrap();
+        let err = match ColdSegment::open(s.as_ref(), "ns", "old").await {
+            Err(e) => e,
+            Ok(_) => panic!("v2 segment must be rejected"),
+        };
+        assert!(err.to_string().contains("compact"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

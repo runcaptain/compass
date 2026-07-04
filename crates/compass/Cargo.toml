@@ -14,9 +14,9 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Requires CUDA 12+ and a Linux host. See ARCHITECTURE.md for build details.
-# Opt-in object-storage backend (S3/GCS/Azure/MinIO) via the object_store crate.
-# Off by default — local-first deployments pull in zero extra dependencies.
+# Opt-in object-storage backend (S3/GCS/Azure/MinIO) via the object_store
+# crate. Off by default; local-first builds skip the object_store dependency
+# tree (`futures` is unconditional — the cold read path uses it).
 object-storage = ["dep:object_store"]
 
 [dependencies]

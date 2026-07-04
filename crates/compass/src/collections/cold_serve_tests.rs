@@ -317,3 +317,57 @@ async fn cold_hits_promote_background_attach() {
     assert_ne!(results[0].2, "semantic-cold");
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+// H1 regression: a LAZY (or cold-serve) node must ingest into a partitioned
+// collection for a brand-new tenant WITHOUT the parent ever being attached —
+// the partition template comes from the bucket config.
+#[tokio::test]
+async fn lazy_node_ingests_new_tenant_without_attaching_parent() {
+    let storage = mem_storage();
+    let embed = embed_state();
+    {
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = CollectionManager::new_with_storage(&dir, storage.clone())
+            .await
+            .unwrap();
+        a.create_collection(
+            "lz",
+            None,
+            Some(DIMS),
+            Some(CollectionConfig {
+                embed_model: "bge-small".to_string(),
+                partition_by: Some("tenant".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir_b = unique_data_dir();
+    let b = cold_manager(&dir_b, storage.clone()).await; // lazy + cold serve
+    let mut c = mk_chunk(0, "x");
+    c.metadata.insert(
+        "tenant".to_string(),
+        MetadataValue::String("fresh-tenant".to_string()),
+    );
+    let (n, _, _) = b
+        .ingest("lz", vec![c], &embed)
+        .await
+        .expect("lazy node must route partitioned ingest from bucket config");
+    assert_eq!(n, 1);
+    assert!(
+        !b.collections.read().await.contains_key("lz"),
+        "the parent must not have been attached to serve the ingest"
+    );
+    // And the data is queryable through the partition filter.
+    let mut req = semantic_req(0, 3);
+    req.filters.insert(
+        "tenant".to_string(),
+        FilterValue::Exact(MetadataValue::String("fresh-tenant".to_string())),
+    );
+    let (results, _, _, _) = b.search("lz", &req, &embed).await.unwrap();
+    assert_eq!(results.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
