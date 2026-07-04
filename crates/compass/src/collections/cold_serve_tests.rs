@@ -371,3 +371,34 @@ async fn lazy_node_ingests_new_tenant_without_attaching_parent() {
     assert_eq!(results.len(), 1);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+// Live-stack repro: the cold node boots BEFORE the collection exists (empty
+// registry), another node creates + ingests, cold must still answer.
+#[tokio::test]
+async fn cold_serves_collection_created_after_boot() {
+    let storage = mem_storage();
+    let embed = embed_state();
+    let dir_b = unique_data_dir();
+    let b = cold_manager(&dir_b, storage.clone()).await; // boots on empty bucket
+
+    let dir_a = unique_data_dir();
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let a = CollectionManager::new_with_storage(&dir_a, storage.clone())
+        .await
+        .unwrap();
+    a.create_collection("late", None, Some(DIMS), None)
+        .await
+        .unwrap();
+    a.ingest("late", vec![mk_chunk(1, "x")], &embed)
+        .await
+        .unwrap();
+
+    let (results, _, _, _) = b
+        .search("late", &semantic_req(1, 3), &embed)
+        .await
+        .expect("cold node must serve a collection created after its boot");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].2, "semantic-cold");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
