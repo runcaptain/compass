@@ -11,6 +11,8 @@
 
 pub mod cloud;
 #[cfg(all(test, feature = "object-storage"))]
+mod cold_serve_tests;
+#[cfg(all(test, feature = "object-storage"))]
 mod partition_cloud_tests;
 #[cfg(test)]
 mod partition_tests;
@@ -181,6 +183,21 @@ pub struct CollectionManager {
     lazy_attach: bool,
     /// LRU budget for attached collections (COMPASS_MAX_ATTACHED; 0 = unbounded).
     max_attached: usize,
+    /// Serve-from-storage (COMPASS_COLD_SERVE): semantic queries on
+    /// UNATTACHED namespaces are answered with object-storage range reads
+    /// instead of triggering an attach. Cloud + lazy mode only.
+    cold_serve: std::sync::atomic::AtomicBool,
+    /// Cold queries on a namespace before a background attach is kicked off
+    /// (COMPASS_WARM_AFTER; 0 = never warm automatically).
+    warm_after: std::sync::atomic::AtomicU32,
+    /// Cold-hit counters per namespace (drives warm promotion).
+    cold_hits: std::sync::Mutex<HashMap<String, u32>>,
+    /// Cached cold-read artifacts, keyed by "{ns}/{segment_id}". Segments are
+    /// immutable, so entries never go stale; bounded by simple clearing.
+    cold_segments: tokio::sync::RwLock<HashMap<String, Arc<crate::search::cold::ColdSegment>>>,
+    /// Weak self-reference for background tasks spawned from &self methods
+    /// (warm promotion). Set once right after construction.
+    self_weak: std::sync::OnceLock<std::sync::Weak<CollectionManager>>,
 }
 
 /// What this node does. Parsed from `COMPASS_ROLE` (default `full`).
@@ -230,9 +247,15 @@ impl CollectionManager {
         storage: Arc<dyn Storage>,
         role: NodeRole,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let lazy = std::env::var("COMPASS_LAZY_ATTACH")
+        let cold = std::env::var("COMPASS_COLD_SERVE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        // Cold serving implies lazy attach: its whole point is answering
+        // queries WITHOUT attaching, so eager boot-time attach is senseless.
+        let lazy = cold
+            || std::env::var("COMPASS_LAZY_ATTACH")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
         let max_attached = std::env::var("COMPASS_MAX_ATTACHED")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -241,7 +264,7 @@ impl CollectionManager {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
-        Self::new_with_storage_opts(
+        let manager = Self::new_with_storage_opts(
             data_dir,
             storage,
             role,
@@ -249,7 +272,14 @@ impl CollectionManager {
             max_attached,
             refresh_interval_secs,
         )
-        .await
+        .await?;
+        if cold {
+            manager.set_cold_serve(true);
+        }
+        if let Ok(Some(n)) = std::env::var("COMPASS_WARM_AFTER").map(|v| v.parse().ok()) {
+            manager.set_warm_after(n);
+        }
+        Ok(manager)
     }
 
     /// Fully-explicit constructor (role + lazy-attach + LRU budget), used by
@@ -289,7 +319,13 @@ impl CollectionManager {
             attach_locks: tokio::sync::Mutex::new(HashMap::new()),
             lazy_attach: cloud_mode && lazy_attach,
             max_attached,
+            cold_serve: std::sync::atomic::AtomicBool::new(false),
+            warm_after: std::sync::atomic::AtomicU32::new(3),
+            cold_hits: std::sync::Mutex::new(HashMap::new()),
+            cold_segments: tokio::sync::RwLock::new(HashMap::new()),
+            self_weak: std::sync::OnceLock::new(),
         });
+        let _ = manager.self_weak.set(Arc::downgrade(&manager));
 
         // Writer role: no local collections, no recovery — the node serves
         // durable appends only, validated against bucket configs. Boot is
@@ -1122,11 +1158,182 @@ impl CollectionManager {
         store::vectors_dir(&self.data_dir, collection_name)
     }
 
+    // ── Serve-from-storage (Phase 5) ─────────────────────────────────────
+
+    pub fn set_cold_serve(&self, on: bool) {
+        self.cold_serve
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cold hits before background warm promotion (0 disables promotion).
+    pub fn set_warm_after(&self, n: u32) {
+        self.warm_after
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn cold_serve(&self) -> bool {
+        self.cold_serve.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cold semantic search: manifest read (freshness anchor) → cached
+    /// per-segment artifacts → cluster probes → tail brute-force → hydrate.
+    /// FTS needs an inverted index and is not cold-servable — callers get a
+    /// clear error steering them to semantic mode (or a warmed node).
+    #[allow(clippy::type_complexity)]
+    async fn search_cold(
+        &self,
+        ns: &str,
+        req: &SearchRequest,
+        embed_state: &EmbedState,
+    ) -> Result<
+        (
+            Vec<(
+                DocumentChunk,
+                f32,
+                String,
+                Option<HashMap<String, MetadataValue>>,
+                Option<Vec<ChunkRelation>>,
+            )>,
+            usize,
+            u64,
+            Option<ExplainPlan>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let start = std::time::Instant::now();
+        crate::metrics::inc(&crate::metrics::COLD_SEARCHES_TOTAL);
+        if req.mode == "fts" {
+            return Err(format!(
+                "collection '{ns}' is cold (not attached): full-text search needs local \
+                 indexes. Use semantic mode, or query again after the namespace warms."
+            )
+            .into());
+        }
+
+        // The bucket config names the default space and proves existence.
+        let cfg = self.bucket_config(ns, false).await?;
+        let space = req
+            .vector_space
+            .clone()
+            .or_else(|| cfg.default_vector_space.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        let query_vec: Vec<f32> = match &req.query_vector {
+            Some(v) => v.clone(),
+            None => embed_state.embed_query(&req.query).map_err(|e| {
+                format!("cold search needs a query_vector or a loaded embed model: {e}")
+            })?,
+        };
+
+        let (manifest, _) = crate::storage::lsm::read_manifest(self.storage.as_ref(), ns).await?;
+        if let Some(min_seq) = req.min_seq {
+            // Cold reads see everything committed to the manifest, so
+            // read-your-writes holds by construction — only a seq beyond the
+            // write history is unsatisfiable.
+            if min_seq >= manifest.next_seq {
+                return Err(format!(
+                    "min_seq {} is beyond the collection's write history ({})",
+                    min_seq, manifest.next_seq
+                )
+                .into());
+            }
+        }
+
+        // Cached artifacts per segment (immutable → cache by id).
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for sref in &manifest.segments {
+            let key = format!("{ns}/{}", sref.id);
+            if let Some(cs) = self.cold_segments.read().await.get(&key).cloned() {
+                segments.push(cs);
+                continue;
+            }
+            let cs = Arc::new(
+                crate::search::cold::ColdSegment::open(self.storage.as_ref(), ns, &sref.id).await?,
+            );
+            let mut cache = self.cold_segments.write().await;
+            if cache.len() >= 1024 {
+                cache.clear(); // crude bound; entries rebuild in a few reads
+            }
+            cache.insert(key, cs.clone());
+            segments.push(cs);
+        }
+
+        let nprobe = std::env::var("COMPASS_COLD_NPROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::search::cold::DEFAULT_NPROBE);
+        let hits = crate::search::cold::search(
+            self.storage.as_ref(),
+            ns,
+            &segments,
+            &manifest,
+            &space,
+            &query_vec,
+            req.top_k,
+            nprobe,
+            &req.filters,
+        )
+        .await?;
+
+        self.maybe_warm(ns);
+
+        let took_us = start.elapsed().as_micros() as u64;
+        let total = hits.len();
+        let explain = req.explain.then(|| ExplainPlan {
+            filter: FilterExplain {
+                eligible_count: total as u64,
+                universe_count: 0, // unknown without attaching — cold reads don't scan
+                selectivity: 0.0,
+            },
+            ann: AnnExplain {
+                engine: "cold-ivf".to_string(),
+                candidates_inspected: None,
+                ef_search_used: 0,
+            },
+        });
+        let results = hits
+            .into_iter()
+            .map(|(c, score)| (c, score, "semantic-cold".to_string(), None, None))
+            .collect();
+        Ok((results, total, took_us, explain))
+    }
+
+    /// Count a cold hit; at the warm threshold, spawn a background attach so
+    /// a repeatedly-queried namespace migrates to the fast path on its own.
+    fn maybe_warm(&self, ns: &str) {
+        let after = self.warm_after.load(std::sync::atomic::Ordering::Relaxed);
+        if after == 0 {
+            return;
+        }
+        let hits = {
+            let mut map = self.cold_hits.lock().unwrap();
+            let e = map.entry(ns.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if hits == after {
+            if let Some(m) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                let ns = ns.to_string();
+                tokio::spawn(async move {
+                    crate::metrics::inc(&crate::metrics::WARM_PROMOTIONS_TOTAL);
+                    tracing::info!("cold namespace '{ns}' hit warm threshold; attaching");
+                    if let Err(e) = m.ensure_attached(&ns).await {
+                        tracing::warn!("warm promotion attach for '{ns}' failed: {e}");
+                        // Reset so a later burst can retry.
+                        m.cold_hits.lock().unwrap().remove(&ns);
+                    }
+                });
+            }
+        }
+    }
+
     // ── Tenant partitions (Phase 6) ──────────────────────────────────────
 
     /// The partition field of a collection, or None for normal collections
-    /// and partition namespaces themselves. Attaches the parent if needed
-    /// (cheap: a partitioned parent holds config only, no chunk data).
+    /// and partition namespaces themselves. Reads attached metadata when
+    /// present, else the (cached) bucket config — deliberately WITHOUT
+    /// attaching: cold-served and lazy namespaces must be routable from
+    /// config alone.
     async fn partition_field(
         &self,
         name: &str,
@@ -1134,11 +1341,21 @@ impl CollectionManager {
         if partitions::is_partition_ns(name) {
             return Ok(None);
         }
-        self.ensure_attached(name).await?;
-        let collections = self.collections.read().await;
-        Ok(collections
-            .get(name)
-            .and_then(|l| l.metadata.config.partition_by.clone()))
+        if let Some(loaded) = self.collections.read().await.get(name) {
+            return Ok(loaded.metadata.config.partition_by.clone());
+        }
+        if self.cloud_mode {
+            // Unattached: the bucket config answers without an attach. A
+            // missing namespace answers None here — the caller's own lookup
+            // produces the not-found.
+            return Ok(
+                match cloud::read_bucket_config(self.storage.as_ref(), name).await {
+                    Ok(Some(cfg)) => cfg.config.partition_by,
+                    _ => None,
+                },
+            );
+        }
+        Ok(None)
     }
 
     /// Make sure a partition namespace exists and is servable, creating it on
@@ -2253,6 +2470,16 @@ impl CollectionManager {
             return self
                 .search_partitioned(collection_name, &field, req, embed_state)
                 .await;
+        }
+
+        // Serve-from-storage: an UNATTACHED namespace answers semantic
+        // queries with a handful of object-storage range reads — no attach,
+        // no index rebuild. Repeated cold hits promote a background attach.
+        if self.cold_serve()
+            && self.cloud_mode
+            && !self.collections.read().await.contains_key(collection_name)
+        {
+            return self.search_cold(collection_name, req, embed_state).await;
         }
         self.ensure_attached(collection_name).await?;
 

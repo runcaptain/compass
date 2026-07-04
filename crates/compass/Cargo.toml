@@ -17,7 +17,7 @@ default = []
 # Requires CUDA 12+ and a Linux host. See ARCHITECTURE.md for build details.
 # Opt-in object-storage backend (S3/GCS/Azure/MinIO) via the object_store crate.
 # Off by default — local-first deployments pull in zero extra dependencies.
-object-storage = ["dep:object_store", "dep:futures"]
+object-storage = ["dep:object_store"]
 
 [dependencies]
 # Internal trait crate — defines VectorIndex, IndexParams, IndexError.
@@ -50,7 +50,7 @@ thiserror = { workspace = true }
 lru = { workspace = true }
 # Object-storage backend deps (optional, enabled by the `object-storage` feature).
 object_store = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

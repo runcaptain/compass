@@ -7,11 +7,13 @@
 
 pub mod chunk_cache;
 pub mod chunk_store;
+pub mod cold;
 #[cfg(test)]
 mod filter_bench;
 pub mod filter_index;
 pub mod filter_pushdown;
 pub mod hybrid;
+pub mod ivf;
 pub mod mmap_vectors;
 pub mod tantivy_fts;
 pub mod vector;

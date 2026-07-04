@@ -110,9 +110,8 @@ pub trait Storage: Send + Sync {
 
     /// Range read — fetch only `range` bytes of the object. The primitive that
     /// makes large segments servable without loading the whole object.
-    // Range reads are the sectioned-segment read primitive (v2 TOC points at
-    // byte ranges); both backends implement it, callers land with Phase 5/6.
-    #[allow(dead_code)]
+    /// Range read — the serve-from-storage primitive (segment TOCs point at
+    /// byte ranges; cold queries fetch only the sections they need).
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
     /// Read the object together with its current version, for a CAS cycle.

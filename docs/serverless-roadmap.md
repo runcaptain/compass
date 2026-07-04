@@ -1,6 +1,6 @@
 # Serverless Roadmap
 
-> Status: Phases 0-3 SHIPPED on feat/warm-serverless (v0.4.0 candidate); Phases 4+ planned. Target: evolve Compass from a cloud-durable single-node
+> Status: Phases 0-3 SHIPPED (feat/warm-serverless); Phase 6 tenant partitions + Phase 5 serve-from-storage SHIPPED on their stacked branches; remaining: routing/affinity hooks, auth binding, intra-tenant sharding. Target: evolve Compass from a cloud-durable single-node
 > engine (v0.3.0) into a fully serverless database — storage/compute separated,
 > stateless workers, bounded cold starts, scale-to-zero — with **every item
 > additive and open source** under Apache 2.0. Local-first, zero-config

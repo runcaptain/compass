@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added — serve-from-storage (Phase 5, "true serverless")
+
+- **`COMPASS_COLD_SERVE=true`**: semantic queries on collections (and tenant partitions) that are NOT attached are answered directly from object storage — a manifest read, cached centroid/TOC artifacts, and a handful of range-GETs — instead of triggering a full index rebuild. Compaction now writes IVF-clustered vector sections (`cent:`/`clu:`, k-means, unit-normalized) plus a row-addressable metadata index (`meta2`/`metaidx`) into segments (format CSEG0003; v2 segments remain readable, pre-v0.5 readers fail loudly on v3). Cold reads see the full committed state including the WAL tail and tombstones, so read-your-writes holds by construction; metadata filters apply; FTS on a cold namespace returns a clear error (inverted indexes still need an attach). Repeated cold hits (`COMPASS_WARM_AFTER`, default 3) promote a background attach so hot namespaces migrate to the fast path on their own. RAM per cold namespace is megabytes (centroids + directories), independent of collection size.
+
 ### Added — tenant-partitioned collections (Phase 6)
 
 - **`config.partition_by`**: create a collection partitioned by a metadata field (e.g. `tenant_id`) and every chunk routes to an internal per-tenant partition — a full engine namespace (own LSM, indexes, attach/evict lifecycle) behind one collection API. Searches and deletes filter by the partition field (exact → one partition; `{"in": [...]}` fans out up to 16, merged by score); chunk ids are collection-unique via the parent's CAS id allocator; partitions auto-create on first ingest (writer role included), attach on demand, are hidden from listings, and cascade-delete with the parent. This moves the scale envelope from per-collection to per-tenant: RAM and refresh cost track the HOT tenant set, so one collection can hold billions of vectors across tenants while serving on bounded memory. Not yet routed on partitioned collections (clear errors): relations, facets, TAMS lookup, vector-space CRUD.

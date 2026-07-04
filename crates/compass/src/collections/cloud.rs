@@ -165,47 +165,76 @@ pub struct Segment {
 
 /// v2 binary segment magic. v1 segments are JSON (decoded via fallback).
 const SEG_MAGIC_V2: [u8; 8] = *b"CSEG0002";
+/// v3 adds serve-from-storage sections: row-addressable chunk metadata
+/// (`meta2` + `metaidx`) and IVF-clustered vectors (`cent:`/`clu:` replace
+/// `emb:` for spaces past the clustering threshold). v3 readers decode v2;
+/// v2 readers FAIL LOUDLY on v3 (magic mismatch) rather than silently
+/// dropping sections — do not mix pre-v0.5 readers with v0.5 writers.
+const SEG_MAGIC_V3: [u8; 8] = *b"CSEG0003";
 
-/// Encode a segment in the v2 sectioned binary layout:
+/// Encode a segment in the v3 sectioned binary layout:
 /// `[magic][u64 max_id][u32 toc_len][toc JSON][sections...]`
-/// Sections: `meta` (JSON chunks with embeddings STRIPPED), `emb:<space>`
-/// (`[u32 dims][u64 n][n × (u64 id + dims×f32 LE)]`), `rels` (JSON),
-/// `tombs` (u64 LE array), `rtombs` (JSON ids). Embeddings dominate segment
-/// size; storing them as raw f32 instead of JSON decimals is ~10× smaller and
-/// range-readable by section.
+/// Sections:
+///   `meta2`   — concatenated per-chunk JSON rows (embeddings stripped);
+///                each row independently parseable so cold reads can fetch
+///                single chunks by byte range
+///   `metaidx` — `[u64 n][n × (u64 id, u64 off, u32 len)]` sorted by id,
+///                offsets into `meta2`
+///   `emb:<space>`  — flat `[u32 dims][u64 n][n × (u64 id + dims×f32)]`,
+///                only for spaces below the clustering threshold
+///   `cent:<space>` / `clu:<space>` — IVF centroids + clustered vectors
+///                (see search/ivf.rs) for spaces at/above the threshold;
+///                vectors are stored L2-normalized
+///   `rels` (JSON), `tombs` (u64 LE array), `rtombs` (JSON ids)
 pub fn encode_segment_v2(seg: &Segment) -> Result<Vec<u8>, StorageError> {
-    let err = |e: String| StorageError::Io(format!("segment v2 encode: {e}"));
+    let err = |e: String| StorageError::Io(format!("segment v3 encode: {e}"));
     let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
 
-    let mut meta_chunks: Vec<DocumentChunk> = Vec::with_capacity(seg.chunks.len());
+    // Row-addressable metadata + index (sorted by id for range lookups).
+    let mut sorted: Vec<&DocumentChunk> = seg.chunks.iter().collect();
+    sorted.sort_by_key(|c| c.id);
+    let mut meta2 = Vec::new();
+    let mut metaidx = Vec::with_capacity(8 + sorted.len() * 20);
+    metaidx.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
     let mut by_space: std::collections::BTreeMap<String, Vec<(u64, Vec<f32>)>> =
         std::collections::BTreeMap::new();
-    for c in &seg.chunks {
+    for c in sorted {
         let mut m = c.clone();
         for (space, emb) in std::mem::take(&mut m.embeddings) {
             by_space.entry(space).or_default().push((c.id, emb));
         }
-        meta_chunks.push(m);
+        let row = serde_json::to_vec(&m).map_err(|e| err(e.to_string()))?;
+        metaidx.extend_from_slice(&c.id.to_le_bytes());
+        metaidx.extend_from_slice(&(meta2.len() as u64).to_le_bytes());
+        metaidx.extend_from_slice(&(row.len() as u32).to_le_bytes());
+        meta2.extend_from_slice(&row);
     }
-    sections.push((
-        "meta".into(),
-        serde_json::to_vec(&meta_chunks).map_err(|e| err(e.to_string()))?,
-    ));
+    sections.push(("meta2".into(), meta2));
+    sections.push(("metaidx".into(), metaidx));
+
     for (space, rows) in by_space {
-        let dims = rows.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
-        let mut buf = Vec::with_capacity(12 + rows.len() * (8 + dims as usize * 4));
-        buf.extend_from_slice(&dims.to_le_bytes());
-        buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
-        for (id, v) in &rows {
-            if v.len() as u32 != dims {
+        let dims = rows.first().map(|(_, v)| v.len()).unwrap_or(0);
+        for (_, v) in &rows {
+            if v.len() != dims {
                 return Err(err(format!("ragged dims in space '{space}'")));
             }
-            buf.extend_from_slice(&id.to_le_bytes());
-            for x in v {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
         }
-        sections.push((format!("emb:{space}"), buf));
+        if rows.len() >= crate::search::ivf::CLUSTER_MIN_ROWS && dims > 0 {
+            let (cent, clu) = crate::search::ivf::build_sections(rows, dims);
+            sections.push((format!("cent:{space}"), cent));
+            sections.push((format!("clu:{space}"), clu));
+        } else {
+            let mut buf = Vec::with_capacity(12 + rows.len() * (8 + dims * 4));
+            buf.extend_from_slice(&(dims as u32).to_le_bytes());
+            buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+            for (id, v) in &rows {
+                buf.extend_from_slice(&id.to_le_bytes());
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            sections.push((format!("emb:{space}"), buf));
+        }
     }
     sections.push((
         "rels".into(),
@@ -227,7 +256,7 @@ pub fn encode_segment_v2(seg: &Segment) -> Result<Vec<u8>, StorageError> {
         .collect();
     let toc_bytes = serde_json::to_vec(&toc).map_err(|e| err(e.to_string()))?;
     let mut out = Vec::new();
-    out.extend_from_slice(&SEG_MAGIC_V2);
+    out.extend_from_slice(&SEG_MAGIC_V3);
     out.extend_from_slice(&seg.max_id.to_le_bytes());
     out.extend_from_slice(&(toc_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&toc_bytes);
@@ -259,6 +288,7 @@ fn decode_segment_v2(bytes: &[u8]) -> Result<Segment, StorageError> {
         ..Default::default()
     };
     let mut embs: HashMap<u64, HashMap<String, Vec<f32>>> = HashMap::new();
+    let mut cent_dims: HashMap<String, usize> = HashMap::new();
     for (name, len) in toc {
         let len = len as usize;
         need(pos + len, bytes.len())?;
@@ -266,6 +296,28 @@ fn decode_segment_v2(bytes: &[u8]) -> Result<Segment, StorageError> {
         pos += len;
         if name == "meta" {
             seg.chunks = serde_json::from_slice(body).map_err(|e| err(e.to_string()))?;
+        } else if name == "meta2" {
+            // v3 row-addressable metadata: concatenated standalone JSON rows.
+            let mut de = serde_json::Deserializer::from_slice(body).into_iter::<DocumentChunk>();
+            for c in de.by_ref() {
+                seg.chunks.push(c.map_err(|e| err(e.to_string()))?);
+            }
+        } else if name == "metaidx" {
+            // Full decode doesn't need the index (meta2 rows stream in order);
+            // it exists for cold range reads.
+        } else if name.starts_with("cent:") {
+            let c = crate::search::ivf::parse_cent(body)
+                .ok_or_else(|| err(format!("bad {name} section")))?;
+            cent_dims.insert(name.clone(), c.dims);
+        } else if let Some(space) = name.strip_prefix("clu:") {
+            let cent_key = format!("cent:{space}");
+            let dims = cent_dims
+                .get(&cent_key)
+                .copied()
+                .ok_or_else(|| err(format!("clu:{space} without preceding cent section")))?;
+            for (id, v) in crate::search::ivf::parse_cluster_rows(body, dims) {
+                embs.entry(id).or_default().insert(space.to_string(), v);
+            }
         } else if let Some(space) = name.strip_prefix("emb:") {
             need(12, body.len())?;
             let dims = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
@@ -323,7 +375,7 @@ pub fn encode_segment(
 fn decode_segment(bytes: &[u8]) -> Result<Segment, StorageError> {
     // v2 binary (magic-tagged) first; then v1 JSON object; then the oldest
     // bare-JSON-array form.
-    if bytes.len() >= 8 && bytes[0..8] == SEG_MAGIC_V2 {
+    if bytes.len() >= 8 && (bytes[0..8] == SEG_MAGIC_V2 || bytes[0..8] == SEG_MAGIC_V3) {
         return decode_segment_v2(bytes);
     }
     if let Ok(seg) = serde_json::from_slice::<Segment>(bytes) {
@@ -679,7 +731,7 @@ mod tests {
             relation_tombstones: vec!["dead".into()],
         };
         let bytes = encode_segment_v2(&seg).unwrap();
-        assert_eq!(&bytes[0..8], b"CSEG0002");
+        assert_eq!(&bytes[0..8], b"CSEG0003");
         let back = decode_segment(&bytes).unwrap();
         assert_eq!(back.max_id, 42);
         assert_eq!(back.tombstones, vec![7, 9]);
@@ -689,6 +741,45 @@ mod tests {
         assert_eq!(c2b.embeddings["default"], vec![0.5, 0.6, 0.7, 0.8]);
         assert_eq!(c2b.embeddings["wide"].len(), 8);
         assert_eq!(back.relations.len(), 1);
+    }
+
+    // Past the clustering threshold the encoder emits cent:/clu: instead of
+    // emb:; the full decode must reconstruct every chunk's (normalized)
+    // embedding from the clustered layout.
+    #[test]
+    fn segment_v3_clustered_roundtrip() {
+        let n = crate::search::ivf::CLUSTER_MIN_ROWS + 100;
+        let chunks: Vec<DocumentChunk> = (0..n as u64)
+            .map(|i| {
+                let mut c = chunk(i, &format!("t{i}"));
+                let v: Vec<f32> = (0..8).map(|d| ((i + d) % 13) as f32 + 1.0).collect();
+                c.embeddings.insert("default".into(), v);
+                c
+            })
+            .collect();
+        let seg = Segment {
+            version: 2,
+            chunks,
+            relations: vec![],
+            max_id: n as u64,
+            tombstones: vec![],
+            relation_tombstones: vec![],
+        };
+        let bytes = encode_segment_v2(&seg).unwrap();
+        let toc_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let toc = std::str::from_utf8(&bytes[20..20 + toc_len]).unwrap();
+        assert!(toc.contains("cent:default"), "toc: {toc}");
+        assert!(toc.contains("clu:default"), "toc: {toc}");
+        assert!(!toc.contains("emb:default"), "toc: {toc}");
+
+        let back = decode_segment(&bytes).unwrap();
+        assert_eq!(back.chunks.len(), n);
+        for c in &back.chunks {
+            let v = &c.embeddings["default"];
+            assert_eq!(v.len(), 8);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "clu vectors are unit-norm");
+        }
     }
 
     // A delete folded into a NEWER tail segment must erase a chunk living in
