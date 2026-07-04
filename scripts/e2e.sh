@@ -116,6 +116,30 @@ r=$(post $FULL/collections/e2e/compact '')
 n=$(post $FULL/collections/e2e/search '{"query":"goal","mode":"fts","top_k":5}' | jqn "len(d['results'])")
 [ "$n" -ge 1 ] && ok "data survives compaction" || bad post-compact "$n"
 
+echo "── tenant partitions ──"
+post $FULL/collections '{"name":"mt","embedding_dims":4,"config":{"partition_by":"tenant"}}' >/dev/null
+r=$(post $FULL/collections/mt/ingest '{"chunks":[
+ {"client_id":"p1","file_id":"p1","chunk_index":0,"doc_type":"chunk","text":"shared secret alpha","metadata":{"tenant":"acme"},"embeddings":{"default":[0.9,0.1,0.1,0.1]}},
+ {"client_id":"p2","file_id":"p2","chunk_index":0,"doc_type":"chunk","text":"shared secret beta","metadata":{"tenant":"globex"},"embeddings":{"default":[0.1,0.9,0.1,0.1]}}]}')
+[ "$(echo "$r" | jqn "d['indexed']")" = "2" ] && ok "partitioned ingest routes" || bad p-ingest x
+n=$(post $FULL/collections/mt/search '{"query":"secret","mode":"fts","top_k":10,"filters":{"tenant":"acme"}}' | jqn "len(d['results'])")
+f1=$(post $FULL/collections/mt/search '{"query":"secret","mode":"fts","top_k":10,"filters":{"tenant":"acme"}}' | jqn "d['results'][0]['chunk']['file_id']")
+[ "$n" = "1" ] && [ "$f1" = "p1" ] && ok "tenant isolation (acme sees only its hit)" || bad p-iso "$n/$f1"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST $FULL/collections/mt/search -H 'content-type: application/json' -d '{"query":"secret","mode":"fts"}')
+[ "$code" -ge 400 ] && ok "unfiltered partitioned search rejected" || bad p-nofilter "$code"
+n=$(post $FULL/collections/mt/search '{"query":"secret","mode":"fts","top_k":10,"filters":{"tenant":{"in":["acme","globex"]}}}' | jqn "len(d['results'])")
+[ "$n" = "2" ] && ok "set-membership fan-out merges tenants" || bad p-fanout "$n"
+r=$(post $WRITER/collections/mt/ingest '{"chunks":[{"client_id":"p3","file_id":"p3","chunk_index":0,"doc_type":"chunk","text":"writer minted tenant","metadata":{"tenant":"initech"},"embeddings":{"default":[0.1,0.1,0.9,0.1]}}]}')
+[ "$(echo "$r" | jqn "d['indexed']")" = "1" ] && ok "writer partitioned ingest" || bad p-writer x
+sleep 1
+n=$(post $FULL/collections/mt/search '{"query":"minted","mode":"fts","top_k":5,"filters":{"tenant":"initech"}}' | jqn "len(d['results'])")
+[ "$n" = "1" ] && ok "writer-minted partition attaches on serving node" || bad p-attach "$n"
+r=$(post $FULL/collections/mt/delete '{"filters":{"tenant":"acme"}}')
+[ "$(echo "$r" | jqn "d['deleted']")" = "1" ] && ok "partition-scoped delete" || bad p-del x
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE $FULL/collections/mt)
+[ "$code" -lt 400 ] && ok "partitioned collection cascade delete" || bad p-casc "$code"
+curl -s $FULL/collections | grep -q "part--" && bad "partitions hidden from listing" leak || ok "partitions hidden from listing"
+
 echo "── collection delete ──"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE $FULL/collections/e2e)
 [ "$code" -lt 400 ] && ok "delete collection" || bad coll-del "$code"

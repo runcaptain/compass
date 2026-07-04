@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added — tenant-partitioned collections (Phase 6)
+
+- **`config.partition_by`**: create a collection partitioned by a metadata field (e.g. `tenant_id`) and every chunk routes to an internal per-tenant partition — a full engine namespace (own LSM, indexes, attach/evict lifecycle) behind one collection API. Searches and deletes filter by the partition field (exact → one partition; `{"in": [...]}` fans out up to 16, merged by score); chunk ids are collection-unique via the parent's CAS id allocator; partitions auto-create on first ingest (writer role included), attach on demand, are hidden from listings, and cascade-delete with the parent. This moves the scale envelope from per-collection to per-tenant: RAM and refresh cost track the HOT tenant set, so one collection can hold billions of vectors across tenants while serving on bounded memory. Not yet routed on partitioned collections (clear errors): relations, facets, TAMS lookup, vector-space CRUD.
+
 ### Added — "warm serverless"
 
 - **Stateless writer role** (`COMPASS_ROLE=writer`): durable-append-only nodes with no local indexes and instant boot. Writes validate against the bucket's collection config, mint ids from CAS-leased blocks, append one WAL fragment, and return its `seq`. Reads and delete-by-filter are refused with clear errors. Consistency contract: durable immediately, searchable on serving nodes within the refresh interval.
