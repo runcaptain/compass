@@ -316,8 +316,19 @@ pub async fn search(
         dead.extend(s.tombstones.iter().copied());
     }
 
-    // WAL tail: bounded by the auto-compaction threshold. Latest-wins over
-    // segments; also the source of tail tombstones.
+    // WAL tail: bounded by the auto-compaction threshold in healthy
+    // operation. A pathologically long tail (compaction disabled/failing)
+    // would make this a full-dataset materialization per query — refuse
+    // loudly instead of degrading into that silently.
+    let tail_len = manifest.uncompacted().count();
+    if tail_len > 2 * crate::collections::AUTO_COMPACT_FRAGMENT_THRESHOLD {
+        return Err(format!(
+            "namespace '{ns}' has {tail_len} uncompacted WAL fragments — too many to \
+             cold-serve. Run POST /collections/:name/compact (or check why \
+             auto-compaction is not running), then retry."
+        )
+        .into());
+    }
     let tail = lsm::read_uncompacted_fragments(storage, ns, manifest).await?;
     let mut tail_chunks: HashMap<u64, DocumentChunk> = HashMap::new();
     for (fref, payload) in &tail {
