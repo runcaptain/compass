@@ -89,6 +89,11 @@ jobs:
           done
           docker run --rm --network host --entrypoint sh minio/mc:latest -c \
             "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb -p local/compass-data"
+      # NON-TEST compile of the cloud feature: no other job builds this
+      # combination (clippy/msrv build without the feature; tests build with
+      # cfg(test)), so a cfg gate that hides an item from the release cloud
+      # build otherwise sails through green checks and breaks docker builds.
+      - run: cargo check -p compass --features object-storage
       # The s3_integration tests skip silently without the env; guard against
       # env-name drift turning this job into a green no-op.
       - run: |
