@@ -17,9 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A completed vector-space rebuild (`POST .../rebuild`) never activated: the space stayed `status="building"` and the rebuilt index was not served until restart. Rebuild completion now flips the persisted status (CAS in cloud mode) and hot-loads the index; activation failure is reported as a failed rebuild.
+- Searching or ingesting into a missing collection returned HTTP 500/400; typed not-found errors now map to 404 across all endpoints (replacing three copies of substring-based status sniffing).
 - Facet counts were wiped by every ingest after the first (each batch replaced the accumulated facet state; latent since v0.2), came back empty after any restart (nothing rebuilt them from disk), and counted deleted chunks until a full FTS rebuild. Facets are now roaring treemaps keyed by chunk id: batches accumulate, the load/rebuild scan reconstructs them, and counts intersect the live-id universe so tombstoned chunks are excluded. Found by the new live-stack E2E harness (`scripts/e2e.sh`, 44 checks across every endpoint and both node roles).
 - Warm restarts of an actively-written collection were O(collection size): batched HNSW persistence legitimately leaves the index file behind the mmap, and the load path treated that as corruption and re-inserted every vector (20.2s vs v0.3.0's 1.1s at 100k chunks in the comparison bench). Load now heals incrementally — append only the missing tail rows from the mmap, save, and serve mmap-backed. Warm restart at 100k: 1.6s.
 - Sub-1000-vector collections never persisted the vector keymap, silently relying on identity key→id mapping that returned wrong chunk ids once ids were non-dense (exposed by block allocation; latent since v0.2). The keymap is now saved on every build and synthesized as identity for pre-fix directories.
+
+### Changed
+
+- Pork audit (three independent review passes): −1,200 lines of dead weight removed — the unwired VectorIndex/GPU backend plumbing (`COMPASS_BACKEND` did nothing), a third never-called filter evaluator, never-wired filter-index persistence codecs, the legacy vector writer, the `rayon` dependency, and assorted dead fields/params. `delete_by_filter` now resolves ids through the same roaring filter-index pushdown as search (one filter semantics, not three). The `dead_code` lint is enabled again crate-wide. `collections/mod.rs` shrank from 7,100 to 3,700 lines (test modules extracted to files).
 
 ### Scope & limitations (honest)
 
