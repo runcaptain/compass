@@ -8,7 +8,7 @@ members = [
 default-members = ["crates/compass"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Captain Technologies <support@runcaptain.com>"]
 license = "Apache-2.0"
@@ -77,7 +77,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Internal crates
-compass-index-api = { path = "crates/compass-index-api", version = "0.3.0" }
+compass-index-api = { path = "crates/compass-index-api", version = "0.4.0" }
 
 [profile.release]
 # `incremental = true` on release bloats the build cache for no runtime
