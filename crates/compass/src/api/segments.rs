@@ -67,14 +67,7 @@ pub async fn segments_at(
             params.time_end_ms,
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                (StatusCode::NOT_FOUND, msg)
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, msg)
-            }
-        })?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
     let took_ms = t0.elapsed().as_secs_f64() * 1_000.0;
     Ok(Json(SegmentsAtResponse { results, took_ms }))

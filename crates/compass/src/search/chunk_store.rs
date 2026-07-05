@@ -4,7 +4,7 @@
 //! Point lookups by u64 ID, batch inserts, full scans for rebuild.
 
 use crate::models::DocumentChunk;
-use redb::{Database, DatabaseError, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, DatabaseError, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::time::Duration;
 
@@ -131,6 +131,7 @@ impl ChunkStore {
         Ok(results)
     }
 
+    #[cfg(test)]
     pub fn insert(
         &self,
         id: u64,
@@ -162,7 +163,9 @@ impl ChunkStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        use redb::ReadableTableMetadata;
         let txn = self.db.begin_read()?;
         let table = txn.open_table(CHUNKS_TABLE)?;
         Ok(table.len()?)

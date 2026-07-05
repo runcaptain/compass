@@ -16,7 +16,7 @@ pub async fn create_collection(
         .manager
         .create_collection(&req.name, req.vector_spaces, req.embedding_dims, req.config)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
 
     Ok((StatusCode::CREATED, Json(collection_to_info(&collection))))
 }
@@ -66,7 +66,7 @@ pub async fn add_vector_space(
         .manager
         .add_vector_space(&name, &req.name, req.dims, &req.model)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
 
     Ok((
         StatusCode::CREATED,
@@ -114,7 +114,7 @@ pub async fn delete_vector_space(
         .manager
         .delete_vector_space(&name, &space)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -128,7 +128,7 @@ pub async fn set_default_vector_space(
         .manager
         .set_default_vector_space(&name, &req.name)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
     Ok(StatusCode::OK)
 }
 
@@ -162,7 +162,7 @@ pub async fn trigger_rebuild(
         .manager
         .get_all_chunk_data(&name)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
     let vectors_dir = state.manager.vectors_dir(&name);
 
@@ -177,6 +177,7 @@ pub async fn trigger_rebuild(
         req.batch_size,
         state.manager.rebuild_tracker.clone(),
         name,
+        state.manager.clone(),
     )
     .await
     .map_err(|e| (StatusCode::CONFLICT, e))?;

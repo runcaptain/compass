@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-04
+
+### Added — serve-from-storage ("true serverless")
+
+- **`COMPASS_COLD_SERVE=true`**: semantic queries on collections (and tenant partitions) that are NOT attached are answered directly from object storage — a manifest read, cached centroid/TOC artifacts, and a handful of range-GETs — instead of triggering a full index rebuild. Compaction now writes IVF-clustered vector sections (`cent:`/`clu:`, k-means, unit-normalized) plus a row-addressable metadata index (`meta2`/`metaidx`) into segments (format CSEG0003; v2 segments remain readable, pre-v0.4 readers fail loudly on v3). Cold reads see the full committed state including the WAL tail and tombstones, so read-your-writes holds by construction; metadata filters apply; FTS on a cold namespace returns a clear error (inverted indexes still need an attach). Repeated cold hits (`COMPASS_WARM_AFTER`, default 3) promote a background attach so hot namespaces migrate to the fast path on their own. RAM per cold namespace is megabytes (centroids + directories), independent of collection size.
+
+### Added — tenant-partitioned collections
+
+- **`config.partition_by`**: create a collection partitioned by a metadata field (e.g. `tenant_id`) and every chunk routes to an internal per-tenant partition — a full engine namespace (own LSM, indexes, attach/evict lifecycle) behind one collection API. Searches and deletes filter by the partition field (exact → one partition; `{"in": [...]}` fans out up to 16, merged by score); chunk ids are collection-unique via the parent's CAS id allocator; partitions auto-create on first ingest (writer role included), attach on demand, are hidden from listings, and cascade-delete with the parent. This moves the scale envelope from per-collection to per-tenant: RAM and refresh cost track the HOT tenant set, so one collection can hold billions of vectors across tenants while serving on bounded memory. Not yet routed on partitioned collections (clear errors): relations, facets, TAMS lookup, vector-space CRUD.
+
+### Added — "warm serverless"
+
+- **Stateless writer role** (`COMPASS_ROLE=writer`): durable-append-only nodes with no local indexes and instant boot. Writes validate against the bucket's collection config, mint ids from CAS-leased blocks, append one WAL fragment, and return its `seq`. Reads and delete-by-filter are refused with clear errors. Consistency contract: durable immediately, searchable on serving nodes within the refresh interval.
+- **Id-block allocator** (`{ns}/id-alloc`): in cloud mode every ingest path claims id blocks via CAS, so attached nodes and stateless writers can never mint colliding ids. Pre-v0.4 namespaces migrate automatically (seeded from the bucket-derived high-water mark). Do not run v0.3 and v0.4 writers against one bucket during a rolling upgrade.
+- **Bucket collection config** (`{ns}/collection.json`): vector-space specs, default space, `created_at`, and `CollectionConfig` are durable in the bucket and survive cold rebuilds (previously specs were re-inferred as `model:"recovered"` and `embed_model` was silently lost). Vector-space CRUD is bucket-first CAS; zero-ingest collections are discoverable from a fresh disk.
+- **Manifest refresh + read-your-writes**: serving nodes converge with other nodes' writes via a background refresher (`COMPASS_REFRESH_INTERVAL`, default 5s) using a per-collection seq tracker that never double-applies a node's own fragments. Config changes sync on refresh; a deleted collection detaches; a recreated one re-attaches. Write responses carry `seq`; `SearchRequest.min_seq` refreshes-then-serves with a bounded wait.
+- **Lazy attach + LRU detach** (`COMPASS_LAZY_ATTACH`, `COMPASS_MAX_ATTACHED`): boot registers bucket namespaces and attaches on first request (stampede-safe, one rebuild); past the budget the least-recently-used collection detaches and re-attaches on demand — the bucket is the source of truth. Default off; local mode unchanged.
+- **CI**: object-storage build + real-S3 integration tests run against MinIO on every PR (with a silent-skip guard); DCO sign-off enforced on PR commits (merge commits exempt).
+
+### Fixed
+
+- A completed vector-space rebuild (`POST .../rebuild`) never activated: the space stayed `status="building"` and the rebuilt index was not served until restart. Rebuild completion now flips the persisted status (CAS in cloud mode) and hot-loads the index; activation failure is reported as a failed rebuild.
+- Searching or ingesting into a missing collection returned HTTP 500/400; typed not-found errors now map to 404 across all endpoints (replacing three copies of substring-based status sniffing).
+- Facet counts were wiped by every ingest after the first (each batch replaced the accumulated facet state; latent since v0.2), came back empty after any restart (nothing rebuilt them from disk), and counted deleted chunks until a full FTS rebuild. Facets are now roaring treemaps keyed by chunk id: batches accumulate, the load/rebuild scan reconstructs them, and counts intersect the live-id universe so tombstoned chunks are excluded. Found by the new live-stack E2E harness (`scripts/e2e.sh`, 44 checks across every endpoint and both node roles).
+- Warm restarts of an actively-written collection were O(collection size): batched HNSW persistence legitimately leaves the index file behind the mmap, and the load path treated that as corruption and re-inserted every vector (20.2s vs v0.3.0's 1.1s at 100k chunks in the comparison bench). Load now heals incrementally — append only the missing tail rows from the mmap, save, and serve mmap-backed. Warm restart at 100k: 1.6s.
+- Sub-1000-vector collections never persisted the vector keymap, silently relying on identity key→id mapping that returned wrong chunk ids once ids were non-dense (exposed by block allocation; latent since v0.2). The keymap is now saved on every build and synthesized as identity for pre-fix directories.
+
+### Changed
+
+- Pork audit (three independent review passes): −1,200 lines of dead weight removed — the unwired VectorIndex/GPU backend plumbing (`COMPASS_BACKEND` did nothing), a third never-called filter evaluator, never-wired filter-index persistence codecs, the legacy vector writer, the `rayon` dependency, and assorted dead fields/params. `delete_by_filter` now resolves ids through the same roaring filter-index pushdown as search (one filter semantics, not three). The `dead_code` lint is enabled again crate-wide. `collections/mod.rs` shrank from 7,100 to 3,700 lines (test modules extracted to files).
+
+### Changed (behavior)
+
+- **Telemetry is now opt-in** (`COMPASS_TELEMETRY=on`); previously it defaulted on. An engine whose promise is "data never leaves your machine" should not phone home by default.
+
+### Scope & limitations (honest)
+
+- Cold serving is semantic-only: full-text (and hybrid-with-text) queries on a cold namespace return a clear error until it warms — BM25 still needs local indexes. Cold recall depends on embedding-space structure (see docs/search-quality.md); the default nprobe reaches warm parity on clustered embeddings. Cross-node convergence is periodic (refresh interval), not synchronous — use `min_seq` when you need read-your-writes (cold reads have it by construction).
+
 ## [0.3.0] - 2026-07-03
 
 ### Added

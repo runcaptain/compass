@@ -19,6 +19,7 @@
 //! Nothing routes through this trait yet — it is introduced standalone and
 //! wired into the engine incrementally in later steps.
 
+pub mod id_alloc;
 pub mod local;
 pub mod lsm;
 #[cfg(feature = "object-storage")]
@@ -52,6 +53,9 @@ impl Version {
     }
 
     /// True when the token carries no usable precondition (CAS must refuse it).
+    // Used by the object-store backend at runtime and by s3_integration
+    // tests — all behind the feature; default builds never reference it.
+    #[cfg(feature = "object-storage")]
     pub fn is_empty(&self) -> bool {
         self.e_tag.is_empty() && self.version.as_deref().is_none_or(str::is_empty)
     }
@@ -59,6 +63,9 @@ impl Version {
 
 /// Metadata about a stored object, returned by `list`.
 #[derive(Debug, Clone)]
+// size/version are part of the listing contract; current callers key off
+// `key` only. Kept — deleting them would change every backend's list().
+#[allow(dead_code)]
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
@@ -101,8 +108,10 @@ pub trait Storage: Send + Sync {
     /// Whole-object read.
     async fn get(&self, key: &str) -> Result<Bytes, StorageError>;
 
-    /// Range read — fetch only `range` bytes of the object. The primitive that
-    /// makes large segments servable without loading the whole object.
+    /// Range read — the serve-from-storage primitive (segment TOCs point at
+    /// byte ranges; cold queries fetch only the sections they need). A range
+    /// end past the object is CLAMPED, never an error (S3/GCS semantics;
+    /// LocalDiskStorage matches).
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, StorageError>;
 
     /// Read the object together with its current version, for a CAS cycle.
@@ -160,6 +169,13 @@ pub trait Storage: Send + Sync {
             }
         }
         Ok(dirs)
+    }
+
+    /// Large-object write. Default delegates to `put`; the object-store
+    /// backend overrides with multipart upload (S3 caps single PUTs at 5GB —
+    /// compacted segments can exceed that).
+    async fn put_large(&self, key: &str, bytes: Bytes) -> Result<Version, StorageError> {
+        self.put(key, bytes).await
     }
 
     /// Whether an object exists.

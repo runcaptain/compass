@@ -129,11 +129,6 @@ impl RelationshipStore {
             .collect()
     }
 
-    /// Total number of tracked relationships.
-    pub fn len(&self) -> usize {
-        self.forward.len()
-    }
-
     // ── Disk persistence ─────────────────────────────────────────────────
     // Simple binary format:
     //   [u32 count]

@@ -22,11 +22,11 @@ pub async fn ingest_chunks(
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
     let start = std::time::Instant::now();
 
-    let (count, id_map) = state
+    let (count, id_map, seq) = state
         .manager
         .ingest(&name, req.chunks, &state.embed_state)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| crate::api::error_response(e, StatusCode::BAD_REQUEST))?;
 
     let took_ms = start.elapsed().as_millis() as u64;
 
@@ -34,5 +34,6 @@ pub async fn ingest_chunks(
         indexed: count,
         id_map,
         took_ms,
+        seq,
     }))
 }

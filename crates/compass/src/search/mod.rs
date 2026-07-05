@@ -5,32 +5,18 @@
 //   Semantic: USearch HNSW approximate nearest neighbor search
 //   Hybrid:   Both combined via Reciprocal Rank Fusion (RRF, k=60)
 
-#[allow(dead_code)]
-pub mod backend;
-#[allow(dead_code)]
 pub mod chunk_cache;
-#[allow(dead_code)]
 pub mod chunk_store;
-// Filter-aware ANN modules . Not yet wired into the API
-// surface; `search_vectors_filtered` below is the prototype call site.
+pub mod cold;
 #[cfg(test)]
 mod filter_bench;
-#[allow(dead_code)]
 pub mod filter_index;
-#[allow(dead_code)]
 pub mod filter_pushdown;
 pub mod hybrid;
-#[allow(dead_code)]
+pub mod ivf;
 pub mod mmap_vectors;
 pub mod tantivy_fts;
 pub mod vector;
-
-// Re-export the stable trait surface for external consumers and future use.
-#[allow(unused_imports)]
-pub use backend::{
-    build_backend, IndexError, IndexParams, LoadableIndex, UsearchHnswIndex, VectorIndex,
-    VectorMatch,
-};
 
 /// Search mode — determines which search engines are used for a query.
 #[derive(Debug, Clone, Copy)]

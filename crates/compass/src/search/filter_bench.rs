@@ -76,13 +76,11 @@ fn build_corpus(n: u32) -> (VectorState, FilterIndex) {
         );
         filter_index.insert(i as u64, &metadata);
     }
-    filter_index.finalize();
     let state = VectorState {
         index: Some(index),
         key_to_chunk_id: chunk_ids,
         mmap_vectors: None,
         vectors,
-        dims: DIMS,
     };
     (state, filter_index)
 }

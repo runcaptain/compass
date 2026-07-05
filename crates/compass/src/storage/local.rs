@@ -132,7 +132,11 @@ impl Storage for LocalDiskStorage {
             .metadata()
             .map_err(|e| StorageError::Io(e.to_string()))?
             .len();
-        if range.start > range.end || range.end > size {
+        // Contract parity with the object-store backend: a range end past
+        // the object is CLAMPED (S3/GCS Range semantics), not an error —
+        // cold reads probe fixed-size headers on objects of unknown length.
+        let range = range.start..range.end.min(size);
+        if range.start > range.end {
             return Err(StorageError::InvalidRange {
                 start: range.start,
                 end: range.end,
@@ -361,11 +365,9 @@ mod tests {
         let s = store("range");
         s.put("k", Bytes::from_static(b"0123456789")).await.unwrap();
         assert_eq!(&s.get_range("k", 2..5).await.unwrap()[..], b"234");
-        // Out-of-bounds range errors.
-        assert!(matches!(
-            s.get_range("k", 5..100).await,
-            Err(StorageError::InvalidRange { .. })
-        ));
+        // End past EOF is CLAMPED (object-store Range semantics — cold reads
+        // probe fixed-size headers on objects of unknown length).
+        assert_eq!(&s.get_range("k", 5..100).await.unwrap()[..], b"56789");
     }
 
     // Boundary cases for the seek-based get_range (each a plausible off-by-one).
@@ -387,9 +389,12 @@ mod tests {
         #[allow(clippy::reversed_empty_ranges)]
         let reversed = s.get_range("k", 6..3).await;
         assert!(matches!(reversed, Err(StorageError::InvalidRange { .. })));
-        // end past EOF → error.
+        // end past EOF → clamped to the object (matches S3/GCS semantics).
+        assert_eq!(&s.get_range("k", 8..11).await.unwrap()[..], b"89");
+        // start past EOF stays an error (object_store 416 parity): only the
+        // END is clamped.
         assert!(matches!(
-            s.get_range("k", 8..11).await,
+            s.get_range("k", 20..30).await,
             Err(StorageError::InvalidRange { .. })
         ));
     }

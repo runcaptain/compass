@@ -27,7 +27,9 @@ jobs:
 
       - name: Verify tag matches Cargo.toml
         run: |
-          CARGO_VERSION=$(grep "^version" crates/compass/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          # The version lives in [workspace.package] in the ROOT manifest;
+          # crate manifests say `version.workspace = true`.
+          CARGO_VERSION=$(grep "^version" Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
           if [ "${{ steps.version.outputs.version }}" != "$CARGO_VERSION" ]; then
             echo "Tag version ${{ steps.version.outputs.version }} does not match Cargo.toml version $CARGO_VERSION"
             exit 1

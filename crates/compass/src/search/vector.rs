@@ -46,8 +46,6 @@ pub struct VectorState {
     pub mmap_vectors: Option<super::mmap_vectors::MmapVectors>,
     /// Legacy in-memory vectors for datasets without an mmap file (e.g. first build).
     pub vectors: Vec<Vec<f32>>,
-    /// Embedding dimensionality (e.g. 384 for BGE-small)
-    pub dims: usize,
 }
 
 unsafe impl Send for VectorState {}
@@ -78,10 +76,10 @@ pub fn create_index(
     let index = Index::new(&opts).map_err(|e| format!("Failed to create USearch index: {}", e))?;
     if capacity > 0 {
         // Reserve enough concurrent search slots for the spawn_blocking pool.
-        // Default rayon threads (=CPU count) is too low when search runs on
-        // tokio's blocking pool. 128 slots costs ~256KB and avoids the
-        // "No available threads to lock" fallback to brute-force.
-        let threads = 128.max(rayon::current_num_threads());
+        // CPU count is too low when search runs on tokio's blocking pool.
+        // 128 slots costs ~256KB and avoids the "No available threads to
+        // lock" fallback to brute-force.
+        let threads = index_threads();
         index
             .reserve_capacity_and_threads(capacity, threads)
             .map_err(|e| format!("Failed to reserve USearch capacity: {}", e))?;
@@ -105,7 +103,6 @@ pub fn build_vector_index(
             key_to_chunk_id: Vec::new(),
             mmap_vectors: None,
             vectors: Vec::new(),
-            dims,
         });
     }
 
@@ -115,21 +112,25 @@ pub fn build_vector_index(
     }
     let mmap = super::mmap_vectors::MmapVectors::create(vectors_path, dims, vectors)?;
 
-    // For small datasets, skip HNSW and use brute-force search
+    // For small datasets, skip HNSW and use brute-force search. The keymap
+    // must STILL be persisted: without it a restart loses key->chunk-id
+    // mapping and falls back to identity, which silently returns wrong ids
+    // once ids are non-dense (block-allocated ids exposed this).
     if vectors.len() < HNSW_THRESHOLD {
+        let map_path = index_path.with_extension("keymap");
+        save_key_map(&map_path, chunk_ids)?;
         return Ok(VectorState {
             index: None,
             key_to_chunk_id: chunk_ids.to_vec(),
             mmap_vectors: Some(mmap),
             vectors: Vec::new(),
-            dims,
         });
     }
 
     // Build the HNSW index
     let index = create_index(dims, vectors.len())?;
 
-    // Insert vectors using parallel threads via rayon
+    // Insert vectors using usearch's internal thread slots
     for (key, vec) in vectors.iter().enumerate() {
         index
             .add(key as u64, vec)
@@ -156,7 +157,6 @@ pub fn build_vector_index(
         key_to_chunk_id: chunk_ids.to_vec(),
         mmap_vectors: Some(mmap),
         vectors: Vec::new(),
-        dims,
     })
 }
 
@@ -198,7 +198,18 @@ pub fn load_vector_index(
 
     // Load the key-to-chunk-id mapping
     let map_path = index_path.with_extension("keymap");
-    let key_to_chunk_id = load_key_map(&map_path)?;
+    let mut key_to_chunk_id = load_key_map(&map_path)?;
+    // Pre-fix local dirs never persisted the keymap for small datasets and
+    // relied implicitly on identity mapping (dense ids from 0). Make that
+    // explicit so a later incremental append can't push new ids onto an empty
+    // keymap and misalign every existing vector.
+    if key_to_chunk_id.is_empty() {
+        if let Some(m) = &mmap {
+            if !m.is_empty() {
+                key_to_chunk_id = (0..m.len() as u64).collect();
+            }
+        }
+    }
 
     // For small datasets, skip HNSW
     if count < HNSW_THRESHOLD {
@@ -207,7 +218,6 @@ pub fn load_vector_index(
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         });
     }
 
@@ -221,12 +231,54 @@ pub fn load_vector_index(
             .view(index_path_str)
             .map_err(|e| format!("Failed to mmap USearch index: {}", e))?;
 
+        // Crash/shutdown recovery for batched HNSW saves: vectors are durable
+        // in the mmap file per batch, but the index file is rewritten only
+        // every N batches — the file can be missing up to N-1 batches' rows.
+        // Heal by APPENDING the missing tail from the mmap (same as the
+        // runtime heal in apply_ingest_commit); a full rebuild here made every
+        // warm restart O(collection) instead of O(unsaved tail). The keymap is
+        // saved per batch, so the index is only ever behind it, never ahead.
+        let index = if index.size() < key_to_chunk_id.len() {
+            tracing::warn!(
+                "HNSW index at {} is stale ({} < {}); appending missing rows from mmap",
+                index_path.display(),
+                index.size(),
+                key_to_chunk_id.len()
+            );
+            let healed = create_index(dims, key_to_chunk_id.len())?;
+            healed
+                .load(index_path_str)
+                .map_err(|e| format!("Failed to load USearch index for heal: {}", e))?;
+            let threads = index_threads();
+            healed
+                .reserve_capacity_and_threads(key_to_chunk_id.len(), threads)
+                .map_err(|e| format!("Reserve failed: {}", e))?;
+            if let Some(m) = &mmap {
+                for i in (healed.size() as usize)..key_to_chunk_id.len().min(m.len()) {
+                    healed
+                        .add(i as u64, m.get(i))
+                        .map_err(|e| format!("Failed to add vector: {}", e))?;
+                }
+            }
+            healed
+                .save(index_path_str)
+                .map_err(|e| format!("Failed to save healed index: {}", e))?;
+            // Serve the healed file mmap-backed like the clean path, instead
+            // of keeping the whole graph resident.
+            let viewed = create_index(dims, 0)?;
+            viewed
+                .view(index_path_str)
+                .map_err(|e| format!("Failed to mmap healed USearch index: {}", e))?;
+            viewed
+        } else {
+            index
+        };
+
         Ok(VectorState {
             index: Some(index),
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         })
     } else {
         Ok(VectorState {
@@ -234,7 +286,6 @@ pub fn load_vector_index(
             key_to_chunk_id,
             mmap_vectors: mmap,
             vectors: Vec::new(),
-            dims,
         })
     }
 }
@@ -244,12 +295,6 @@ pub fn load_vector_index(
 /// + selectivity story end-to-end.
 #[derive(Debug, Clone, Default)]
 pub struct FilteredSearchExplain {
-    /// |eligible| at query time.
-    pub eligible_count: u64,
-    /// |universe| at query time.
-    pub universe_count: u64,
-    /// eligible / universe.
-    pub selectivity: f64,
     /// Whether the HNSW filtered walk was used (vs. brute force fallback).
     pub used_hnsw: bool,
     /// Number of HNSW candidates inspected. Counted via the filter closure
@@ -272,20 +317,11 @@ pub fn search_vectors_filtered(
     top_k: usize,
     eligible: &RoaringTreemap,
 ) -> (Vec<VectorResult>, FilteredSearchExplain) {
-    let universe = state.key_to_chunk_id.len() as u64;
-    let eligible_count = eligible.len();
     let mut explain = FilteredSearchExplain {
-        eligible_count,
-        universe_count: universe,
-        selectivity: if universe == 0 {
-            1.0
-        } else {
-            eligible_count as f64 / universe as f64
-        },
         used_hnsw: false,
         candidates_inspected: 0,
     };
-    if eligible_count == 0 {
+    if eligible.is_empty() {
         return (Vec::new(), explain);
     }
 
@@ -440,30 +476,18 @@ pub fn search_vectors(query_vec: &[f32], state: &VectorState, top_k: usize) -> V
 }
 
 // ── Persistence helpers ──────────────────────────────────────────────────────
-// Simple binary formats for saving/loading vectors and key maps to disk.
+// Binary formats for loading vectors and key maps from disk. (The legacy
+// vector WRITER is gone — only the mmap format is written; the legacy reader
+// below survives for migration.)
 
-/// Save vectors to a binary file (legacy format, kept for migration).
-/// Format: [u32 count] [u32 dims] [count * dims * f32 values]
-#[allow(dead_code)]
-fn save_vectors(
-    path: &Path,
-    vectors: &[Vec<f32>],
-    dims: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let count = vectors.len();
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + count * dims * 4);
-    buf.extend_from_slice(&(count as u32).to_le_bytes());
-    buf.extend_from_slice(&(dims as u32).to_le_bytes());
-    for vec in vectors {
-        for &val in vec {
-            buf.extend_from_slice(&val.to_le_bytes());
-        }
-    }
-    std::fs::write(path, buf)?;
-    Ok(())
+/// Thread-slot count for usearch reserve calls: at least 128 (tokio's
+/// blocking pool can run more concurrent searches than there are cores).
+pub(crate) fn index_threads() -> usize {
+    128.max(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
 }
 
 /// Load vectors from a binary file.

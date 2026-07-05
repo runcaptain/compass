@@ -132,6 +132,7 @@ impl ObjectStoreBackend {
     }
 
     /// Construct directly from an existing object store (used by tests).
+    #[cfg(test)]
     pub fn from_store(inner: Arc<dyn ObjectStore>, label: &'static str) -> Self {
         Self { inner, label }
     }
@@ -259,6 +260,29 @@ impl Storage for ObjectStoreBackend {
             e_tag: res.e_tag.unwrap_or_default(),
             version: res.version,
         })
+    }
+
+    async fn put_large(&self, key: &str, bytes: Bytes) -> Result<Version, StorageError> {
+        // Multipart for anything past a conservative threshold; small objects
+        // take the single-PUT fast path.
+        const PART: usize = 16 * 1024 * 1024;
+        if bytes.len() <= PART {
+            return self.put(key, bytes).await;
+        }
+        let path = OsPath::from(key);
+        let upload = self
+            .inner
+            .put_multipart(&path)
+            .await
+            .map_err(|e| map_os_err(key, e))?;
+        let mut w = object_store::WriteMultipart::new(upload);
+        for part in bytes.chunks(PART) {
+            w.write(part);
+        }
+        w.finish().await.map_err(|e| map_os_err(key, e))?;
+        // Multipart results don't return an ETag through this helper; segments
+        // are immutable + UUID-keyed, so no CAS token is needed on them.
+        Ok(Version::etag(String::new()))
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {

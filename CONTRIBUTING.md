@@ -15,14 +15,23 @@ cargo run --release             # serves on http://localhost:4001
 
 Compass is a Cargo workspace. Useful invocations:
 
+Prerequisites on Linux: `cmake`, `pkg-config`, `libssl-dev` (what CI
+installs). On Windows there is a known linker clash between `esaxx-rs` and
+`cxx` — use `cargo check` locally and run builds/tests in Docker or WSL.
+
 ```bash
-cargo build                              # builds the default member (`compass`)
-cargo build -p compass-index-api         # builds just the trait crate
-cargo build --features gpu               # adds the GPU backend (Linux + CUDA only)
-cargo test --workspace                   # runs all tests in all crates
-cargo clippy --workspace -- -D warnings  # lint check (CI requires zero warnings)
-cargo fmt --all --check                  # format check (CI requires clean diff)
+cargo build                                                # default member (`compass`)
+cargo test --workspace --exclude compass-vector-gpu       # all tests CI runs
+cargo test -p compass --features object-storage           # + S3/GCS backend tests
+cargo clippy --workspace --exclude compass-vector-gpu --all-targets -- -D warnings
+cargo fmt --all --check                                    # CI requires a clean diff
 ```
+
+`compass-vector-gpu` is a standalone experimental crate (cuVS; needs CUDA
+12+, CMake, a long first build) that is NOT wired into the engine yet —
+every CI job excludes it, and so should you unless you're working on it.
+Tests against real object storage skip cleanly unless `COMPASS_TEST_S3_BUCKET`
+is set (CI runs them against MinIO).
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module map and where to put new code.
 
@@ -35,9 +44,8 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module map and where to put new
 - Documentation improvements, especially examples.
 
 **Out of scope (for now):**
-- Storage backends other than the local filesystem.
 - New embedding model integrations (we plug into HuggingFace TEI / vLLM via the `embed_endpoint` config; pull requests adding new in-process embedders need a strong motivation).
-- Cluster / replication features (Compass is single-node by design; horizontal scaling is via sharding behind a load balancer).
+- Consensus/quorum replication. Compass scales out via object storage as the source of truth (stateless writers + serving nodes + serve-from-storage cold reads); PRs should build on that model, not introduce node-to-node coordination.
 
 If you're not sure, open an issue first and ask.
 
@@ -45,7 +53,7 @@ If you're not sure, open an issue first and ask.
 
 - [ ] `cargo fmt --all` clean.
 - [ ] `cargo clippy --workspace -- -D warnings` clean.
-- [ ] `cargo test --workspace` green.
+- [ ] `cargo test --workspace --exclude compass-vector-gpu` green.
 - [ ] `CHANGELOG.md` updated under the `[Unreleased]` section.
 - [ ] Public API changes have rustdoc comments.
 - [ ] Behavior changes have a test that would have caught the regression.
@@ -75,7 +83,7 @@ Open an issue with:
 
 ## Reporting security issues
 
-Don't open a public issue. Email `founders@runcaptain.com` with the details. We'll acknowledge within two business days.
+Don't open a public issue. Email `support@runcaptain.com` with the details. We'll acknowledge within two business days.
 
 ## Code of conduct
 

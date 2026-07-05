@@ -25,19 +25,10 @@ const MAX_RELATIONS_PER_REQUEST: usize = 10_000;
 
 fn map_err(e: Box<dyn std::error::Error + Send + Sync>) -> (StatusCode, String) {
     let msg = e.to_string();
-    if msg.contains("not found") {
-        (StatusCode::NOT_FOUND, msg)
-    } else if msg.contains("must differ") {
-        (StatusCode::BAD_REQUEST, msg)
-    } else {
-        // Log the detail server-side; internal errors (paths, backends, redb
-        // internals) don't belong in response bodies.
-        tracing::error!("relations handler error: {msg}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error (see server logs)".to_string(),
-        )
+    if msg.contains("must differ") {
+        return (StatusCode::BAD_REQUEST, msg);
     }
+    crate::api::error_response(e, StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// POST /collections/:name/relations

@@ -437,7 +437,18 @@ Supported: `s3://bucket[/prefix]` (AWS S3, MinIO, Cloudflare R2 — set `COMPASS
 
 In this mode the bucket is the **source of truth**: every write lands durably in object storage first (an LSM of immutable WAL fragments + a CAS-committed manifest), and a node that boots with an empty disk discovers its collections from the bucket and rebuilds all local indexes — chunks, hierarchy, and typed relations included. Compaction (automatic past a WAL threshold, or via `POST /compact`) folds fragments into segments and physically reclaims deleted data.
 
-Scope, honestly: reads are served from the locally rebuilt indexes (durable-via-cloud, fast-via-local) — this is not stateless multi-node serving, and cold-start recovery materializes the live set in RAM. See [CHANGELOG](CHANGELOG.md) for details.
+### Serverless topologies
+
+With the bucket as the source of truth, nodes become disposable roles you mix per workload (full reference: [docs/deployment.md](docs/deployment.md)):
+
+- **Serving node** (default): full local indexes, fast reads; converges on other nodes' writes via a background manifest refresher (`COMPASS_REFRESH_INTERVAL`, default 5s). Writes return a `seq`; pass it back as `min_seq` for read-your-writes.
+- **Writer node** (`COMPASS_ROLE=writer`): stateless, append-only, boots in milliseconds, refuses reads. Durable immediately; searchable on serving nodes within the refresh interval.
+- **Cold serving** (`COMPASS_COLD_SERVE=true`): answers *semantic* queries on collections it has never attached, straight from object-storage range reads — first query in ~tens of ms instead of a minutes-long index rebuild. Repeated hits promote a background attach (`COMPASS_WARM_AFTER`). Full-text on a cold collection returns a clear error until it warms. Recall characteristics: [docs/search-quality.md](docs/search-quality.md).
+- **Lazy attach + LRU** (`COMPASS_LAZY_ATTACH`, `COMPASS_MAX_ATTACHED`): boot registers namespaces without loading them; RAM tracks the hot set.
+
+### Multi-tenant partitions
+
+Create a collection with `"config": {"partition_by": "tenant_id"}` and every chunk routes to an internal per-tenant partition — its own indexes and attach/evict lifecycle behind one collection API. Searches and deletes filter by the partition field (exact match, or `{"in": [...]}` to fan out across up to 16 tenants); chunk ids stay collection-unique; partitions auto-create on first ingest and cascade-delete with the parent. Serving RAM tracks the hot-tenant set, not the tenant count — this also works fully offline in local mode.
 
 For local development against MinIO:
 
@@ -566,16 +577,23 @@ POST   /collections/:name/vector-spaces/:space/rebuild Trigger re-embedding
 GET    /collections/:name/vector-spaces/:space/status  Rebuild progress
 PUT    /collections/:name/default-vector-space         Switch default space
 
+GET    /collections/:name/segments/at                  Temporal segment lookup (TAMS)
+
 GET    /health                                         Health check
+GET    /metrics                                        Prometheus-text metrics (unauthenticated by design, like /health — exposes collection names + counts; firewall it if that matters)
 ```
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, PR guidelines, and commit conventions.
 
+## Telemetry
+
+Telemetry is **off by default** — Compass never phones home unless you set `COMPASS_TELEMETRY=on`. When opted in, it sends a startup event and a daily heartbeat to PostHog (random instance id, version, OS/arch, collection and vector counts — never document content, queries, or metadata). `DO_NOT_TRACK=1` is honored even when opted in.
+
 ## Security
 
-To report a vulnerability, email **security@runcaptain.com**. See [SECURITY.md](SECURITY.md) for details.
+To report a vulnerability, email **support@runcaptain.com**. See [SECURITY.md](SECURITY.md) for details.
 
 ## License
 

@@ -4,7 +4,9 @@
 // vector space CRUD, rebuild triggers, and status checks.
 //
 // Bearer-token auth middleware is applied to all routes
-// except /health. See `AuthConfig` and `auth_middleware` below.
+// except /health and /metrics (both unauthenticated by design; /metrics
+// exposes collection names + counts — firewall it if that matters).
+// See `AuthConfig` and `auth_middleware` below.
 
 pub mod collections;
 pub mod delete;
@@ -25,6 +27,23 @@ use axum::{Json, Router};
 use std::sync::Arc;
 
 /// Shared application state passed to every request handler.
+/// Map an engine error to an HTTP response. Typed `NotFound` becomes 404
+/// regardless of the handler's default; a 500 default logs the detail and
+/// returns a generic body (backend/path internals don't belong in responses).
+pub(crate) fn error_response(
+    e: Box<dyn std::error::Error + Send + Sync>,
+    default: StatusCode,
+) -> (StatusCode, String) {
+    if e.downcast_ref::<crate::collections::NotFound>().is_some() {
+        return (StatusCode::NOT_FOUND, e.to_string());
+    }
+    if default == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!("handler error: {e}");
+        return (default, "internal error (see server logs)".to_string());
+    }
+    (default, e.to_string())
+}
+
 pub struct AppState {
     pub manager: Arc<CollectionManager>,
     pub embed_state: Arc<EmbedState>,
@@ -148,10 +167,43 @@ pub fn build_router(state: Arc<AppState>, auth: Arc<AuthConfig>) -> Router {
     Router::new()
         // ── Health (unauthenticated) ─────────────────────────────────────
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_endpoint))
         .merge(protected)
         // 64 MB body limit. Default 2 MB is too small for batched ingest with embeddings.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        // Backpressure: bound in-flight requests instead of queueing without
+        // limit (COMPASS_MAX_CONCURRENCY; unset = unlimited). The cap must stay
+        // under tokio's Semaphore::MAX_PERMITS (usize::MAX >> 3) — a larger
+        // value PANICS at startup.
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            std::env::var("COMPASS_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or(usize::MAX >> 4)
+                .min(usize::MAX >> 4),
+        ))
         .with_state(state)
+}
+
+/// GET /metrics — Prometheus text. Unauthenticated (like /health); carries
+/// operational counters plus per-collection gauges.
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> String {
+    let mut gauges = String::new();
+    // Attached collections only: list_collections in lazy mode does one S3
+    // GET per registered namespace — an unauthenticated request-amplifier if
+    // exposed to a scraper.
+    for c in state.manager.attached_collections().await {
+        gauges.push_str(&format!(
+            "compass_collection_chunks{{collection=\"{}\"}} {}\n",
+            c.name, c.chunk_count
+        ));
+        gauges.push_str(&format!(
+            "compass_collection_applied_seq{{collection=\"{}\"}} {}\n",
+            c.name, c.applied_seq
+        ));
+    }
+    crate::metrics::render(&gauges)
 }
 
 /// GET /health

@@ -15,15 +15,23 @@ const POSTHOG_API_KEY: &str = "phc_BFvsmH5rpe8GqJ8zwfqhH9jGAdZMXcNZhEao8mnDEd3X"
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_DELAY: Duration = Duration::from_secs(60);
 
-/// Returns true if telemetry is enabled (default).
+/// Returns true if telemetry is enabled. DEFAULT OFF: Compass's core promise
+/// is "data never leaves your machine" — an engine pitched on privacy must
+/// not phone home unless the operator explicitly opts in
+/// (COMPASS_TELEMETRY=on). DO_NOT_TRACK is honored even when opted in.
 pub fn is_enabled() -> bool {
-    if let Ok(v) = std::env::var("COMPASS_TELEMETRY") {
-        return !matches!(v.to_lowercase().as_str(), "off" | "false" | "0" | "no");
-    }
     if let Ok(v) = std::env::var("DO_NOT_TRACK") {
-        return !matches!(v.as_str(), "1" | "true");
+        if matches!(v.as_str(), "1" | "true") {
+            return false;
+        }
     }
-    true
+    matches!(
+        std::env::var("COMPASS_TELEMETRY")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 /// Persistent instance ID — generated once, stored in data_dir/instance_id.
@@ -100,7 +108,7 @@ pub fn spawn_telemetry(
 
     let instance_id = get_or_create_instance_id(&data_dir);
     tracing::info!(
-        "Anonymous telemetry enabled (instance: {}). Set COMPASS_TELEMETRY=off to disable.",
+        "Anonymous telemetry enabled by explicit opt-in (instance: {}). Unset COMPASS_TELEMETRY to disable.",
         &instance_id[..8]
     );
 

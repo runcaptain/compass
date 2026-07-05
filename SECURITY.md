@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-We take the security of Compass seriously. If you discover a security vulnerability, please email founders@runcaptain.com with the following information:
+We take the security of Compass seriously. If you discover a security vulnerability, please email support@runcaptain.com with the following information:
 
 1. **Description** of the vulnerability
 2. **Steps to reproduce** (if applicable)
@@ -28,7 +28,7 @@ We will acknowledge your report within **two business days** and work with you t
 
 ### Model Weights
 
-- Compass downloads model weights on first run (e.g., BGE-small via Hugging Face Hub).
+Compass never downloads anything at runtime. Model weights are fetched only if you run `scripts/download-models.sh` (or `huggingface-cli`) yourself.
 - Verify downloaded files match expected checksums when possible.
 - For air-gapped deployments, pre-download and verify model weights before use.
 

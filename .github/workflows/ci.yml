@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # feat/** so stacked PRs (feature targeting feature) get CI too.
+    branches: [main, "feat/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,6 +57,71 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev
       - run: cargo test --workspace --exclude compass-vector-gpu
+
+  # Cloud-feature coverage: the object-storage build + the real-S3 integration
+  # tests against MinIO. Not in the required-checks list (new job), but a
+  # failure here still blocks review attention.
+  test-cloud:
+    runs-on: ubuntu-24.04
+    env:
+      COMPASS_TEST_S3_BUCKET: compass-data
+      COMPASS_S3_ENDPOINT: http://localhost:9000
+      COMPASS_S3_ALLOW_HTTP: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev
+      # MinIO as a plain container (service containers can't override the
+      # image command, and minio/minio needs `server /data`). Same images as
+      # docker-compose.minio.yml.
+      - run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c \
+            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb -p local/compass-data"
+      # NON-TEST compile of the cloud feature: no other job builds this
+      # combination (clippy/msrv build without the feature; tests build with
+      # cfg(test)), so a cfg gate that hides an item from the release cloud
+      # build otherwise sails through green checks and breaks docker builds.
+      - run: cargo check -p compass --features object-storage
+      # The s3_integration tests skip silently without the env; guard against
+      # env-name drift turning this job into a green no-op.
+      - run: |
+          cargo test -p compass --features object-storage -- --nocapture 2>&1 | tee /tmp/cloud-tests.log
+          if grep -q '^skipped: COMPASS_TEST_S3_BUCKET' /tmp/cloud-tests.log; then
+            echo '::error::s3_integration tests were skipped — MinIO env wiring is broken'
+            exit 1
+          fi
+
+  # Developer Certificate of Origin: every PR commit carries a Signed-off-by
+  # trailer. Dependency-free check over the PR range.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          missing=0
+          for sha in $(git rev-list --no-merges ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
+            if ! git log -1 --format=%B "$sha" | grep -q '^Signed-off-by: '; then
+              echo "::error::commit $sha is missing a Signed-off-by trailer (git commit -s)"
+              missing=1
+            fi
+          done
+          exit $missing
 
   msrv:
     runs-on: ubuntu-24.04
