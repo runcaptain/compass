@@ -21,9 +21,11 @@ overlays/minio-dev   self-contained dev stack (in-cluster MinIO) — try it on
 overlays/aws         production: real S3, IRSA or access-key auth
 ```
 
-Try the whole topology on a local cluster:
+Try the whole topology on any cluster — no clone needed:
 
 ```bash
+kubectl apply -k "https://github.com/runcaptain/compass//deploy/kubernetes/overlays/minio-dev?ref=main"
+# or, from a checkout:
 kubectl apply -k deploy/kubernetes/overlays/minio-dev
 kubectl -n compass-dev get pods        # serving-0, writer, cold, minio
 kubectl -n compass-dev port-forward svc/compass-read 4001:4001
