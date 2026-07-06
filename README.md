@@ -10,6 +10,8 @@
   [![CI](https://github.com/runcaptain/compass/actions/workflows/ci.yml/badge.svg)](https://github.com/runcaptain/compass/actions/workflows/ci.yml)
   [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+  [![Image](https://img.shields.io/badge/ghcr.io-runcaptain%2Fcompass-2496ED?logo=docker&logoColor=white)](https://github.com/runcaptain/compass/pkgs/container/compass)
+  [![Deploy](https://img.shields.io/badge/%E2%98%81%20one--command%20deploy-Kubernetes%20%2F%20AWS-326CE5?logo=kubernetes&logoColor=white)](#deploy-to-kubernetes--aws-one-command)
 </div>
 
 Built by [Captain](https://runcaptain.com) for high-throughput retrieval in on-prem enterprise deployments where customer data cannot leave their VPC.
