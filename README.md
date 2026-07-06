@@ -419,6 +419,22 @@ docker build -t compass .
 docker run -p 4001:4001 -v ./data:/app/data compass
 ```
 
+## Deploy to Kubernetes / AWS (one command)
+
+[`deploy/`](deploy/README.md) ships the full serverless topology as code: a
+kustomize tree (serving StatefulSet with a PVC per replica, stateless writer
+Deployment, optional cold tier) plus Terraform for the AWS storage half
+(private encrypted S3 bucket + least-privilege IAM, IRSA-ready). Try the whole
+thing on any local cluster:
+
+```bash
+kubectl apply -k deploy/kubernetes/overlays/minio-dev
+```
+
+Production: `terraform apply` in [`deploy/terraform/aws`](deploy/terraform/aws),
+point [`deploy/kubernetes/overlays/aws`](deploy/kubernetes/overlays/aws) at the
+bucket, `kubectl apply -k`. Details and operational notes: [deploy/README.md](deploy/README.md).
+
 ## Object storage (S3 / GCS / Azure)
 
 By default Compass persists to local disk — zero config, no credentials. Optionally, it can persist to your own cloud object storage instead (a hard either/or, chosen at startup):

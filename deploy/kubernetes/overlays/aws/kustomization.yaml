@@ -1,0 +1,39 @@
+# Production overlay for AWS S3. Two auth modes:
+#   IRSA (recommended): set the service-account annotation below and skip
+#     the secret entirely.
+#   Access key: create the secret Terraform hints at
+#     (kubectl -n compass create secret generic compass-aws …) — the base
+#     mounts it as optional, so IRSA deployments simply omit it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: compass
+resources:
+  - namespace.yaml
+  - ../../base
+  - ../../components/cold   # optional cold tier; delete this line to skip
+
+images:
+  - name: compass
+    # ghcr.io/runcaptain/compass is published by .github/workflows/docker.yml
+    # on every release tag (multi-arch). Swap in your own registry if you
+    # build custom images.
+    newName: ghcr.io/runcaptain/compass
+    newTag: v0.4.1
+
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: compass-config
+      data:
+        COMPASS_STORAGE: "s3://CHANGE-ME-your-bucket"   # terraform output compass_storage_url
+        AWS_REGION: "us-east-1"
+  # IRSA mode: uncomment and paste the terraform `irsa_role_arn` output.
+  # - patch: |-
+  #     apiVersion: v1
+  #     kind: ServiceAccount
+  #     metadata:
+  #       name: compass
+  #       annotations:
+  #         eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/compass-irsa

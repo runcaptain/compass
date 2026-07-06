@@ -24,3 +24,10 @@ beir_data/
 
 # Committed template — .env.* above must not swallow it
 !.env.example
+
+# Terraform (deploy/terraform)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl

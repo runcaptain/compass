@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **One-command deployment** (`deploy/`): a kustomize tree for any Kubernetes cluster — serving StatefulSet with a PVC per replica (warm restarts), stateless writer Deployment, optional cold-serving tier, hardened pod security (non-root, seccomp, no capabilities), startup probes sized for cold rebuilds — plus Terraform for the AWS storage half (private KMS-encrypted S3 bucket with a TLS-only policy, least-privilege IAM, IRSA role or access key). A self-contained `minio-dev` overlay brings the whole serverless topology up on kind/k3s/minikube in one `kubectl apply -k`. Verified end-to-end on a live k3s cluster (all tiers serving, cross-tier read-your-writes, PVC persistence across pod replacement) and `terraform apply` verified against an AWS API emulator (idempotent re-apply; destroy refuses while data exists).
+- **Published container images**: `ghcr.io/runcaptain/compass` (multi-arch amd64+arm64) on every release tag via `.github/workflows/docker.yml`. The Docker builder base moved to `rust:1.88-trixie` — bookworm's gcc-12 could not compile a dependency's ARM feature probes, which had made arm64 images impossible.
+
 ## [0.4.0] - 2026-07-04
 
 ### Added — serve-from-storage ("true serverless")

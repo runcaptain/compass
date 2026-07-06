@@ -1,0 +1,88 @@
+# Writer nodes: stateless, append-only ingest. Durable immediately;
+# searchable on serving nodes within the refresh interval.
+#
+# Plain Deployment with an emptyDir scratch dir — writers hold no state
+# worth keeping (ids come from the bucket's CAS allocator), so they scale
+# horizontally and die freely.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compass-writer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compass
+      app.kubernetes.io/component: writer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compass
+        app.kubernetes.io/component: writer
+    spec:
+      serviceAccountName: compass
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: compass
+          image: compass:latest
+          ports:
+            - containerPort: 4001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: compass-config
+            - secretRef:
+                name: compass-aws
+                optional: true
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: COMPASS_ROLE
+              value: writer
+          volumeMounts:
+            - name: scratch
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: scratch
+          emptyDir: {}
+---
+# Write endpoint: point ingest/delete traffic here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: compass-write
+spec:
+  selector:
+    app.kubernetes.io/name: compass
+    app.kubernetes.io/component: writer
+  ports:
+    - port: 4001
+      targetPort: http
+      name: http

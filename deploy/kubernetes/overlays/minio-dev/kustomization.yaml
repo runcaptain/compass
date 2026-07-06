@@ -1,0 +1,61 @@
+# Self-contained dev/test overlay: in-cluster MinIO stands in for S3.
+# One command gives you the full serverless topology on any cluster
+# (kind/k3s/minikube included):
+#   kubectl apply -k deploy/kubernetes/overlays/minio-dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: compass-dev
+resources:
+  - namespace.yaml
+  - minio.yaml
+  - ../../base
+  - ../../components/cold
+
+images:
+  - name: compass
+    newName: compass       # expects a locally imported image in dev clusters
+    newTag: latest
+
+secretGenerator:
+  - name: compass-aws
+    literals:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    options:
+      disableNameSuffixHash: true
+
+patches:
+  # The dev image is imported into the cluster (kind load / ctr images
+  # import); :latest defaults to pullPolicy Always, which would try (and
+  # fail) to pull from a registry. Never = use the imported image only.
+  - target:
+      kind: StatefulSet
+      name: compass-serving
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target:
+      kind: Deployment
+      name: compass-writer
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target:
+      kind: Deployment
+      name: compass-cold
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: compass-config
+      data:
+        COMPASS_STORAGE: "s3://compass-data"
+        COMPASS_S3_ENDPOINT: "http://minio:9000"
+        COMPASS_S3_ALLOW_HTTP: "true"
+        AWS_REGION: "us-east-1"
