@@ -1,0 +1,24 @@
+# Shared plumbing: namespace-agnostic service account + engine config.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: compass
+  # On EKS with IRSA, the aws overlay annotates this with the role ARN
+  # from the Terraform output — no long-lived keys in the cluster.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: compass-config
+data:
+  PORT: "4001"
+  RUST_LOG: "compass=info"
+  # The bucket. Overlays set this (s3://…, gs://…, az://…). Empty = the
+  # engine falls back to LOCAL disk mode — a bare `apply -k base` still
+  # boots, it just isn't the serverless topology.
+  COMPASS_STORAGE: ""
+  # Serving nodes converge on other nodes' writes every N seconds.
+  COMPASS_REFRESH_INTERVAL: "5"
+  # Uncomment to bound serving RAM to the hot collection set:
+  # COMPASS_LAZY_ATTACH: "true"
+  # COMPASS_MAX_ATTACHED: "64"

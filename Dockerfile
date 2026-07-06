@@ -6,7 +6,9 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 # Pin builder toolchain so deploys are reproducible and a compromised
 # rust:latest tag can't silently land in our image.
-FROM rust:1.88-bookworm AS builder
+# trixie (gcc-14) rather than bookworm: bookworm's gcc-12 fails to build
+# the numkong dependency's ARM feature probes, which blocked arm64 images.
+FROM rust:1.88-trixie AS builder
 
 WORKDIR /app
 

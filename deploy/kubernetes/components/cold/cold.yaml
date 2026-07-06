@@ -1,0 +1,89 @@
+# OPTIONAL cold-serving tier: answers semantic queries on collections it has
+# never attached, straight from object-storage range reads. Boots in <1s at
+# ~30MiB; scale-to-many for bursty read fleets. Not part of the base — an
+# overlay opts in with `resources: [../../components/cold]`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compass-cold
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compass
+      app.kubernetes.io/component: cold
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compass
+        app.kubernetes.io/component: cold
+    spec:
+      serviceAccountName: compass
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: compass
+          image: compass:latest
+          ports:
+            - containerPort: 4001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: compass-config
+            - secretRef:
+                name: compass-aws
+                optional: true
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: COMPASS_COLD_SERVE
+              value: "true"
+            # Cold pods stay cold: warm promotion would re-grow local state
+            # on a tier sized for none. Route hot tenants to serving pods.
+            - name: COMPASS_WARM_AFTER
+              value: "0"
+          volumeMounts:
+            - name: scratch
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: scratch
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: compass-cold
+spec:
+  selector:
+    app.kubernetes.io/name: compass
+    app.kubernetes.io/component: cold
+  ports:
+    - port: 4001
+      targetPort: http
+      name: http

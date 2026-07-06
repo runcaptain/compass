@@ -1,0 +1,123 @@
+# Serving nodes: full local indexes, fast reads, background convergence.
+#
+# StatefulSet — NOT a Deployment — because each replica needs its OWN
+# persistent volume: a warm disk turns restarts into a seconds-long delta
+# catch-up (applied_seq) instead of a full rebuild from the bucket. Two
+# replicas sharing one PVC would corrupt each other's indexes.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: compass-serving
+spec:
+  serviceName: compass-serving-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compass
+      app.kubernetes.io/component: serving
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compass
+        app.kubernetes.io/component: serving
+    spec:
+      serviceAccountName: compass
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+        # Skip the recursive chown when the PVC root already has the right
+        # group — a full walk of a big warm cache would stall pod starts.
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: compass
+          image: compass:latest # kustomize overlays pin the real image
+          ports:
+            - containerPort: 4001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: compass-config
+            - secretRef:
+                name: compass-aws
+                optional: true # IRSA mode needs no secret
+          env:
+            - name: DATA_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # Boot order matters: the engine loads/rebuilds every collection
+          # BEFORE binding the port, so a node recovering a big bucket
+          # answers nothing for minutes. The startupProbe owns that window
+          # (up to 60 min) — liveness only takes over once the port is up.
+          # For very large buckets, prefer COMPASS_LAZY_ATTACH=true, which
+          # makes boot instant and this probe trivially green.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 240
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # tantivy/redb write under /data only, but keep tmp writable
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Headless service the StatefulSet requires (stable per-pod DNS).
+apiVersion: v1
+kind: Service
+metadata:
+  name: compass-serving-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: compass
+    app.kubernetes.io/component: serving
+  ports:
+    - port: 4001
+      targetPort: http
+      name: http
+---
+# Read endpoint: load-balances across ready serving pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: compass-read
+spec:
+  selector:
+    app.kubernetes.io/name: compass
+    app.kubernetes.io/component: serving
+  ports:
+    - port: 4001
+      targetPort: http
+      name: http

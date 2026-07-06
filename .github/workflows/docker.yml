@@ -1,0 +1,56 @@
+name: Docker image
+
+# Publishes ghcr.io/runcaptain/compass on every release tag — the image the
+# deploy/kubernetes overlays reference. Multi-arch (amd64 + arm64; the
+# builder base is trixie specifically so arm64 compiles). Also runnable
+# manually to publish an ad-hoc tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=manual-${{ github.run_number }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      # The overlays assume the serverless topology, so the published image
+      # carries the object-storage backend. Local-first users typically build
+      # from source anyway (README quickstart).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            CARGO_FEATURES=object-storage
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
