@@ -13,7 +13,10 @@ resources:
 
 images:
   - name: compass
-    newName: compass       # expects a locally imported image in dev clusters
+    # Pulls the published image so `kubectl apply -k <github url>` works on
+    # any cluster with no clone. For offline dev, import your own build under
+    # this exact name (docker save | ctr -n k8s.io images import / kind load).
+    newName: ghcr.io/runcaptain/compass
     newTag: latest
 
 secretGenerator:
@@ -25,30 +28,30 @@ secretGenerator:
       disableNameSuffixHash: true
 
 patches:
-  # The dev image is imported into the cluster (kind load / ctr images
-  # import); :latest defaults to pullPolicy Always, which would try (and
-  # fail) to pull from a registry. Never = use the imported image only.
+  # IfNotPresent: pulls ghcr on a fresh cluster, but prefers a locally
+  # imported image of the same name (offline dev), instead of :latest's
+  # default Always which would re-pull over it.
   - target:
       kind: StatefulSet
       name: compass-serving
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
-        value: Never
+        value: IfNotPresent
   - target:
       kind: Deployment
       name: compass-writer
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
-        value: Never
+        value: IfNotPresent
   - target:
       kind: Deployment
       name: compass-cold
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
-        value: Never
+        value: IfNotPresent
   - patch: |-
       apiVersion: v1
       kind: ConfigMap

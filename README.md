@@ -42,6 +42,10 @@ cargo build --release
 # Listening on http://localhost:4001
 ```
 
+Or skip the build entirely: `docker run -p 4001:4001 ghcr.io/runcaptain/compass:latest`
+— and for the full serverless topology on a Kubernetes cluster, see
+[Deploy to Kubernetes / AWS](#deploy-to-kubernetes--aws-one-command) (one command, no clone).
+
 Environment variables: `PORT` (default 4001), `DATA_DIR` (default ./data), `COMPASS_API_KEY` (bearer-token auth; unauthenticated when unset), `COMPASS_STORAGE` (see [Object storage](#object-storage-s3--gcs--azure)). See [`.env.example`](.env.example) for the full list.
 
 ## Examples
@@ -421,19 +425,21 @@ docker run -p 4001:4001 -v ./data:/app/data compass
 
 ## Deploy to Kubernetes / AWS (one command)
 
-[`deploy/`](deploy/README.md) ships the full serverless topology as code: a
-kustomize tree (serving StatefulSet with a PVC per replica, stateless writer
-Deployment, optional cold tier) plus Terraform for the AWS storage half
-(private encrypted S3 bucket + least-privilege IAM, IRSA-ready). Try the whole
-thing on any local cluster:
+One command deploys the full serverless topology — serving nodes on
+persistent volumes, stateless writers, an optional cold tier, and a bundled
+dev S3 — onto **any** Kubernetes cluster, no clone required:
 
 ```bash
-kubectl apply -k deploy/kubernetes/overlays/minio-dev
+kubectl apply -k "https://github.com/runcaptain/compass//deploy/kubernetes/overlays/minio-dev?ref=main"
+kubectl -n compass-dev get pods   # serving-0, writer, cold, minio
 ```
 
-Production: `terraform apply` in [`deploy/terraform/aws`](deploy/terraform/aws),
-point [`deploy/kubernetes/overlays/aws`](deploy/kubernetes/overlays/aws) at the
-bucket, `kubectl apply -k`. Details and operational notes: [deploy/README.md](deploy/README.md).
+Production on AWS is two steps: `terraform apply` in
+[`deploy/terraform/aws`](deploy/terraform/aws) (private encrypted S3 bucket +
+least-privilege IAM, IRSA-ready), then point
+[`deploy/kubernetes/overlays/aws`](deploy/kubernetes/overlays/aws) at the
+bucket and `kubectl apply -k` it. Full walkthrough and operational notes:
+[deploy/README.md](deploy/README.md).
 
 ## Object storage (S3 / GCS / Azure)
 
