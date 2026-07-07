@@ -1,7 +1,20 @@
 # Deploying Compass
 
-Three paths, in increasing order of ceremony. All of them are the same
+Four paths, in increasing order of ceremony. All of them are the same
 binary; topology background lives in [docs/deployment.md](../docs/deployment.md).
+
+## 0. One click (AWS CloudFormation)
+
+<a href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=compass&templateURL=https://compass-cloudformation.s3.amazonaws.com/compass-quickstart.yaml"><img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png" alt="Launch Stack on AWS"></a>
+
+[`cloudformation/compass-quickstart.yaml`](cloudformation/compass-quickstart.yaml)
+creates a self-contained stack: minimal VPC, private encrypted S3 bucket
+(**retained on stack deletion** — data outlives compute), least-privilege
+task role (no keys; the engine picks up ECS task credentials natively), and
+one Fargate task running `ghcr.io/runcaptain/compass`. Parameters: image
+tag, API key, allowed CIDR, CPU/memory. The stack outputs a one-liner to
+fetch the task's public IP. Built for evaluation and small single-node
+workloads — graduate to the Kubernetes topology below for fleets.
 
 ## 1. One machine (docker compose)
 
