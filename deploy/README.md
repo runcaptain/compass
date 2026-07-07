@@ -5,7 +5,7 @@ binary; topology background lives in [docs/deployment.md](../docs/deployment.md)
 
 ## 0. One click (AWS CloudFormation)
 
-<a href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=compass&templateURL=https://compass-cloudformation.s3.amazonaws.com/compass-quickstart.yaml"><img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png" alt="Launch Stack on AWS"></a>
+<a href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=compass&templateURL=https://runcaptain-compass-cloudformation.s3.amazonaws.com/compass-quickstart.yaml"><img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png" alt="Launch Stack on AWS"></a>
 
 [`cloudformation/compass-quickstart.yaml`](cloudformation/compass-quickstart.yaml)
 creates a self-contained stack: minimal VPC, private encrypted S3 bucket
