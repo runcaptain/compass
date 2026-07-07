@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Compass quick-start: a serverless single-node deployment on AWS in one
+  click. Creates a private encrypted S3 bucket (the database), a
+  least-privilege task role, and one Fargate task running the published
+  Compass image inside a minimal self-contained VPC. No long-lived keys
+  anywhere - the container picks up the task role automatically. Intended
+  for evaluation and small workloads; for multi-node fleets use
+  deploy/kubernetes + deploy/terraform/aws from the repository.
+
+Parameters:
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Tag of ghcr.io/runcaptain/compass to run (e.g. v0.4.1).
+  ApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >-
+      Bearer token required on every API call. Leave empty for an
+      UNAUTHENTICATED instance - only do that with a restrictive AllowedCidr.
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >-
+      CIDR allowed to reach port 4001. The default is the whole internet -
+      set your IP (x.x.x.x/32) or set ApiKey (ideally both).
+  Cpu:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096]
+    Description: Fargate CPU units (1024 = 1 vCPU).
+  Memory:
+    Type: Number
+    Default: 4096
+    AllowedValues: [1024, 2048, 4096, 8192, 16384]
+    Description: Fargate memory (MiB). Must be a valid pairing with Cpu.
+
+Conditions:
+  HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
+
+Resources:
+  # ── Minimal VPC (two public subnets, so this template needs zero inputs) ──
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-vpc"}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/25
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.128/25
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  # ── The bucket: this IS the database ─────────────────────────────────────
+  DataBucket:
+    Type: AWS::S3::Bucket
+    # Survives stack deletion: the bucket holds every collection, and
+    # CloudFormation refuses to delete non-empty buckets anyway. Clean up
+    # deliberately when you mean it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ── IAM: least privilege, no keys ─────────────────────────────────────────
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: compass-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CompassObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub "${DataBucket.Arn}/*"
+              - Sid: CompassList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:GetBucketLocation
+                Resource: !GetAtt DataBucket.Arn
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ── Compute ───────────────────────────────────────────────────────────────
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/compass/${AWS::StackName}"
+      RetentionInDays: 30
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Compass API access
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4001
+          ToPort: 4001
+          CidrIp: !Ref AllowedCidr
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-compass"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: compass
+          Image: !Sub "ghcr.io/runcaptain/compass:${ImageTag}"
+          PortMappings:
+            - ContainerPort: 4001
+              Protocol: tcp
+          Environment:
+            - Name: COMPASS_STORAGE
+              Value: !Sub "s3://${DataBucket}"
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - !If
+              - HasApiKey
+              - {Name: COMPASS_API_KEY, Value: !Ref ApiKey}
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: compass
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: DefaultRoute
+    Properties:
+      ServiceName: compass
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref SecurityGroup]
+      TaskDefinition: !Ref TaskDefinition
+
+Outputs:
+  BucketName:
+    Description: The S3 bucket holding every collection (the database).
+    Value: !Ref DataBucket
+  ClusterName:
+    Description: ECS cluster running Compass.
+    Value: !Ref Cluster
+  FindTheEndpoint:
+    Description: >-
+      The task gets a public IP (no load balancer keeps this template cheap;
+      the IP changes if the task is replaced). Fetch it with this command,
+      then hit http://IP:4001/health.
+    Value: !Sub >-
+      aws ecs list-tasks --cluster ${Cluster} --query 'taskArns[0]' --output text |
+      xargs -I{} aws ecs describe-tasks --cluster ${Cluster} --tasks {}
+      --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value'
+      --output text | xargs -I{} aws ec2 describe-network-interfaces
+      --network-interface-ids {}
+      --query 'NetworkInterfaces[0].Association.PublicIp' --output text
+  DataDurability:
+    Description: What survives what.
+    Value: >-
+      The bucket is the source of truth: kill the task, delete the stack -
+      data survives in S3 (bucket is retained on stack deletion). Point any
+      future Compass at the same bucket to recover everything.

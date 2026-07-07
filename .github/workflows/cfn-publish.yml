@@ -1,0 +1,57 @@
+name: Publish CloudFormation template
+
+# The Launch Stack button requires the template at a public S3 HTTPS URL
+# (CloudFormation quick-create cannot read from GitHub). This uploads
+# deploy/cloudformation/compass-quickstart.yaml to the template bucket on
+# every change and every release tag.
+#
+# One-time setup (repo admin):
+#   1. Create an S3 bucket (default name: compass-cloudformation, us-east-1)
+#      with a bucket policy allowing public s3:GetObject on *.yaml.
+#   2. Repo settings -> Secrets: CFN_PUBLISH_AWS_ACCESS_KEY_ID /
+#      CFN_PUBLISH_AWS_SECRET_ACCESS_KEY (an IAM user with PutObject on the
+#      bucket only). Variables: CFN_TEMPLATE_BUCKET (the bucket name).
+# Without the secrets the job skips cleanly — forks stay green.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/cloudformation/**"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint template
+        run: pipx install cfn-lint && cfn-lint deploy/cloudformation/compass-quickstart.yaml
+
+      - name: Check publish credentials
+        id: creds
+        env:
+          KEY: ${{ secrets.CFN_PUBLISH_AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$KEY" ]; then echo "have=true" >> "$GITHUB_OUTPUT";
+          else echo "have=false" >> "$GITHUB_OUTPUT"; echo "::notice::CFN publish secrets not configured — lint-only run"; fi
+
+      - name: Upload to the template bucket
+        if: steps.creds.outputs.have == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CFN_PUBLISH_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CFN_PUBLISH_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          BUCKET: ${{ vars.CFN_TEMPLATE_BUCKET || 'compass-cloudformation' }}
+        run: |
+          aws s3 cp deploy/cloudformation/compass-quickstart.yaml "s3://$BUCKET/compass-quickstart.yaml"
+          # Versioned copy on tags so old buttons keep working forever.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            aws s3 cp deploy/cloudformation/compass-quickstart.yaml "s3://$BUCKET/${GITHUB_REF#refs/tags/}/compass-quickstart.yaml"
+          fi

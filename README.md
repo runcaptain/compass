@@ -12,6 +12,8 @@
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
   [![Image](https://img.shields.io/badge/ghcr.io-runcaptain%2Fcompass-2496ED?logo=docker&logoColor=white)](https://github.com/runcaptain/compass/pkgs/container/compass)
   [![Deploy](https://img.shields.io/badge/%E2%98%81%20one--command%20deploy-Kubernetes%20%2F%20AWS-326CE5?logo=kubernetes&logoColor=white)](#deploy-to-kubernetes--aws-one-command)
+  <br>
+  <a href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=compass&templateURL=https://compass-cloudformation.s3.amazonaws.com/compass-quickstart.yaml"><img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png" alt="Launch Stack on AWS"></a>
 </div>
 
 Built by [Captain](https://runcaptain.com) for high-throughput retrieval in on-prem enterprise deployments where customer data cannot leave their VPC.
@@ -427,9 +429,19 @@ docker run -p 4001:4001 -v ./data:/app/data compass
 
 ## Deploy to Kubernetes / AWS (one command)
 
-One command deploys the full serverless topology — serving nodes on
-persistent volumes, stateless writers, an optional cold tier, and a bundled
-dev S3 — onto **any** Kubernetes cluster, no clone required:
+**AWS, zero tools installed** — the Launch Stack button opens the AWS console
+with everything pre-filled; one Create click gives you a running serverless
+Compass (Fargate task + private encrypted S3 bucket + least-privilege IAM,
+no long-lived keys — the task role is picked up automatically):
+
+<a href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=compass&templateURL=https://compass-cloudformation.s3.amazonaws.com/compass-quickstart.yaml"><img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png" alt="Launch Stack on AWS"></a>
+
+The bucket is retained when the stack is deleted — your data outlives the
+compute, always. Template source: [`deploy/cloudformation/compass-quickstart.yaml`](deploy/cloudformation/compass-quickstart.yaml).
+
+**Kubernetes** — one command deploys the full multi-node topology — serving
+nodes on persistent volumes, stateless writers, an optional cold tier, and a
+bundled dev S3 — onto **any** cluster, no clone required:
 
 ```bash
 kubectl apply -k "https://github.com/runcaptain/compass//deploy/kubernetes/overlays/minio-dev?ref=main"
