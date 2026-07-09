@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Creating a release needs contents:write; the default token is read-only.
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create GitHub Release
@@ -38,33 +42,20 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p compass
 
-      - name: Extract changelog section
-        id: changelog
-        run: |
-          # Extract changelog between tag and previous tag
-          VERSION="${{ steps.version.outputs.version }}"
-          PREV_TAG=$(git describe --tags --abbrev=0 $(git rev-list --tags --skip=1 -n1) 2>/dev/null || echo "HEAD")
-          
-          # Extract relevant section from CHANGELOG.md
-          CHANGELOG=$(sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '$ d')
-          
-          # Escape for GitHub Actions
-          CHANGELOG="${CHANGELOG//'%'/'%25'}"
-          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
-          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
-          
-          echo "body=$CHANGELOG" >> $GITHUB_OUTPUT
-
       - name: Create Release
-        uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release v${{ steps.version.outputs.version }}
-          body: ${{ steps.changelog.outputs.body }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Release body = this version's CHANGELOG section, verbatim.
+          sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '$ d' > /tmp/notes.md
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "release v$VERSION already exists — skipping creation"
+          else
+            gh release create "v$VERSION" \
+              --title "Release v$VERSION" \
+              --notes-file /tmp/notes.md
+          fi
 
   publish-crate:
     name: Publish to crates.io
