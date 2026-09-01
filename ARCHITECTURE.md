@@ -16,7 +16,7 @@ compass/
 
 The split exists for a reason. `compass-index-api` is the smallest possible crate that downstream backends bind to: it has no I/O, no async runtime, no logging. New backends (CPU, GPU, IVF-PQ, sharded) can be developed against it without pulling in the rest of Compass.
 
-`compass-vector-gpu` is opt-in. Default builds don't compile it. Enable with `--features gpu` from the umbrella crate, or depend on it directly for embedded use.
+`compass-vector-gpu` is opt-in. Default builds don't compile it: the `compass` crate has no `gpu` feature and no dependency on the GPU crate. Depend on `compass-vector-gpu` directly for embedded use. (`compass-index-api` does carry a `gpu` feature, but it only toggles that crate's own `gpu_available()` helper — it does not pull in a GPU backend.)
 
 ## Module map (compass crate)
 
@@ -98,7 +98,7 @@ The "one-click model upgrade" feature relies on the rebuild path. When a new vec
 3. Once complete, the new space's status flips to `active`. The default vector space can then be switched atomically.
 4. The old space remains on disk for rollback until explicitly deleted.
 
-GPU acceleration applies to the embedding step (via the external endpoint) and, when `--features gpu` is enabled, to the index construction step (CAGRA on GPU is ~12x faster than CPU HNSW build at dim 768/1024).
+GPU acceleration applies today only to the embedding step (via the external endpoint). GPU index construction (CAGRA, ~12x faster than CPU HNSW build at dim 768/1024) lives in `compass-vector-gpu`, which is not wired into the engine — see the note above.
 
 ## GPU backend build prerequisites
 
