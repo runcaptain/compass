@@ -15,11 +15,11 @@
 //!
 //! First build of cuVS takes 30-60 minutes; cache the artifact aggressively in CI.
 //!
-//! # Usage from `compass`
+//! # Usage
 //!
 //! ```toml
 //! [dependencies]
-//! compass = { version = "0.2", features = ["gpu"] }
+//! compass-vector-gpu = { git = "https://github.com/runcaptain/compass" }
 //! ```
 //!
 //! At runtime, [`CuvsHnswIndex`] implements [`compass_index_api::VectorIndex`]
